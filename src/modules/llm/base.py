@@ -1,0 +1,162 @@
+"""LLM module — abstract backend interface and shared data types."""
+
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from typing import Any
+
+
+@dataclass
+class TokenUsage:
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
+    #: What the provider says these calls cost, in USD (OpenRouter's ``usage.cost``).
+    #: ``None`` when it did not say; ``compute_cost`` then prices the tokens itself.
+    cost_usd: float | None = None
+
+    def __add__(self, other: TokenUsage) -> TokenUsage:
+        if self.cost_usd is None and other.cost_usd is None:
+            cost = None
+        else:
+            cost = (self.cost_usd or 0.0) + (other.cost_usd or 0.0)
+        return TokenUsage(
+            input_tokens=self.input_tokens + other.input_tokens,
+            output_tokens=self.output_tokens + other.output_tokens,
+            cache_read_tokens=self.cache_read_tokens + other.cache_read_tokens,
+            cache_write_tokens=self.cache_write_tokens + other.cache_write_tokens,
+            cost_usd=cost,
+        )
+
+    @property
+    def total_tokens(self) -> int:
+        return self.input_tokens + self.output_tokens + self.cache_read_tokens + self.cache_write_tokens
+
+
+@dataclass
+class ToolLoopResult:
+    success: bool
+    output: str
+    error: str | None = None
+    tool_calls_made: int = 0
+    usage: TokenUsage = field(default_factory=TokenUsage)
+    duration_seconds: float = 0.0
+    stop_reason: str = "end_turn"
+    #: Model calls made (in-process loops only; 0 when the backend does not count them).
+    turns: int = 0
+    #: The largest single call's input tokens (fresh plus cached): how big the conversation got.
+    peak_prompt_tokens: int = 0
+    #: Older tool exchanges summarised to keep the conversation small (see ``llm/history.py``).
+    summarised_exchanges: int = 0
+    #: What the backend saw that explains a missing output file (Codex: its sandbox refused writes),
+    #: added to the error when the output contract fails; empty when there is nothing to say.
+    diagnostic: str = ""
+    #: The backend's sandbox refused writes in this call (Codex: refused file changes or commands), so
+    #: another attempt would meet the same refusal: the dispatcher pauses the run instead of retrying.
+    sandbox_blocked: bool = False
+
+
+class ToolHandler(ABC):
+    """Intercepts and executes tool calls from the LLM."""
+
+    @abstractmethod
+    async def handle(self, tool_name: str, tool_input: dict[str, Any]) -> str:
+        """Execute a tool call and return result as string."""
+        ...
+
+    def can_handle(self, tool_name: str) -> bool:
+        return True
+
+
+class CompositeToolHandler(ToolHandler):
+    """Delegates to the first handler that can handle the tool."""
+
+    def __init__(self, handlers: list[ToolHandler]) -> None:
+        self._handlers = handlers
+
+    async def handle(self, tool_name: str, tool_input: dict[str, Any]) -> str:
+        for handler in self._handlers:
+            if handler.can_handle(tool_name):
+                return await handler.handle(tool_name, tool_input)
+        return f"Error: no handler registered for tool '{tool_name}'"
+
+
+class LLMBackend(ABC):
+    """Abstract LLM execution backend."""
+
+    def identity(self) -> dict[str, Any]:
+        """What runs the calls: backend, model, and for the CLI backends the
+        CLI's version. Recorded once per run (the `backend_identity` event)."""
+        return {"model": getattr(self, "_model", None) or None}
+
+    @abstractmethod
+    async def tool_loop(
+        self,
+        system: str,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        tool_handler: ToolHandler | None,
+        max_turns: int = 30,
+        *,
+        paper_id: str | None = None,
+        specialist: str | None = None,
+    ) -> ToolLoopResult:
+        """Run a multi-turn tool-use conversation until end_turn or max_turns.
+
+        ``tool_handler`` may be ``None`` for tool-less calls (strategist
+        decisions, structured-output prompts) where we just want a completion
+        without tool dispatch.
+
+        ``paper_id`` and ``specialist`` are optional context the runner
+        already knows. SDK backends ignore them (the in-process tool handler
+        already carries this state). The CLI backend uses them to set
+        ``E2ER_PAPER_ID`` / ``E2ER_SPECIALIST`` in the subprocess env so the
+        ``e2er-allium-query`` wrapper can inject them automatically — the
+        specialist's prompt doesn't have to remember its own paper_id.
+        """
+        ...
+
+
+async def run_preflight(backend: Any) -> None:
+    """Run the backend's own check before a run's first specialist, if it has one (Codex: its sandbox).
+
+    Only an ``async def preflight`` defined on the backend's class counts, so the test doubles and
+    the SDK backends are left alone. The check raises to stop the run (SandboxBlockedError pauses it).
+    """
+    import inspect
+
+    check = getattr(type(backend), "preflight", None)
+    if check is not None and inspect.iscoroutinefunction(check):
+        await backend.preflight()
+
+
+def extract_json(text: str) -> dict[str, Any] | None:
+    """Extract the last JSON object from text output."""
+    import json
+    import re
+
+    # Try full parse first
+    try:
+        return json.loads(text.strip())  # type: ignore[no-any-return]
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    # Find last {...} block
+    matches = list(re.finditer(r"\{", text))
+    for m in reversed(matches):
+        start = m.start()
+        depth = 0
+        for i, ch in enumerate(text[start:]):
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    candidate = text[start : start + i + 1]
+                    try:
+                        return json.loads(candidate)  # type: ignore[no-any-return]
+                    except (json.JSONDecodeError, ValueError):
+                        break
+    return None

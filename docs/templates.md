@@ -1,0 +1,670 @@
+# Templates
+
+A template is a pipeline file in `pipelines/` (schema:
+`docs/schemas/pipeline.schema.json`). A run follows the template chosen when the
+paper is created; resume keeps it. e2er ships eleven:
+
+| Template | For |
+|---|---|
+| `empirical` | Question and data in, empirical paper out. The default. |
+| `empirical-preregistered` | `empirical` with a design review, a pre-registration frozen before estimation, and a review of the draft (see `researcher-step.md`). |
+| `event-study-finance` | Abnormal-return event studies around announcements; checks the estimation window and overlapping events before estimation. |
+| `policy-evaluation` | What a policy changed, by difference-in-differences: the design is checked against the data before estimation and pre-registered; the event study, pre-trends test and placebo or sensitivity analysis are checked after it. |
+| `spatial-analysis` | How a variable varies across regions or places: boundaries, CRS and weights checked before the analysis; Moran's I recomputed with permutation inference, and maps drawn from the saved data. |
+| `replication` | Computational reproduction of a published study from its Zenodo replication package; the product is a reproduction report, not a paper. |
+| `field-map` | A map of a research field by main path analysis of its citation network (OpenAlex), with robustness across alternative boundaries, a reading list, network exports and a short field review. |
+| `descriptive-study` | A description of a sample in any field: summary statistics, distributions, associations and figures, after a data check (units, duplicates, missing values, coverage); every figure re-read from its data. |
+| `time-series-forecasting` | A series, its trend and seasonality, models and forecasts: the setup and its hold-out frozen before fitting, every model judged on the hold-out against naive baselines, forecasts with intervals; optional pre-registration. |
+| `systematic-review` | A systematic review with a random-effects meta-analysis (PRISMA 2020): protocol, a recorded OpenAlex search, screening with a reason for every exclusion, open-access full texts, extraction with every number traced to its page and quote, e2er's own meta-analysis code, forest, funnel and flow figures; a narrative synthesis when too few studies can be pooled. |
+| `text-analysis` | Counts and models of the language of a corpus (Project Gutenberg or the researcher's texts): term frequencies, key terms by log-likelihood with the log ratio, collocations, dictionary and sentiment measures with a hand-checked sample, topic models with their stability across seeds. The corpus design is reviewed before the corpus is built; e2er recounts every number from the corpus. |
+
+## The abstract step
+
+Every template whose paper is compiled has an `abstract` step after every step
+that writes the paper: after `revision` in empirical, empirical-preregistered,
+event-study-finance, policy-evaluation, spatial-analysis, descriptive-study,
+text-analysis, time-series-forecasting and systematic-review, and after
+`review_draft` in field-map (which has no revision). Up to 0.18.0 the systematic
+review's and the field map's writers wrote the abstract themselves and it went
+into the paper unchecked; their writers now leave it out, as the drafter does.
+`tests/test_abstract_step.py` reads the templates in `pipelines/` and holds every
+one with `compile` in its `finalize` to this:
+
+```toml
+[[steps]]
+kind = "specialists"
+name = "abstract"
+run  = ["abstract_writer"]
+```
+
+The abstract writer reads the final `paper_draft.tex`, the result values the
+paper's text cites (its `% src:` notes) and what the reviewers and the
+self-attack said about the abstract (`abstract_findings.json`, written by the
+revision step whatever the reviewer's score), and writes `abstract.tex`. A
+deterministic check then reads it (`src/core/abstract.py`): at most 160 words;
+no p-values, intervals, standard errors, Fisher-z or test statistics; at most
+three numbers (years, the base of a rate and a sample threshold do not count),
+each a value of the results at the precision shown; no coefficient or estimate
+quoted as a raw number (a number next to estimate, coefficient, shift, effect,
+beta or slope needs a plain unit; a signed decimal below 1 without a unit is a
+coefficient); a sentence that states a
+finding; a last sentence that is no negation and has no "rather than"; none of
+the constructions the phrase check refuses, "X, not Y" and the mirrored
+"changed A; changed nothing about B" among them. A failure sends the writer
+back once with the reasons. A second failure is a finding: `abstract_check.json`
+(exported to `reviews/`) and a failed `abstract` check in the dossier; the run
+goes on. Under `--governance off` or `contracts` the verdict is recorded and
+nobody is sent back. The compiler puts `abstract.tex` into the paper, in place
+of the draft's abstract environment or after the title, so the PDF,
+`report.html` and the title read from `abstract.tex` show one abstract. The
+strategist no longer plans the abstract writer, and the paper drafter is told
+to leave the abstract out. The field-map and systematic-review templates keep
+the abstract their review writers write. `e2er abstract <folder>` runs the
+same step on a finished study (docs/publishing.md).
+
+## Skills and files a template adds
+
+A template can give its specialists extra skills and ask them for extra
+machine-readable files, for its own runs only:
+
+```toml
+[skills]
+identification_strategist = ["econometrics/event-study"]
+
+[sidecars]
+identification_strategist = ["event_design.json"]
+```
+
+Both are added after the specialist's own entries in
+`src/core/specialists/registry.py`, never instead of them. A skill must name a
+file e2er ships (`skills/files/<path>.md`) or has installed; an unknown skill,
+specialist or file name stops the template from loading. The merged skills are
+listed in the study's description (`e2er.json`, `components.skills`) and pinned
+in its dossier; the run also logs them as a `template_components` event.
+
+## How long one call may run
+
+On the CLI backends (Claude Code, Codex, Gemini) each specialist call has a
+time limit, by default the backend's setting (`CLAUDE_CODE_TIMEOUT`,
+`CODEX_TIMEOUT`, `GEMINI_TIMEOUT`, 1,800 s). The data analyst, which loads the
+data, gets at least 60 minutes. A template can set the limit per specialist,
+or per step for everything the step dispatches:
+
+```toml
+[timeouts]
+data_analyst = 90          # minutes
+
+[[steps]]
+kind = "strategist"
+name = "initial"
+timeout_minutes = 45       # the step's specialists, unless [timeouts] names them
+```
+
+A call that runs out of time pauses the run with the reason; the files it wrote
+are kept, and Resume gives the specialist a new attempt.
+
+## Results, causal claim, persona, data skills and panel (outside economics)
+
+e2er's defaults come from economics: the analysis must report a regression
+(`coefficients`, t = estimate / se), an identification strategy is required,
+specialists read the economist persona, the data specialists read the
+blockchain and DeFi skills, and six reviewers score the draft with mechanism
+and identification among them. A template for astronomy, earth science,
+geography, health or literature declares what it needs instead:
+
+```toml
+results     = "descriptive"     # regression (default) | descriptive | timeseries | spatial | text | metaanalysis
+causal      = false             # default: true for regression, false for every other kind
+base_skill  = "base/researcher" # default base/economist
+data_skills = []                # replaces the blockchain/DeFi/Allium data skills; absent = as before
+review_weights = { methods_reviewer = 1.5, data_reviewer = 1.25 }
+
+[[steps]]
+kind = "aggregate"
+name = "review"
+run  = ["data_reviewer", "methods_reviewer", "plausibility_reviewer", "literature_reviewer", "writing_reviewer"]
+```
+
+- **`results`** names the contract `estimation_results.json` is held to
+  (`src/core/pipeline/result_kinds.py`). Every kind is written by the same
+  script (`run_estimation.py`) to the same file, so rerun, export and
+  reproduce work unchanged; a file of a kind other than regression starts
+  with `"result_kind": "<kind>"`. Each kind has a schema skill
+  (`skills/files/data/<kind>-results-schema.md`) and deterministic checks:
+  *descriptive* (summary statistics with ordered quantiles, distributions
+  whose counts add up, figures declared in `figure_spec.json`), *timeseries*
+  (fitted models with fit statistics, forecasts inside their intervals,
+  out-of-sample RMSE and MAE with MAE <= RMSE), *spatial* (units, spatial
+  statistics with their weights, Moran's I expectation -1/(n - 1), p from z,
+  map specifications), *text* (corpus counts, term frequencies whose
+  per-10,000 values follow from the counts, text-model outputs), *metaanalysis*
+  (studies with their effects and variances, the flow counts adding up, the
+  pooled estimate and tau^2 recomputed from the studies, heterogeneity,
+  prediction interval and Egger's test, or a narrative synthesis below the
+  minimum number of studies). The number
+  check traces the paper's numbers to the kind's files, and `e2er verify`
+  adds a `results contract` check for these kinds. Tables of statistics,
+  bins, periods or terms are `records` tables in `table_spec.json` (see
+  `skills/files/data/table-spec.md`); figures may be `scatter` and
+  `histogram` besides the earlier types.
+- **`causal = false`**: `identification_spec.json` is not required and not
+  asked for, and a regression need not implement one.
+- **`base_skill`** replaces `base/economist` wherever a specialist reads it.
+- **`data_skills`** replaces the domain data skills of the data architect
+  and analyst (`data/blockchain`, `data/crypto-defi`, `data/allium-cli`,
+  `data/allium-developer-api`); the general connector skills stay.
+- **The panel** is the template's `aggregate` step, now honoured as written
+  (the six economics reviewers are the default panel). Two
+  discipline-neutral reviewers can join it: `methods_reviewer` (whether the
+  methods answer the question in the field's own terms) and
+  `plausibility_reviewer` (whether the numbers are plausible in the domain).
+  `review_weights` sets a reviewer's weight in the combined score; the
+  mechanism rule applies only to a panel with a mechanism reviewer.
+- **Polish** runs only the polish specialists the template's `polish` step lists.
+
+A template that sets none of these runs exactly as before. What a template
+changes is logged in the `template_components` event (`core`) and shown to
+every specialist and the strategist as a short template block in their
+context. `pipelines/descriptive-study.toml` and
+`pipelines/time-series-forecasting.toml` are the shipped templates of two
+kinds (below); the replay tests run them end to end.
+
+## Optional researcher steps
+
+A `researcher` or `preregister` step with `optional = true` runs only when the
+researcher chooses it for the run: it is one of the "also stop" choices on New
+study and `e2er run --review-at <step>` turns it on. A run that does not choose
+it follows the template without the step (`PipelineSpec.chosen`), and its
+step list does not show it. The time-series template's pre-registration is
+optional this way.
+
+## Credit
+
+A template names the work it is based on, draws from or cites in `[[credit]]`
+tables: the authors (field `creator`), the role (`conceptualization`, `method`, `related work`),
+the relation (`based_on`, `related_work`, `cites`), the title, the address, the
+dates it was published and read, and where it was found. `based_on` says where
+the idea came from; it does not say its authors endorse the template. e2er.org
+cites a `based_on` entry on the template's page as "Based on" with a link to
+the work; the people who wrote it are cited as the source and get no page of
+their own. e2er's own parts also list their credit in `credits.json` at the
+repository root, for the catalogue of e2er.org.
+
+A run records its template's credit in the `template_components` event, and
+the dossier of a published run carries it as `credit`: the template's name and
+the `[[credit]]` entries as the template file wrote them, so e2er.org can say
+"Template based on …". A template without `[[credit]]` adds nothing to the
+dossier.
+
+```json
+"credit": {
+  "template": "field-map",
+  "entries": [
+    {"creator": "Michal Hron", "role": "conceptualization", "relation": "based_on",
+     "title": "Map a research field with Claude: main path analysis, step by step",
+     "url": "https://www.linkedin.com/pulse/…", "accessed": "2026-10-08", "…": "…"}
+  ]
+}
+```
+
+```toml
+[[credit]]
+creator   = "Michal Hron"
+role      = "conceptualization"
+relation  = "based_on"
+title     = "Map a research field with Claude: main path analysis, step by step"
+publisher = "LinkedIn Pulse"
+published = "2026-10-08"
+url       = "https://www.linkedin.com/pulse/map-research-field-claude-main-path-analysis-step-michal-hron-jm2ge/"
+accessed  = "2026-10-08"
+found_via = "shared by the e2er authors"
+```
+
+
+## `systematic-review`
+
+A systematic review with a random-effects meta-analysis, following the PRISMA
+2020 statement (Page et al. 2021): the protocol is fixed before the search,
+the search is recorded and repeatable, every exclusion has a reason, studies
+are assessed on their full text where an open-access one exists, risk of bias
+is judged per study, heterogeneity is always reported, and the flow of records
+is drawn. What e2er adds: every number the extractor takes from a study is read
+back from the page and quote it cites, and the meta-analysis is e2er's own code
+(`src/modules/metaanalysis/stats.py`, numpy and scipy only), written into the
+study as `run_estimation.py` so that `e2er reproduce` reruns it. The code's
+REML and DerSimonian-Laird estimates, tau^2, I^2, H^2, Q and trim and fill
+reproduce metafor's published results for the BCG vaccine trials (13 studies)
+to four decimals (`tests/test_metaanalysis.py`).
+
+Four specialists of its own: the **protocol designer** (`review_protocol.json`
+and `.md`), the **study screener** (`screening.json`), the **study extractor**
+(`extraction.json`) and the **review writer** (`paper_draft.tex`). The rest is
+code. The method skill is `methods/meta-analysis` (the files' schemas, what to
+quote, the pitfalls); the results schema is `data/metaanalysis-results-schema`.
+
+| Step | Kind | What happens |
+|---|---|---|
+| `design_protocol` | specialist | The question in PICO, PECO or another form; eligibility criteria as `include` and `exclude` lists, each with an id (I1, E1, ...); `databases`; `searches` (Boolean concept blocks, years, types, optionally open access only); the outcome; the effect measure (SMD, MD, RD, OR, RR, HR, their logs, r, or generic) and what a positive value means; the synthesis (`tau2_method` REML or DL, `min_studies`, `ci_level`); the risk-of-bias tool, its domains and levels. The designer sizes each search with `e2er-fieldmap count` (one OpenAlex request each). |
+| `search` | check `meta_search` | Every search on OpenAlex (and Crossref when named: its most relevant `max_crossref` records only, since Crossref has no Boolean search, and the log says so). One request reads a search's size first; a search above `max_records` (default 600) is refused before its pages are read. Pages are cached in the workspace, so a rerun sends no request; at most `max_requests` (default 40). Duplicates are removed by DOI, then by title and year. Writes `records.json`, `records.csv`, `search_log.json` (each query as sent, the count reported, the records read, the time) and `search_counts.md`, and records each search in `data_sources.json` (OpenAlex, CC0). Runs at every start, so an edited protocol is searched again. |
+| `review_protocol` | researcher | Approve or edit the protocol, with the counts. |
+| `preregister` | preregister, **optional** | The protocol and the search counts assembled into `preregistration.md` and frozen; `review_protocol.json` is a plan file, and a change after the freeze stops the synthesis. |
+| `screen` | specialist | One decision per record on its title and abstract: include, exclude (with the ids of the criteria it meets or fails and a reason) or unsure (the full text decides). |
+| `screening_check` | check `meta_screening` | Every record decided once, no decision for anything else, every exclusion with a criterion the protocol defines and a reason. Writes `screening_check.json` and `screening_sample.md`: the unsure records, the inclusions and a seeded sample of `sample_size` (default 20) exclusions with their abstracts. The same check is the screener's output contract, so the screener is sent back with the problems before the run stops. |
+| `review_screening` | researcher | Read the sample and correct decisions in `screening.json`; the check runs again on approval. |
+| `fulltext` | check `meta_fulltext` | For every record included or unsure: a PDF the researcher saved (`data/fulltext/<id>.pdf`, or `fulltext/<id>.pdf` in a `LOCAL_DATA_DIR` folder; `<id>` is the record id or the DOI with `/` as `_`), else the open-access PDF OpenAlex lists, else the open-access resolvers by DOI. Text page by page (pypdf, running heads removed) to `fulltext/<id>.txt`; `fulltext_log.json` records the origin and SHA-256, or why no full text is available. At most `max_downloads` (default 150). Runs at every start: a PDF saved since is read; earlier failures are not downloaded again (remove a record from `fulltext_log.json` to retry it). Full texts stay in the workspace and are not exported. |
+| `extract` | specialist | Per record: include or exclude on the full text (or on the abstract when there is none, said in `source_text`; a record with neither can only be excluded, `source_text: "title"`), the effect exactly as printed, the study's characteristics, `n_total`, risk of bias per protocol domain, and for every number the page and a verbatim quote that prints it. A study with no poolable statistic stays included with `effect: null` and a reason. |
+| `extraction_check` | check `meta_extraction` | Every extracted number read back: the quote must be on the page given (elsewhere in the text is accepted with a note; across a page break too), or in the abstract for a study read from its abstract, and the number must be printed in the quote. Every full-text exclusion has a criterion and a reason; every included study has its risk of bias with the protocol's domains and levels; every effect can be put on the analysis scale. Writes `extraction_check.json` and `.md`, `meta_studies.csv`, `risk_of_bias.csv` and `prisma_counts.json`. The trace is also the extractor's output contract (a verification check: the extractor is sent back with the untraced numbers before the run stops). |
+| `review_extraction` | researcher, **optional** | Read the extraction table before anything is pooled. |
+| `synthesis` | check `meta_synthesis` | Writes `run_estimation.py` (e2er's code) and runs it: effects on the analysis scale (log ratios, Fisher's z for r, Hedges' g from group statistics; an SE as printed, else from the CI), the random-effects estimate with tau^2 by REML or DL, z, p and CI, Q, I^2 and H^2, the prediction interval (t on k - 2 df), the common-effect estimate, Egger's test and trim and fill (L0) with a low-power flag below ten studies, and leave-one-out. Below the protocol's `min_studies`: no pooling, `narrative_only`. The results are held to the meta-analysis contract (the pooled estimate and tau^2 recomputed from the studies, the flow counts adding up). Draws `fig_forest.pdf`, `fig_funnel.pdf` and `fig_prisma.pdf` (figure types `forest`, `funnel`, `prisma`), writes `tables/meta_flow.tex`, `tables/meta_studies.tex` and `tables/meta_results.tex`, and adds the methods' and the included studies' entries to `literature.bib` (keys in `meta_references.json`). |
+| `write_draft` | specialist | The review, PRISMA item by item, with the three tables and figures included (no table written by hand), every number from the results, every included study cited; its output contract checks the inclusions and the citations. |
+| `review_draft` | researcher | Read the draft. |
+| `review` | reviewers | Number check, citation check, then `methods_reviewer` (1.5), `data_reviewer` (1.25), `technical_reviewer`, `plausibility_reviewer`, `writing_reviewer` (0.75). |
+| `revision` | specialists | As in the other templates. |
+| `abstract` | specialist | The abstract writer, from the final review, and the abstract check (see [The abstract step](#the-abstract-step)). |
+
+`e2er verify` on an exported review checks the results contract (pooled
+estimate recomputed, flow counts) and, as its method checks, that every effect
+in `meta_studies.csv` is the extraction's, that every extracted number is
+printed in its quote (and a quote from an abstract is in the record's
+abstract), that the run's trace left nothing untraced, and that each study's
+`yi` and `vi` follow from its statistics. The full texts are not in the export,
+so the page-level trace is the run's (`extraction_check.json`).
+
+What it does not do: a second independent screener and agreement statistics,
+searches of MEDLINE, Embase, PsycINFO or Web of Science, subgroup analyses and
+meta-regression, multilevel models for several effects per study, and risk of
+bias by a tool's full algorithm. A review should state these limits.
+
+Method sources (`[[credit]]`, DOIs checked on Crossref on 2026-10-11): Page et
+al. (2021) as the basis; DerSimonian and Laird (1986); Viechtbauer (2005);
+Higgins and Thompson (2002); Riley, Higgins and Deeks (2011); Egger et al.
+(1997); Duval and Tweedie (2000); Viechtbauer (2010).
+
+## `field-map`
+
+Maps a research field by main path analysis. The workflow follows Michal Hron's
+article "Map a research field with Claude: main path analysis, step by step"
+(LinkedIn Pulse, 8 October 2026); this implementation is independent and uses
+OpenAlex. Taken from the article: the six steps below and the pitfalls the
+skill lists. e2er's own: the code (`src/modules/fieldmap`), the OpenAlex
+retrieval, the handling of citation cycles, the exports, the steps and stops,
+and the number-checked review. Hron's own implementation runs on Scopus
+(github.com/michalhron/scopus-plus-mcp); nothing of it is used.
+
+| Step | Kind | What happens |
+|---|---|---|
+| `design_boundary` | specialist | The boundary designer writes `field_boundary.json`: the main boundary (search terms with the topic's older names, OpenAlex source ids of a journal set, years) and 2 to 6 alternatives. `e2er-fieldmap count` and `e2er-fieldmap sources` read sizes and journal ids, one OpenAlex request each. |
+| `retrieve_boundary` | check `field_retrieve` | Retrieves every boundary from OpenAlex: one request for the size (a boundary above `max_papers` is refused), then pages of 100 with cursor paging, at most `max_requests`, cached in `fieldmap/cache/`. Runs at every start; unchanged boundaries send no request. Each load is recorded in `data_sources.json` (OpenAlex, CC0, with OpenAlex's citation). |
+| `review_boundary` | researcher | Approve or edit the boundaries, with the counts in `field_boundary_counts.md`. |
+| `citation_network` | check `field_network` | The network of citations inside the main boundary (from the cited to the citing paper) and `completeness_report.md`: papers without internal links, without references, with short reference lists, probable duplicates, notices, broken cycles. Stops when more than `max_isolated_share` (default 50%) of the papers have no internal link, more than `max_missing_refs_share` (default 40%) have no references, or there are fewer than `min_papers` (default 100). The defaults come from five boundaries (see the calibration below). |
+| `main_path` | check `field_main_path` | SPC weights (exact integers), the global main path (largest total SPC; ties all kept and counted), the local forward main path, key routes from the `key_routes` heaviest links (ties with the last included), the heaviest links (`main_path.md`). |
+| `robustness` | check `field_robustness` | The same on every alternative boundary; papers on the main path of every boundary are robust (`robustness.md`). |
+| `propose_lanes` | specialist | The lane mapper groups the mapped papers into 2 to 8 lanes named as questions (`field_lanes.json`), from titles and abstracts. |
+| `review_lanes` | researcher | Approve or edit the lanes. |
+| `draw_map` | check `field_map` | `figures/field_map.png`/`.svg`/`.pdf`, `reading_list.csv`/`.json`, `exports/` (Pajek `.net`, GEXF, VOSviewer map and network, CSV edges), `tables/field_map_summary.tex`, `tables/main_path_list.tex`, `field_map_results.json`; the methods' references go into `literature.bib`. |
+| `write_review` | specialist | The review writer drafts `paper_draft.tex`, with every number from `field_map_results.json`. |
+| `number_check`, `citation_check` | checks `numbers`, `citations` | The number check and the citation check on the draft, as steps of their own. |
+| `review_draft` | researcher | Read the draft. |
+| `abstract` | specialist | The abstract writer, from the review as the researcher left it, and the abstract check (see [The abstract step](#the-abstract-step)). |
+
+Cycles: inside each group of papers that cite each other in a circle, only the
+citations from an earlier to a later paper (year, date, OpenAlex id) are kept;
+every dropped citation is listed in `completeness_report.json`. Nothing is
+estimated, so the template has no estimation gate and no econometrics step.
+Set `OPENALEX_API_KEY` (free) to use a key's own request budget instead of the
+budget OpenAlex shares among keyless requests from one network.
+
+### Calibration of the completeness stops
+
+The stop values of `citation_network` were set on 2026-10-10 from five
+boundaries (main boundary only, 31 OpenAlex requests for the four new ones):
+
+| Boundary | Papers | Without internal links | Without references | Main path |
+|---|---:|---:|---:|---:|
+| main path analysis (scientometrics, 2026-10-08) | 346 | 18% | 15% | 17 papers |
+| expectation-confirmation model / IS continuance (information systems) | 1,164 | 33% | 35% | 18 papers |
+| Ricardian equivalence (economics) | 685 | 40% | 30% | 18 papers |
+| wash trading (finance niche) | 62 | 58% | 44% | 5 papers, 8 tied |
+| token airdrops (crypto niche) | 60 | 87% | 62% | 5 papers |
+
+Established literatures stay at or below 40% without internal links and 35%
+without references; the two niches are above 55% and 44%. The stops are set
+between the groups: 50% and 40% (before: 60% and 25%; 25% would have stopped the
+information-systems and economics boundaries). `skills/files/synthesis/main-path-analysis.md`
+has the full table.
+
+## `policy-evaluation`
+
+A policy reached some units at known dates and not others; the study
+estimates what it changed by comparing the treated units' change with the
+change of units not (yet) treated. The methods follow the recent
+difference-in-differences literature (Roth, Sant'Anna, Bilinski and Poe
+2023): with staggered timing a two-way fixed-effects regression averages
+comparisons that use earlier-treated units as controls, with weights that can
+be negative when effects differ (Goodman-Bacon 2021; de Chaisemartin and
+D'Haultfœuille 2020), so the template asks for a heterogeneity-robust
+estimator (Callaway and Sant'Anna 2021; Sun and Abraham 2021; Borusyak,
+Jaravel and Spiess 2024; and others). The skill
+`econometrics/did-practice` gives the design file's schema, the estimators,
+the results block and how to compute the pre-trends test and a
+relative-magnitudes bound with numpy and scipy.
+
+| Step | Kind | What happens |
+|---|---|---|
+| `did_design_gate` | check `did_design`, after the identification strategist, data architect and data analyst | Reads `did_design.json` (outcome, panel, treatment timing, comparison group, estimator) and the panel in `data.db`. Fails when the outcome or timing is not in the data, when there is no comparison group (no never-treated unit, or no later-treated unit for a not-yet-treated design), when timing is staggered and the estimator is `twfe`, or when no cohort has `min_pre_periods` (default 2) periods before treatment. Staggered timing with a robust estimator passes with a warning. A failed check sends the identification strategist back once with the reasons (`on_fail = "retry"`), then stops the run. Writes the cohorts, the treated, never-treated and always-treated units and the pre-periods per cohort to `did_design_check.json`. |
+| `preregister` | researcher, after the design specialists and the data analyst | The design (with `did_design.json`) is assembled into `preregistration.md` and frozen on approval; `did_design.json` is one of the plan files whose later change is a deviation. Approving straight away is the shortest path. |
+| `did_results_gate` | check `did_results`, after the econometrics specialist, before drafting | Requires in `estimation_results.json`: `event_study.periods` with at least `min_pre_periods` pre-treatment periods besides the reference period and at least one after treatment; `pre_trends` (joint test, its p-value and number of pre-periods, which must match the path); `placebo` or `sensitivity`; and `main.estimator` naming the declared estimator (never `twfe` on staggered timing). A pre-trends test that rejects at `pretrend_alpha` (default 0.05) stops the run unless `sensitivity` holds a Rambachan–Roth analysis (relative magnitudes or smoothness bounds), and then the check warns that the conclusion rests on it. The event-study plot (`fig_event_study.pdf`) is drawn from the results when `figure_spec.json` has none; one that is there must show the results' numbers. A failed check sends the econometrics specialist back once, then stops the run. Writes `did_check.json`. |
+
+The rest is the empirical template's: estimation check, panel review
+(identification, data, methods, writing and technical reviewers, the
+identification reviewer weighted 1.5), revision and replication package.
+`e2er verify` runs the results side of the check again on the export
+(`method checks`). The template cites its method sources in `[[credit]]`.
+
+## `spatial-analysis`
+
+How a variable varies across places, and whether neighbouring units are
+alike. No causal claim: no identification strategy is asked for, the
+specialists read the researcher persona, and the panel is methods, data,
+plausibility, writing and technical. The results follow the spatial contract
+(`results = "spatial"`); the skill `data/spatial-statistics` gives the
+design file, how to build contiguity and nearest-neighbour weights with
+numpy, Moran's I with permutation inference (Moran 1950), local clusters
+(Anselin 1995; Getis and Ord 1992), and the points that change the answer:
+the modifiable areal unit problem (Openshaw 1984), the choice of weights,
+edge effects and islands.
+
+| Step | Kind | What happens |
+|---|---|---|
+| `spatial_design_gate` | check `spatial_design`, after the data architect and the data analyst | Reads `spatial_design.json` (units, boundaries, CRS, weights). Fails when the boundaries' source is not recorded (a load from `e2er-data gisco` or `naturalearth` in `data_sources.json`, or the researcher's own file or table with its source, licence and attribution), when the CRS is missing or does not fit the coordinates, when a data unit has no geometry and is not listed under `units_without_geometry` with a reason (by its id, or by a pattern such as `"CH*"` for a group of ids; the ids a pattern covers are written out) (or more than `max_unmatched_share`, default 20%, have none), or when the weights are not documented (type and its parameter, row standardisation, islands). A failed check sends the data architect back once with the reasons, then stops the run. Writes the match to `spatial_design_check.json`. |
+| `spatial_results_gate` | check `spatial_results`, after the econometrics specialist, before drafting | Reads `spatial_units.csv` (the units and values the analysis used) and `spatial_weights.csv` (from, to, weight). Recomputes every Moran's I from them and stops the run when one differs, when no Moran's I has permutation inference with at least `min_permutations` (default 99) permutations, when a p-value is below 1/(permutations + 1), or when the weights file names unknown units, links a unit to itself or (row-standardised) has rows that do not sum to 1. LISA clusters are optional; their counts must add up to at most the number of units. Every map the results name becomes a `map` figure built from the design's boundaries and the units file. Writes `spatial_check.json`. |
+
+Maps are a figure type of their own (`figure_type: "map"`, see
+`skills/files/data/figure-spec.md` and `src/core/renderer/maps.py`):
+choropleths in quantile, equal-interval or given classes, category maps
+(LISA clusters), and point maps, drawn with matplotlib alone from a `data.db`
+table or a GeoJSON file and the values in a CSV or a table, in an equal-area
+projection for Europe or Equal Earth for the world; units without data are
+drawn as "No data", data units without geometry are named in the render
+report, and the boundaries' attribution is printed on the map.
+
+Boundaries come from two sources added with the template:
+
+| Source | `e2er-data` | Terms |
+|---|---|---|
+| Eurostat GISCO | `gisco nuts --level 2 --year 2021 --scale 20M`, `gisco countries` | Non-commercial use with the notice "© EuroGeographics for the administrative boundaries" on every map; the files may not be passed on, so a published study loads them again (`get_data.py`), and e2er does not deposit them on Zenodo. |
+| Natural Earth | `naturalearth countries --scale 110m` (release v5.1.2) | Public domain. |
+
+## `text-analysis`
+
+Counts and models of language in a corpus: books from Project Gutenberg
+(`e2er-data gutenberg books|text`: Gutendex catalogue, texts from Project
+Gutenberg's mirror with its licence removed), or the researcher's own texts
+(`.csv` or `.jsonl` with a text column in the data folder, imported into
+`data.db`; plain `.txt` files read by the build script, one document per
+file). No causal claim; the researcher persona; the panel is methods, data,
+plausibility (read as a scholar of the texts would), writing and technical.
+The results follow the text contract (`results = "text"`); the skill
+`methods/text-analysis` gives the design file, the corpus build, the
+preprocessing every check applies, the statistics (Dunning 1993; Rayson and
+Garside 2000; Hardie's log ratio; Church and Hanks 1990), the topic models
+(LDA, Blei, Ng and Jordan 2003; NMF, Lee and Seung 1999) and their stability
+(Greene et al. 2014), and the validation Grimmer and Stewart (2013) ask for.
+numpy, scipy and scikit-learn; nothing is downloaded.
+
+One specialist is the template's own: the **text validator** reads every
+passage of the sample the analysis drew of each dictionary and sentiment
+measure and judges whether the word means there what the measure assumes
+(`text_validation.json`, with a reason for every item and the precision).
+
+The preprocessing is applied the same way everywhere: Unicode NFC,
+lower-casing when declared, every match of the recorded token pattern, then
+the recorded lemma table. Token counts count every token; the recorded stop
+words only leave term lists and models.
+
+| Step | Kind | What happens |
+|---|---|---|
+| `corpus_design_gate` | check `corpus_design`, after the data architect | Reads `corpus_design.json`. Fails when the question, the corpus definition, the selection or the sampling is missing; when the statement of sampling bias is missing; when the corpus table is not named; when a metadata field has no source; when the preprocessing is unusable (a token pattern with capturing groups or an empty match, lower-casing not true or false, stop words or lemmas neither `"none"` nor a file in the study folder with its source, n-grams beyond 3); when a group is not defined by a metadata column or a list of documents; or when an analysis lacks what makes it checkable (keyness its two groups, a dictionary or sentiment measure its word list and source, a topic model LDA or NMF with at least two candidate numbers of topics and `min_seeds`, default 3, seeds). Sends the data architect back once, then stops the run. |
+| `review_design` | your review | After the plan, the literature and the corpus design; before the corpus is built. |
+| `corpus_gate` | check `corpus`, after the data analyst | Reads the corpus table in `data.db` and `corpus_manifest.json`. Fails when a document has no source or licence, ids repeat, two documents have the same text, a SHA-256 or a token count is not e2er's, the corpus statistics (documents, tokens, types, the length distribution) are not e2er's, a word list the design names is missing, or a metadata value is missing without a stated reason. Freezes the word lists with their SHA-256 and writes `corpus_check.json`. Sends the data analyst back once, then stops. |
+| `text_results_gate` | check `text_results`, after the econometrics specialist, before drafting | Recounts from the corpus: the preprocessing the results state against the design's, the corpus figures, every term count, group size, frequency per 10,000 tokens and dispersion; every keyness score (G2, log ratio, p-value, direction); adjacent collocations and their PMI; the hits of every dictionary and sentiment measure, whose word list must be the design's. Topic models need a recorded seed, a metric for at least two numbers of topics, runs under at least `min_seeds` seeds whose stability (mean best-match Jaccard overlap of the top terms) e2er recomputes, at least five top terms and `min_examples` (default 2) example documents of the corpus per topic, and shares that add up to 1 per group. Fails also on a word list changed after the corpus check, a stop word in a term list, a diachronic, keyness or topic model without a figure drawn from its results, and a missing statement of sampling bias. Writes `text_check.json`. Sends the analysis back once, then stops. |
+| `text_validation_gate` | check `text_validation`, after the analysis and the text validator | For every dictionary and sentiment measure: a sample (`validation_sample.json`) drawn with a recorded seed, at least `min_validation_items` (default 20) items or every hit; every quoted passage found verbatim in its document with a hit of the word list; every item judged, nothing judged that is not in the sample, a reason for every item judged wrong; the precision equal to the share judged right. Writes `text_validation_check.json`. A study without such a measure passes with nothing to validate. Sends the text validator back once, then stops. |
+| `estimation_gate`, `figure_gate` | checks | The text results contract; every figure re-read from the results it names. |
+| `review_draft` | your review | Before the panel. |
+
+`e2er verify` recounts the results and the validation again on the exported
+corpus (`method checks`); without `data/data.db` in the folder it says that
+nothing was recounted. The template cites its method sources in `[[credit]]`.
+
+## `event-study-finance`
+
+A fork of `empirical-preregistered` with one more step: the `event_window`
+check, which runs inside the initial phase after the identification strategist,
+the data architect and the data analyst, and before the econometrics specialist.
+The identification strategist declares the events and windows in
+`event_design.json` (schema in `skills/files/econometrics/event-study.md`). The
+check fails, and the run stops before estimation, when
+
+- the estimation window is shorter than `min_estimation_days` (default 120
+  trading days) or ends fewer than `min_gap_days` (default 10) before the event
+  window;
+- more than `max_overlap_share` (default 0) of the events overlap in their event
+  windows for the same firm or asset, and the design declares no treatment for
+  overlaps (`drop`, `cluster` or `aggregate`);
+- an event date is not a trading day in the data calendar the design names, or
+  a window runs past the data.
+- the design names the researcher's own event table (`events_source`) and its
+  event dates are not exactly that table's dates; a date without trading maps
+  to the next trading day, and the check's result lists each such mapping. Without
+  `events_source`, a table in the data that looks like an event list only
+  produces a warning.
+
+The calendar is a table `data_dictionary.json` declares under `tables` and the data analyst
+loaded; when it is not, the failure lists the tables in `data.db`. Before the pre-registration
+freezes, the run also stops if anything has already been estimated, and after it freezes, a change to
+the plan stops the run before the estimation until the researcher approves it as a deviation or puts the
+plan back (see `researcher-step.md`).
+
+The three settings are in the template, under the gate's `[steps.settings]`.
+A failed check stops the run at the check with its reasons (`e2er review`
+shows them): edit `event_design.json` or send the identification strategist
+back, and the check runs again on resume. Approving does not pass it. Each
+result is recorded like the other checks and appears in the dossier. With
+`on_fail = "retry"` the identification strategist is sent back once with the
+reasons before the run stops; with `"shadow"` the result is only recorded.
+
+A gate step with `after = [...]` is how any check can sit inside the initial
+phase; it also runs before a group that contains the econometrics specialist,
+so a plan that leaves out one of the named specialists does not skip it.
+
+`before = ["paper_drafter"]` on such a gate holds the named specialists back until the check has
+passed, in every phase: when the next group of a dispatch contains one of them, the specialists of
+`after` that have not run are sent out first (the plan left them out), then the check runs, then the
+group. The text-analysis template's checks of the results, the policy-evaluation and spatial checks
+of the results, the descriptive data check and its figures, and the time-series forecast check pass
+before the draft is written this way. A check that runs as a step of its own may also name `before`;
+the file is refused unless it comes before every step that runs those specialists (the
+systematic-review extraction and synthesis before the review writer).
+
+## `replication`
+
+A computational reproduction: rerun a published study with its own data and
+code and compare every reported number with what the rerun produces
+("reproduction tests rerun published studies", Brodeur et al., 2025; Kohler et
+al., 2026). Robustness checks are a separate study. The question names the
+Zenodo record:
+
+```bash
+e2er run "Computational reproduction of <paper title> (10.5281/zenodo.<id>)" --template replication
+```
+
+| Step | Kind | What happens |
+|---|---|---|
+| `fetch` | check `package_integrity` | The record is read from the public Zenodo API (no key). Every file is downloaded, verified against the checksum Zenodo publishes (MD5) and hashed with SHA-256; a mismatch fails the step. Archives are unpacked into `package/`, every unpacked file is hashed, and the tree is made read-only. PDF text goes to `package_text/`, page by page. All of it is in `package_manifest.json`. The step runs at every start: the package is re-hashed (one changed byte fails the step), and the paper the researcher supplies is staged (below). |
+| `plan` | specialist `replication_planner` | Reads the README, the documentation and the code; lists the entry points in run order, the pinned image and the packages, maps every table and figure to its script and output, and records the targets at two levels (below). Writes `replication_plan.json` (schema `docs/schemas/replication_plan.schema.json`) and `replication_plan.md`. The plan is validated before the run uses it: pinned official image, interpreter plus package-relative script, no inline code, no shell. |
+| `review_plan` | researcher | The run stops. Approve, edit the plan, or send the planner back. |
+| `sandbox_run` | check `sandbox` | Runs the plan in Docker (below). Fails only when the sandbox cannot work (no Docker, invalid plan, image unavailable, package modified); a script that fails is a result. |
+| `compare` | specialist `reproduction_comparer` | Levels each result by the protocol: reproduced, reproduced with minor differences, not reproduced, could not be run. Writes `reproduction_report.json` (schema `docs/schemas/reproduction_report.schema.json`) and `reproduction_report.md`. |
+| `reproduction_gate` | check `reproduction` | Re-reads every reproduced number from the output file the report names (a CSV cell when a locator is given), requires that file to be one the run wrote, not one the package shipped, recomputes the differences, checks each level against them, and checks that every target is compared or listed as unassessed with a reason. Then it writes the counts and the environment into `reproduction_report.md` from the JSON (section "Counts and environment") and fails when the report's prose contradicts the JSON: a count that names its level, a table of counts, the label stated for a number, a package version. Writes `reproduction_check.json`. |
+| `review_report` | researcher | The run stops for the researcher to read the report. |
+
+The protocol both specialists follow is `skills/files/replication/reproduction-protocol.md`.
+
+### Package versions: as of the package date
+
+By default (`snapshot = "package-date"` in the sandbox step's settings) the
+install phase installs packages as they were on the Zenodo record's
+publication date: R packages from Posit Package Manager's dated CRAN snapshot
+(the image's p3m URL with `/latest` replaced by the date, e.g.
+`https://p3m.dev/cran/__linux__/noble/2026-08-30`, also written to
+`Rprofile.site` so it is the repository inside the run), Python packages with
+pip's `--uploaded-prior-to <date>T23:59:59Z`. `"latest"` installs the newest
+and `"YYYY-MM-DD"` a given day. Versions the plan declares win: R installs them
+with `remotes::install_version`, Python pins them with `==`. After the install a
+no-network container of the committed image reports the repository, the
+platform and every installed version, dependencies included; `sandbox_log.json`
+records them under `snapshot`, `install.installed`, `install.platform` and
+`declared_versions`, and the reproduction check copies them into
+`reproduction_check.json`. The comparer's report states the snapshot and the
+versions of the packages it discusses; the check compares each with the log.
+
+### Strict labels
+
+Each compared number is labelled by the protocol's thresholds, which the
+reproduction check applies too: `reproduced` when equal at the target's own
+precision (the printed decimals for the paper; within 1e-9 relative for a
+full-precision package cell), `reproduced_minor` when at most
+`minor_rel_tolerance` (10 %) off with the same sign, `not_reproduced`
+otherwise; a result takes its worst number's label. The check also refuses a
+reason text that says "equals" or "at full precision" when no compared number
+is equal (or "differs" when all are), and one that states a cause as
+established ("because", "due to", "caused by", "bug") instead of naming
+possible causes.
+
+### Two levels of targets
+
+Every target in `replication_plan.json` has `level: 1` or `level: 2`, and the
+report and the check treat the levels separately.
+
+- **Level 1: the package's own result files.** Does the code rebuild them? The
+  source is `{"kind": "package_file", "file", "locator": {"row", "column"}}`, a
+  cell of a shipped `.csv`/`.tsv`. The plan contract reads the cell and refuses
+  a value that is not there; the reproduction check reads the same cell of the
+  rebuilt copy of that file.
+- **Level 2: the published paper.** Does the rerun reproduce the printed
+  numbers? Taken only from the paper: `{"kind": "paper", "document", "page",
+  "table" | "figure", "decimals"}`. The contract checks that the printed value
+  is on that page of the paper's extracted text and that `decimals` matches
+  it.
+
+Each result of `reproduction_report.json` carries `target_level` and compares
+only targets of that level; every target of each level is compared or listed
+as unassessed; `reproduction_check.json` counts each level separately.
+
+### The paper, supplied by the researcher
+
+Publishers often refuse automated downloads (SSRN answers 403), so the paper
+is researcher input: save it as a PDF where the fetch step looks, in this
+order — the `PAPER_PDF` setting, `paper.pdf` in a `LOCAL_DATA_DIR` folder, or
+`data/paper.pdf` in the study's workspace. At the next start of the run the
+fetch step copies it to `paper/paper.pdf` (read-only), records its SHA-256,
+size, pages and original path under `paper` in `package_manifest.json`, and
+extracts its text page by page (`pdftotext -layout` when installed, else
+pypdf) into `paper_text/paper.pdf.txt` for the planner. The run logs a
+`researcher_input` event, which the dossier lists as a researcher step
+(`supplied_input`, with the SHA-256, and the one it replaces when the paper
+changes). Without a paper there are no level-2 targets.
+
+After supplying it at the plan review, send back the step `plan` or the
+specialist `replication_planner`: the fetch step runs first either way, so the
+planner works with the paper.
+
+### The sandbox
+
+- **Image**: the plan's pinned official image, `rocker/r-ver:X.Y.Z` or
+  `python:X.Y[.Z]-slim`; its digest is logged.
+- **Install phase** (network on): a container with no mounts at all installs
+  the listed apt and R or Python packages, prints what was installed, and is
+  committed as a local image (reused on resume). Only package managers run; no
+  code from the package runs while the network is available.
+- **Run phase**: the package is copied to `sandbox/run/`, the output folder.
+  Each entry point runs in its own container with `--network none`,
+  `--cpus`, `--memory` (no swap), `--pids-limit`, `--read-only` root file
+  system with a `/tmp` tmpfs, `--cap-drop=ALL`, `no-new-privileges`, as user
+  1000:1000, and a time limit (the container is removed when it runs over).
+  The only mounts are the original package, read-only, at `/work/package`, and
+  the output folder at `/work/run`. The home directory is never mounted.
+- **Log**: `sandbox_log.json` holds each `docker` command, exit code, duration,
+  the tails of stdout and stderr (full logs in `sandbox/logs/`), the installed
+  versions, and the SHA-256 of every file the run wrote or changed. The package
+  is re-hashed after the run.
+- Scripts marked `needs_network` (downloaders) are skipped and their results
+  become "could not be run".
+
+Settings, in the template: `max_mb` (fetch, default 1000), `cpus`,
+`memory_gb`, `timeout_minutes` per entry point and `install_timeout_minutes`
+(sandbox), `minor_rel_tolerance` (reproduction, default 0.10). `fetch` and
+`sandbox_run` block in every governance regime; `reproduction` follows the
+regime like the other verification checks.
+
+A `specialists` step whose name has no phase of its own in the runner
+dispatches its `run` list with the registry's default work order
+(`SPECIALIST_DEFAULT_FOCUS`), and a gate whose check runs as a step
+(`package_integrity`, `sandbox`, `reproduction`) runs in sequence and halts
+like a check inside the dispatch. A template without a `revision` step is
+complete when its last step is done.
+
+## `descriptive-study`
+
+A description of a sample, for any field: astronomy catalogues, earth-science
+records, official statistics, the first part of most empirical papers. The
+results are of the kind `descriptive` (summary statistics, distributions,
+associations, figures; `data/descriptive-results-schema`), there is no causal
+claim and no identification strategy, the specialists read the researcher
+persona and the method skill `methods/descriptive-analysis`.
+
+| Step | Kind | What happens |
+|---|---|---|
+| `review_design` | researcher | After the research plan, the literature review and the data dictionary: the researcher approves or edits them before any data are loaded. |
+| `data_quality_gate` | check `data_quality`, inside the initial phase after the data analyst | Reads every table `data_dictionary.json` declares from `data.db` and writes `data_quality.json` and `data_quality.md` (rows, duplicates, missing values per column, units, ranges). Fails when a declared table is missing or empty, a numeric column the dictionary declares has no `unit`, rows repeat on the declared `key` (or as whole rows), a declared column misses more than `max_missing_share` (default 0.05) of its values and the dictionary gives no `missing` reason, or the data do not span the declared `coverage`. On a failure the data analyst is sent back once (`on_fail = "retry"`), then the run stops. |
+| `initial`, `iterative` | strategist | Data, analysis (the econometrics specialist as the analysis specialist, writing `estimation_results.json` in the descriptive schema), draft. |
+| `estimation_gate` | check `estimation` | The results file against the descriptive contract. |
+| `figure_gate` | check `figure_data` | Every figure of `figure_spec.json` re-read from the `source` it names: a data.db table and columns (with an optional simple condition), or a list in a results file (e.g. `distributions.radius.bins`); numbers compared at the precision the figure states. Writes `figure_check.json`. |
+| `review_draft` | researcher | The researcher reads the draft before the reviewers. |
+| `polish` | specialists | Numbers and references only (`polish_numerics`, `polish_bibliography`). |
+| `review` | reviewers | `data_reviewer`, `methods_reviewer` (1.5), `plausibility_reviewer`, `literature_reviewer`, `writing_reviewer`. |
+
+The number check also reads `data_quality.json`, so a paper can state its rows
+and missing values. Method sources (`[[credit]]`, relation `cites`): Emerson
+and Colditz (1983), Freedman and Diaconis (1981), Hyndman and Fan (1996),
+Spearman (1904), Little and Rubin (2019), Wickham (2014).
+
+## `time-series-forecasting`
+
+One series (or a few) over time: trend and seasonality, stationarity, fitted
+models, forecasts with intervals, and their accuracy on periods the models
+never saw, compared with simple baselines. The results are of the kind
+`timeseries`; the template has one specialist of its own, the **forecast
+designer**, who writes `forecast_design.json` and `forecast_design.md` after
+the data are loaded and before any model is fitted (schema in the skill
+`methods/time-series-forecasting`).
+
+| Step | Kind | What happens |
+|---|---|---|
+| `review_design` | researcher | After the plan, the literature, the data and the forecast setup: approve or edit the setup before anything is fitted. |
+| `preregister` | preregister, **optional** | When chosen: the plan and the forecast setup assembled into `preregistration.md` and frozen with their fingerprints on approval (the setup counts as a plan file: a later change is a deviation). |
+| `forecast_design_gate` | check `forecast_design`, inside the initial phase after the forecast designer | The setup against the series in `data.db`: the series exists and its periods do not repeat; the hold-out is the last `n_periods` periods, each with a value; at least `min_train_periods` (default 24) periods remain to fit on; a horizon and an interval level; at least one baseline (naive, seasonal naive, mean or drift) and one candidate; at least one stationarity and one trend diagnostic. When it passes it writes `holdout_freeze.json` (SHA-256 of the setup and of the hold-out values, the hold-out periods, the end of the training periods). It records the setup that decides the evaluation (series, hold-out, horizon, interval level, seasonal period, transformation, models and baselines, diagnostics) and the design as written. It refuses a setup written after a model was fitted, and a changed setup once results exist (rewording a description is not a change); before that, a change is frozen again and listed. The forecast designer is sent back once on a failure. |
+| `initial`, `iterative` | strategist | The analysis specialist fits on the training periods, evaluates on the hold-out and forecasts beyond the data. |
+| `estimation_gate` | check `estimation` | The results file against the time-series contract. |
+| `forecast_gate` | check `forecast_evaluation` | The results against the frozen setup: setup and hold-out values unchanged; each declared diagnostic with statistic, p-value and `sample_end` inside the training periods; each declared model with `train_end` before the hold-out (else "leakage") and an out-of-sample entry on exactly the hold-out periods with all its predictions; RMSE, MAE and interval coverage recomputed from the predictions and `data.db` (tolerance `error_tolerance`, default 0.5%); a forecast beyond the data with the declared horizon and interval level. Writes `forecast_check.json` with the recomputed errors and each model's RMSE relative to the best baseline. |
+| `figure_gate` | check `figure_data` | As in `descriptive-study`. A `time_series` figure names a source per series; a series may carry `lower` and `upper` (a shaded interval). |
+| `review_draft` | researcher | The researcher reads the draft before the reviewers. |
+| `polish` | specialists | Formulas, numbers and references. |
+| `review` | reviewers | `methods_reviewer` (1.5), `technical_reviewer` (1.25), `data_reviewer`, `plausibility_reviewer`, `literature_reviewer`, `writing_reviewer`. |
+
+Method sources (`[[credit]]`, relation `cites`, DOIs checked on Crossref on
+2026-10-11): Box, Jenkins and Reinsel (2008); Hyndman and Athanasopoulos,
+*Forecasting: Principles and Practice* (3rd ed., 2021, no DOI); Hyndman and
+Khandakar (2008); Hyndman and Koehler (2006); Tashman (2000); Diebold and
+Mariano (1995); Harvey, Leybourne and Newbold (1997); Dickey and Fuller (1979);
+Kwiatkowski, Phillips, Schmidt and Shin (1992); Mann (1945); Sen (1968).

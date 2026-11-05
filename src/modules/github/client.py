@@ -1,0 +1,182 @@
+"""GitHub integration — create paper repos and push artifacts."""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+from ...logging_config import get_logger
+from .templates import LATEX_GITIGNORE, render_readme
+
+logger = get_logger(__name__)
+
+
+class GitHubClient:
+    """Thin wrapper around PyGithub for paper repo management."""
+
+    def __init__(self, token: str, username: str) -> None:
+        from typing import cast
+
+        from github import Github
+        from github.AuthenticatedUser import AuthenticatedUser
+
+        self._gh = Github(token)
+        self._username = username
+        # Github(token).get_user() with no argument always returns
+        # AuthenticatedUser at runtime, but PyGithub's stubs disagree across
+        # versions: <=2.9 widens to NamedUser | AuthenticatedUser (the cast is
+        # required), 2.10 narrows it (the cast is redundant, and
+        # warn_redundant_casts makes that an error). The ignore holds for both
+        # — warn_unused_ignores is off precisely for this kind of drift.
+        self._user = cast(AuthenticatedUser, self._gh.get_user())  # type: ignore[redundant-cast]
+
+    def create_paper_repo(
+        self,
+        paper_id: str,
+        paper_title: str,
+        private: bool = True,
+    ) -> dict[str, Any]:
+        """Create a new GitHub repo for a paper.
+
+        IMPORTANT: .gitignore is committed FIRST (before README or any LaTeX content)
+        so that Overleaf integration never pollutes git history with artifacts.
+        """
+        repo_name = _slugify(paper_title, paper_id)
+
+        try:
+            repo = self._user.create_repo(
+                name=repo_name,
+                description=f"e2er v3 generated paper: {paper_title}",
+                private=private,
+                auto_init=False,
+            )
+        except Exception as e:
+            if "already exists" in str(e).lower():
+                logger.warning("Repo %s already exists, using existing", repo_name)
+                repo = self._user.get_repo(repo_name)
+            else:
+                raise
+
+        # Step 1: .gitignore as the FIRST commit — this is critical for Overleaf
+        try:
+            repo.create_file(
+                path=".gitignore",
+                message="chore: add LaTeX .gitignore (Overleaf-safe)",
+                content=LATEX_GITIGNORE,
+                branch="main",
+            )
+            logger.info("Created .gitignore in %s", repo_name)
+        except Exception as e:
+            logger.warning("Could not create .gitignore: %s", e)
+
+        # Step 2: README
+        readme = render_readme(paper_title, paper_id, self._username)
+        try:
+            repo.create_file(
+                path="README.md",
+                message="docs: initial README",
+                content=readme,
+                branch="main",
+            )
+        except Exception as e:
+            logger.warning("Could not create README: %s", e)
+
+        return {
+            "repo_name": repo_name,
+            "clone_url": repo.clone_url,
+            "html_url": repo.html_url,
+            "ssh_url": repo.ssh_url,
+        }
+
+    def push_file(
+        self,
+        repo_name: str,
+        file_path: str,
+        content: str | bytes,
+        commit_message: str,
+        branch: str = "main",
+    ) -> None:
+        """Create or update a file in the repo. ``file_path`` is a plain relative path (no ``..``, no ``/`` first)."""
+        parts = file_path.replace("\\", "/").split("/")
+        if not file_path or file_path.startswith("/") or any(p in ("", ".", "..") for p in parts):
+            raise ValueError(f"refusing the repository path {file_path!r}")
+        repo = self._user.get_repo(repo_name)
+        if isinstance(content, str):
+            encoded = content.encode()
+        else:
+            encoded = content
+
+        from github import UnknownObjectException
+
+        try:
+            existing = repo.get_contents(file_path, ref=branch)
+        except UnknownObjectException:
+            # 404: the file is not there yet. Any other error (401, 403, a rate limit, a 5xx) is raised:
+            # the catch-all here turned every failure, including a failed update, into a create_file that
+            # failed with a misleading "sha wasn't supplied" or, worse, hid the first error.
+            repo.create_file(path=file_path, message=commit_message, content=encoded, branch=branch)
+            return
+        if isinstance(existing, list):
+            # get_contents returns a list for a directory: a file cannot replace it.
+            raise ValueError(f"{file_path!r} is a directory in the repository")
+        repo.update_file(path=file_path, message=commit_message, content=encoded, sha=existing.sha, branch=branch)
+
+    def push_directory(
+        self,
+        repo_name: str,
+        local_dir: Path,
+        remote_prefix: str = "",
+        commit_message: str = "chore: push artifacts",
+        extensions: list[str] | None = None,
+    ) -> int:
+        """Push all files from a local directory to the repo. Returns file count."""
+        count = 0
+        root = local_dir.resolve()
+        for file_path in sorted(local_dir.rglob("*")):
+            # A link in a workspace (an AI step can make one) would upload the file it points to: ~/.ssh, .env.
+            if file_path.is_symlink() or not file_path.is_file():
+                continue
+            if not file_path.resolve().is_relative_to(root):
+                logger.warning("Not pushing %s: it is outside %s", file_path, local_dir)
+                continue
+            if extensions and file_path.suffix not in extensions:
+                continue
+            relative = file_path.relative_to(local_dir)
+            if any(part.startswith(".") for part in relative.parts):
+                continue  # hidden files and folders (.env, .git, .e2er) never go up
+            remote_path = f"{remote_prefix}/{relative.as_posix()}" if remote_prefix else relative.as_posix()
+            try:
+                content = file_path.read_bytes()
+                self.push_file(repo_name, remote_path, content, commit_message)
+                count += 1
+            except Exception as e:
+                logger.warning("Could not push %s: %s", remote_path, e)
+        return count
+
+    def ensure_replication_scaffold(self, repo_name: str) -> None:
+        """Create the replication/ directory scaffold if it doesn't exist."""
+        stubs = {
+            "replication/.gitkeep": "",
+            "replication/data/.gitkeep": "",
+        }
+        for path, content in stubs.items():
+            try:
+                self.push_file(
+                    repo_name,
+                    path,
+                    content,
+                    "chore: scaffold replication package structure",
+                )
+            except Exception as e:
+                logger.debug("Scaffold %s skipped: %s", path, e)
+
+
+def _slugify(title: str, paper_id: str) -> str:
+    """Convert paper title to a valid GitHub repo name."""
+    import re
+
+    slug = title.lower()
+    slug = re.sub(r"[^a-z0-9\s-]", "", slug)
+    slug = re.sub(r"\s+", "-", slug.strip())
+    slug = slug[:50].rstrip("-")
+    return f"paper-{slug}-{paper_id[:8]}" if slug else f"paper-{paper_id[:8]}"

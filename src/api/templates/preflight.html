@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% block title %}Preflight · e2er{% endblock %}
+
+{% block content %}
+<h1>Preflight</h1>
+<p class="sub">
+  Can this computer run a study? These are the checks <code class="tick">e2er doctor</code> runs. The most common
+  problem is an AI provider that is installed but not signed in: a study then fails a few minutes in.
+</p>
+
+<div id="pf-checks" {% if pending %}hx-get="/htmx/preflight-checks" hx-trigger="load" hx-swap="innerHTML"{% endif %}>
+  {% if pending %}
+    <p class="muted">Running the checks. Each data source gets a few seconds to answer, a slow archive up to 20 seconds.</p>
+  {% else %}
+    {% include "_preflight_checks.html" %}
+  {% endif %}
+</div>
+{% endblock %}

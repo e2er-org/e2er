@@ -1,0 +1,289 @@
+name: Release
+
+# Tag-driven release. Fires only on `push: tags: v*`. Builds the wheel,
+# enforces version consistency between pyproject.toml and src/__init__.py,
+# creates a GitHub release with the wheel attached, and publishes to PyPI
+# via OIDC (no API token secret needed).
+#
+# One-time PyPI setup (do this once per PyPI project, before the first tag):
+#   1. Go to https://pypi.org/manage/project/e2er/settings/publishing/
+#      (or create the project first via a manual upload if it doesn't exist).
+#   2. Add a Trusted Publisher with:
+#        owner:         example-user
+#        repository:    E2ER-project
+#        workflow:      release.yml
+#        environment:   pypi
+#   3. Create a GitHub environment named "pypi" (Settings → Environments)
+#      with optional protection rules (recommended: require reviewer for
+#      production releases).
+#   4. Push any new v* tag. The `publish` job runs in the `pypi`
+#      environment and mints a short-lived OIDC token that PyPI accepts.
+#
+# Until the pending publisher is registered, the first publish run fails
+# with "invalid-publisher" — expected. Register on PyPI, then re-run.
+#
+# Release procedure: docs/RELEASING.md. In short:
+#   1. On a clean dev: `python scripts/release.py X.Y.Z --commit` makes every
+#      version edit (pyproject.toml, src/__init__.py, CITATION.cff, README.md,
+#      the CHANGELOG heading) and commits them.
+#   2. Bring dev to main, then tag and push from main:
+#        git tag vX.Y.Z && git push origin main vX.Y.Z
+#   3. This workflow runs: version check -> tests (four parallel parts) ->
+#      build -> GitHub release with release-facts.json -> PyPI; and, beside
+#      PyPI, the job that waits for Zenodo's version DOI and fills it into
+#      release-facts.json. Do NOT `gh release create` the tag by hand.
+#
+# Re-publishing a tag whose run skipped publish: re-run the workflow run
+# (`gh run rerun <id>`). The idempotent `release` job + `skip-existing` on
+# the publish step make this safe.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read  # every job reads only; a job that writes says so itself
+
+jobs:
+  version-check:
+    name: Verify tag matches package version
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Check version consistency
+        # Every place that names the version (scripts/release.py makes the edits) must name the tag's.
+        run: python3 scripts/release.py --check --tag "$GITHUB_REF_NAME"
+
+  test:
+    name: Run tests before building (part ${{ matrix.part }} of 4)
+    needs: version-check
+    runs-on: ubuntu-latest
+    # The suite (about 4,200 tests) took up to 30 min in one job on a hosted runner: 10 cancelled
+    # 0.16.1's first run, 25 cancelled 0.17.2's (it was never published). It now runs in four parts
+    # of whole test files balanced by tests/test_durations.json (E2ER_TEST_PART, tests/parts.py):
+    # about a quarter of the suite's time each (4.5-5 min each locally, 21 min in one run), 30 min is ample headroom.
+    timeout-minutes: 30
+    strategy:
+      fail-fast: true
+      matrix:
+        part: [1, 2, 3, 4]
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+        with:
+          python-version: '3.12'
+
+      - name: Set up uv (the replay tests' `e2er reproduce` steps)
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
+        with:
+          version: "0.12.19"
+          enable-cache: false
+
+      - name: Install dependencies
+        run: |
+          # Every dependency pinned with its hashes (.github/requirements/ci.txt; docs/RELEASING.md
+          # says how to refresh it), then e2er itself without dependencies or a build download.
+          python -m pip install --require-hashes -r .github/requirements/ci.txt
+          python -m pip install --no-deps --no-build-isolation -e .
+
+      - name: Run tests
+        env:
+          E2ER_TEST_PART: ${{ matrix.part }}/4
+          # uv is installed above: the replay tests' reproduce steps fail instead of skipping (tests/replay/uv.py).
+          E2ER_REQUIRE_UV: "1"
+        run: pytest tests/ -v --tb=short -m "not e2e"
+
+  facts:
+    name: Release facts (counts from the code)
+    needs: version-check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          # Every dependency pinned with its hashes (.github/requirements/ci.txt; docs/RELEASING.md
+          # says how to refresh it), then e2er itself without dependencies or a build download.
+          python -m pip install --require-hashes -r .github/requirements/ci.txt
+          python -m pip install --no-deps --no-build-isolation -e .
+
+      - name: Write release-facts.json
+        # Format: docs/RELEASING.md. doi stays null here; the zenodo-doi job fills it in.
+        run: python scripts/release_facts.py --out release-facts.json
+
+      - name: Upload it
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: release-facts
+          path: release-facts.json
+          retention-days: 30
+
+  build:
+    name: Build wheel + sdist
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+        with:
+          python-version: '3.12'
+
+      - name: Install build tool
+        run: python -m pip install --require-hashes -r .github/requirements/build.txt
+
+      - name: Build
+        run: python -m build --no-isolation
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: dist
+          path: dist/
+          retention-days: 30
+
+  release:
+    name: Create GitHub release
+    needs: [build, facts]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write  # creates the GitHub release and uploads the wheel
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: dist
+          path: dist/
+
+      - name: Download the release facts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: release-facts
+          path: facts/
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          # Pull this version's CHANGELOG section if present.
+          NOTES_FILE=$(mktemp)
+          VERSION="${TAG#v}"
+          awk -v ver="$VERSION" '
+            /^## / {
+              if (capturing) exit;
+              # The heading itself, literally: "## [0.1.1]" never matches "## [0.1.10]" or "## [0x1y1]".
+              if (index($0, "## [" ver "]") == 1) capturing=1;
+              next
+            }
+            capturing { print }
+          ' CHANGELOG.md > "$NOTES_FILE"
+          if [ ! -s "$NOTES_FILE" ]; then
+            echo "Release $TAG" > "$NOTES_FILE"
+          fi
+
+          # Idempotent: if the release already exists (e.g. created manually,
+          # or a prior partial run), update its notes + attach the wheel
+          # instead of failing. A failure here would skip the publish job
+          # (`needs: release`) and silently leave the version off PyPI.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG exists — updating notes and (re)uploading assets."
+            gh release edit "$TAG" --title "$TAG" --notes-file "$NOTES_FILE"
+            gh release upload "$TAG" dist/* facts/release-facts.json --clobber
+          else
+            gh release create "$TAG" \
+              --title "$TAG" \
+              --notes-file "$NOTES_FILE" \
+              dist/* facts/release-facts.json
+          fi
+
+  zenodo-doi:
+    # Zenodo's GitHub integration mints the version DOI after the release exists (seconds to
+    # minutes; for 0.16.1 never). Ask Zenodo's public records API (no token) for up to 30 min and
+    # put the DOI into release-facts.json; without one, doi stays null (readers use the concept DOI).
+    name: Zenodo version DOI into release-facts.json
+    needs: release
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    permissions:
+      contents: write  # uploads release-facts.json to the release
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Fill in the DOI
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          gh release download "$TAG" --pattern release-facts.json --dir facts --clobber
+          python3 scripts/release_facts.py zenodo-doi facts/release-facts.json --wait 1800 --every 30
+          if python3 -c "import json,sys; sys.exit(0 if json.load(open('facts/release-facts.json'))['doi'] else 1)"; then
+            gh release upload "$TAG" facts/release-facts.json --clobber
+          fi
+
+  publish:
+    name: Publish to PyPI (OIDC)
+    needs: release
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Runs in the GitHub `pypi` environment so PyPI's trusted-publisher
+    # check sees the expected environment claim. Without this, OIDC
+    # authentication fails with "invalid-publisher" even when the project
+    # has been pre-registered on PyPI.
+    environment:
+      name: pypi
+      url: https://pypi.org/p/e2er
+    permissions:
+      id-token: write  # for OIDC
+
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish to PyPI via OIDC
+        # Uses the official PyPA action which mints a short-lived OIDC
+        # token and POSTs it to PyPI's trusted-publisher endpoint. No
+        # API token secret is needed.
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086  # v1.14.3
+        with:
+          # `skip-existing: true` makes re-runs idempotent — if the
+          # version was already uploaded (e.g. a prior partial run),
+          # this is a no-op instead of an error.
+          skip-existing: true

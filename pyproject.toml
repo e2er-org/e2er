@@ -1,0 +1,189 @@
+[project]
+name = "e2er"
+version = "0.20.1"
+description = "e2er is the open infrastructure for publishing, verifying, reproducing and reusing AI-enabled research."
+requires-python = ">=3.11"
+readme = "README.md"
+license = { text = "MIT" }
+
+dependencies = [
+    "anthropic>=0.40.0",
+    "openai>=1.50.0",
+    "httpx>=0.27.0",
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.30.0",
+    "pydantic>=2.9.0",
+    "pydantic-settings>=2.6.0",
+    "psycopg[binary,pool]>=3.2.0",
+    "PyGithub>=2.4.0",
+    "gitpython>=3.1.0",
+    "pyalex>=0.14",
+    "arxiv>=2.1.0",
+    "bibtexparser>=2.0.0b7",
+    "pypdf>=4.0",
+    # Cap below 3.0: pandas 3.0 removed legacy offset aliases ('M', 'Y', …).
+    # LLM-generated estimation scripts use `resample("M")` (the pre-3.0
+    # idiom), which raises on 3.x. Pin to the 2.x line the generated code
+    # targets.
+    "pandas>=2.0,<3.0",
+    "numpy>=1.26",
+    # The estimation runner executes a specialist's run_estimation.py with
+    # e2er's own interpreter. Without these, a script cannot import a t
+    # distribution and writes its own: the FOMC demonstration study's
+    # hand-rolled t_sf gave p = 0.208 for t = -2.00 with 19 df (true 0.060).
+    # The econometrics skill requires them for every distribution function.
+    "scipy>=1.11",
+    "statsmodels>=0.14",
+    # Topic models (NMF, LDA) and text vectorisers for the text-analysis template's
+    # analysis scripts, and scikit-learn's English stop words. No model downloads.
+    "scikit-learn>=1.3",
+    "matplotlib>=3.8",
+    "yfinance>=0.2.40",
+    "aiosqlite>=0.20.0",
+    "python-dotenv>=1.0",
+    "python-multipart>=0.0.12",
+    "jinja2>=3.1.0",
+    # Reads the RISE catalogue's pack manifests (`e2er skills`). Present
+    # transitively in most environments, which is exactly why it has to be
+    # declared: a fresh `pip install e2er` would otherwise crash on first use.
+    "PyYAML>=6.0",
+    # Readers for the .parquet and .xlsx files a researcher puts in the data
+    # folder (README, "Bring your own data"). pandas imports them lazily, so
+    # without these the files were skipped with a warning nobody saw.
+    "pyarrow>=14.0",
+    "openpyxl>=3.1",
+    # The system keychain for the tokens of `e2er login` (e2er.org) and `e2er zenodo login`.
+    # Where it has no backend (a headless Linux server, CI), the tokens go to
+    # ~/.e2er/credentials.json with mode 0600 (src/core/platform_client.py `_keyring`).
+    "keyring>=25.0",
+]
+
+[project.optional-dependencies]
+pgvector = [
+    "pgvector>=0.3.0",
+    "sentence-transformers>=3.3.0",
+]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "pytest-cov>=5.0",
+    "ruff>=0.6",
+    "mypy>=1.11",
+    "respx>=0.21",
+    # Validates the published schemas in docs/schemas/ against what the code
+    # actually writes. A format offered to others as implementable is a promise,
+    # and an unchecked promise drifts.
+    "jsonschema>=4.0",
+]
+
+[project.scripts]
+e2er = "src.__main__:main"
+# Data gatekeeper invoked by Claude Code / Codex / Gemini CLI specialists.
+# The skill files (skills/files/data/yfinance.md, fred.md, allium*.md) tell
+# the model to run `e2er-data <source> <command> --save-to ...`. Without
+# this entry point, the dev-checkout bash wrapper at scripts/e2er-data is
+# the only way to invoke it — which means pip-installed users get
+# "command not found" and no data ever lands.
+e2er-data = "src.modules.data.cli:main"
+# The field-map template's specialists count boundaries and read the mapped
+# papers through it (src/modules/fieldmap/cli.py); scripts/e2er-fieldmap is the
+# dev-checkout wrapper.
+e2er-fieldmap = "src.modules.fieldmap.cli:main"
+# The other commands specialists run by name (claude_code.py allowlists, the
+# specialists' instructions); src/wrappers.py implements them, and the
+# scripts/ files of a source checkout call the same functions.
+e2er-run = "src.wrappers:run_main"
+e2er-lit = "src.wrappers:lit_main"
+e2er-check-tables = "src.wrappers:check_tables_main"
+e2er-allium-query = "src.wrappers:allium_query_main"
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+# Tell setuptools to package src/ (the codebase), skills/ (the skill
+# markdown files), and sql/ (the SQLite bootstrap schema + Postgres
+# migrations) into the wheel. `e2er install-skills` extracts the bundled
+# skills to ~/.{claude,codex,gemini}/skills/ for the headless backends.
+#
+# Layout:
+#   src/ → importable as `src.*` (src/api/, src/core/, src/db/, ...)
+#   skills/ → top-level package; ships .md files as package-data so
+#             `e2er install-skills` can find them via importlib.resources.
+#   sql/ → top-level package; ships *.sql files. SQLite bootstrap in
+#          src/db/client.py reads sql/sqlite/schema.sql via a relative
+#          path resolution that works in both dev checkout and installed
+#          wheel layouts.
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*", "skills*", "sql*", "pipelines"]
+exclude = ["tests*", "Tests*", "docs*", "examples*", "scripts*", "docker*"]
+
+[tool.setuptools.package-data]
+# Skill markdown files. `**` captures the category subdirs and the .md files.
+"skills.files" = ["**/*.md"]
+# Static assets and Jinja2 templates served by FastAPI. Without these the
+# `app.mount("/static", StaticFiles(...))` call at import time crashes,
+# which prevents uvicorn from starting on a fresh `pip install e2er`.
+"src.api" = ["static/*", "templates/*"]
+# SQLite bootstrap schema, loaded by src/db/client.py on first connect
+# when DATABASE_URL is not set (zero-config user journey).
+"sql.sqlite" = ["*.sql"]
+# Postgres migrations (kept for `scripts/migrate.py` users who pip-install
+# the dev extra or run from a source checkout).
+"sql" = ["*.sql"]
+# The templates. Without them a fresh install could not start a study: every
+# template name failed with "no pipeline named 'empirical'" (0.11.0 and before).
+"pipelines" = ["*.toml"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+# Recorded output of real runs, replayed byte for byte by the end-to-end stories
+# (tests/replay/): the specialists wrote these files, so they are data, not code we style.
+extend-exclude = ["tests/fixtures/replay", "tests/fixtures/showcase_export"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP"]
+# N805/N806: first-arg / lowercase-variable rules don't fit our style.
+ignore = ["N805", "N806"]
+
+[tool.mypy]
+python_version = "3.11"
+# Pragmatic baseline: catch real bugs (wrong types, optional-attr access,
+# variable shadowing) without grinding on annotation completeness for a
+# 10K-line codebase that wasn't type-checked from day one.
+warn_unused_configs = true
+ignore_missing_imports = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = false  # tolerate # type: ignore drift across versions
+strict_equality = true
+# Disabled (would produce 30+ stylistic errors on the existing codebase):
+#   disallow_untyped_defs / disallow_any_generics / no_any_return /
+#   warn_return_any — these can be ratcheted on later, file-by-file, via
+#   per-module overrides if you want to tighten gradually.
+
+[[tool.mypy.overrides]]
+# Don't parse numpy's bundled stubs. Recent numpy ships PEP 695 `type`
+# statements in numpy/__init__.pyi, which mypy rejects under our 3.11 target
+# ("Type statement is only supported in Python 3.12 and greater") and aborts
+# before checking our code — a CI break driven by numpy's release cadence, not
+# our types. `follow_imports = skip` only applies to .pyi stubs when
+# `follow_imports_for_stubs = true`, and the module list must include the
+# top-level `numpy` (where __init__.pyi lives), not just `numpy.*`. We already
+# don't type-check through numpy (ignore_missing_imports), so this only drops a
+# stub we never relied on. Version-robust.
+module = ["numpy", "numpy.*"]
+follow_imports = "skip"
+follow_imports_for_stubs = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = [
+    "e2e: real-LLM end-to-end tests (skipped unless ANTHROPIC_API_KEY is set)",
+    "reviewer_path: a reviewer's commands from a built wheel in a fresh environment (tests/test_reviewer_path.py; the CI job `reviewer path` runs them)",
+]
+# Skip e2e and the reviewer path by default; run them explicitly with `-m e2e` or `-m reviewer_path`.
+addopts = "-m 'not e2e and not reviewer_path'"

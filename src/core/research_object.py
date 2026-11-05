@@ -1,0 +1,288 @@
+"""The research-object manifest: what a published E2ER bundle is, in one file.
+
+An exported bundle already proves its own integrity: ``provenance.json`` hashes
+every file and records how results were derived. What it does not say is who
+made it, which template and agents produced it, which literature and data it
+rests on, and what a registry should list about it. ``e2er.json`` says that.
+
+The manifest is derived, never typed in by hand. Every field comes from the
+bundle, from the run database when one is given, or from the arguments of
+``e2er publish``, and each list records where it came from (``recorded`` from
+the run database, ``declared`` from the bundle or the template file). The
+object's content identity is the SHA-256 of ``provenance.json``: since that file
+fixes the hash of every other file, one digest identifies the whole bundle.
+
+Schema: docs/schemas/research-object.schema.json (``e2er-research-object/0.1``).
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+import sqlite3
+import tomllib
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+
+from ..skills.loader import skill_component
+
+SCHEMA = "e2er-research-object/0.1"
+MANIFEST_NAME = "e2er.json"
+#: The owner of an anonymous version for double-blind review: its id is anonymous/<code> (e2er publish --blind).
+ANONYMOUS = "anonymous"
+_ID = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,38})$")
+_PROJECT = re.compile(r"^[a-z0-9][a-z0-9._-]{0,99}$")
+
+
+class PublishError(ValueError):
+    """The bundle or the arguments cannot produce a valid research object."""
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _json(path: Path) -> Any:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+#: The summary `e2er publish --github` puts at the top of README.md (cli_publish.readme_block).
+README_BEGIN = "<!-- e2er:github begin -->"
+README_END = "<!-- e2er:github end -->"
+README_SUMMARY = re.compile(re.escape(README_BEGIN) + r".*?" + re.escape(README_END) + r"\n*(?:---\n+)?", re.S)
+
+
+def export_readme(text: str) -> str:
+    """README.md as the export wrote it: without the summary publish --github puts at its top."""
+    return README_SUMMARY.sub("", text, count=1).lstrip("\n")
+
+
+def _question_and_title(bundle: Path) -> tuple[str, str]:
+    # The export's own README: the GitHub summary above it must not change the study's title or question.
+    readme = (bundle / "README.md").read_text(encoding="utf-8") if (bundle / "README.md").is_file() else ""
+    readme = export_readme(readme)
+    q = re.search(r"\*\*Research question:\*\*\s*(.+)", readme)
+    question = q.group(1).strip() if q else ""
+    title = ""
+    abstract = bundle / "paper" / "abstract.tex"
+    if abstract.is_file():
+        m = re.search(r"\\title\{(.+?)\}\s*\n", abstract.read_text(encoding="utf-8"), re.S)
+        if m:
+            title = re.sub(r"\s+", " ", m.group(1).replace("\\\\", " ")).strip()
+    if not title:
+        h = re.search(r"^#\s+(.+)$", readme, re.M)
+        title = h.group(1).strip() if h else question
+    return question, title
+
+
+def _recorded_usage(db: Path, paper_id: str) -> list[dict[str, Any]]:
+    """Per-agent AI usage as the run recorded it (table ``llm_usage``)."""
+    con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    try:
+        rows = con.execute(
+            "SELECT specialist, backend, model, COUNT(*), SUM(input_tokens), SUM(output_tokens), "
+            "SUM(cache_read_tokens), SUM(cache_write_tokens), SUM(COALESCE(cost_usd, 0)), "
+            "MIN(created_at), MAX(created_at) "
+            "FROM llm_usage WHERE paper_id = ? GROUP BY specialist, backend, model ORDER BY MIN(created_at)",
+            (paper_id,),
+        ).fetchall()
+    finally:
+        con.close()
+    return [
+        {
+            "agent": r[0],
+            "backend": r[1],
+            "model": r[2],
+            "calls": r[3],
+            "input_tokens": r[4] or 0,
+            "output_tokens": r[5] or 0,
+            "cache_read_tokens": r[6] or 0,
+            "cache_write_tokens": r[7] or 0,
+            "cost_usd": round(r[8] or 0.0, 4),
+            "first": r[9],
+            "last": r[10],
+        }
+        for r in rows
+    ]
+
+
+def _recorded_run(db: Path, paper_id: str) -> dict[str, Any]:
+    con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    try:
+        cols = {r[1] for r in con.execute("PRAGMA table_info(papers)")}
+        want = [c for c in ("mode", "methodology", "governance", "pipeline") if c in cols]
+        row = con.execute(f"SELECT {', '.join(want)} FROM papers WHERE id = ?", (paper_id,)).fetchone()
+    finally:
+        con.close()
+    return dict(zip(want, row, strict=True)) if row else {}
+
+
+def _template_agents(template_file: Path, mode: str) -> list[str]:
+    """Agents a template dispatches in a mode, from the template file itself."""
+    spec = tomllib.loads(template_file.read_text(encoding="utf-8"))
+    agents: list[str] = []
+    for step in spec.get("steps", []):
+        if mode in step.get("modes", [mode]):
+            agents += [a for a in step.get("run", []) if a not in agents]
+    return agents
+
+
+def _template_components(template_file: Path | None, table: str) -> dict[str, list[str]]:
+    """A template's `[skills]` or `[sidecars]` table, read from the file itself."""
+    if template_file is None or not template_file.is_file():
+        return {}
+    raw = tomllib.loads(template_file.read_text(encoding="utf-8")).get(table) or {}
+    return {k: [str(x) for x in v] for k, v in raw.items() if isinstance(v, list)}
+
+
+def _skills_for(agents: list[str], template_file: Path | None = None) -> dict[str, list[str]]:
+    """Each agent's skills: the registry's, then the ones the template adds (as the run merged them)."""
+    from .specialists.registry import SPECIALIST_SKILLS
+
+    if template_file is not None and template_file.is_file():
+        # As the run merges them, the template's core settings included (base_skill,
+        # data_skills, results: src/core/pipeline/components.py).
+        from .pipeline.components import skills_for
+        from .pipeline.spec import PipelineError, load_spec
+
+        try:
+            spec = load_spec(template_file)
+        except PipelineError:
+            spec = None
+        if spec is not None:
+            return {a: skills_for(a, spec) for a in agents}
+    extra = _template_components(template_file, "skills")
+    return {a: list(dict.fromkeys([*SPECIALIST_SKILLS.get(a, []), *extra.get(a, [])])) for a in agents}
+
+
+def build_manifest(
+    bundle: Path,
+    *,
+    owner: str,
+    project: str,
+    contributors: list[dict[str, Any]],
+    repository: dict[str, str] | None = None,
+    db: Path | None = None,
+    template: str = "empirical",
+    template_file: Path | None = None,
+    license_id: str | None = None,
+    derived_from: list[str] | None = None,
+    verification: list[dict[str, str]] | None = None,
+    run_record: Any = None,
+) -> dict[str, Any]:
+    """The manifest. With ``run_record`` (the dossier's :class:`~src.core.dossier.RunRecord`
+    of the run database), the agents and their skills are the ones the run
+    recorded: the specialists that ran, with the skills of the registry and
+    template at the commit each ran on (or as recorded at dispatch). Without
+    it, the template file declares them (``agents_source: declared``).
+    """
+    bundle = Path(bundle)
+    prov_path = bundle / "provenance.json"
+    prov = _json(prov_path)
+    if not isinstance(prov, dict) or "files" not in prov:
+        raise PublishError(f"{bundle} has no provenance.json; export it with `e2er export` first")
+    if not _ID.match(owner):
+        raise PublishError(f"owner {owner!r} must be a GitHub login in lower case")
+    if not _PROJECT.match(project):
+        raise PublishError(f"project {project!r} must be lower case: letters, digits, '.', '_' or '-'")
+    # An anonymous version for double-blind review (`e2er publish --blind`, id anonymous/<code>) names nobody.
+    if not contributors and owner != ANONYMOUS:
+        raise PublishError("name at least one author (--github and/or --orcid)")
+
+    run = prov.get("run", {})
+    question, title = _question_and_title(bundle)
+
+    # AI actors: recorded by the run when the database is given, else what the template declares.
+    usage: list[dict[str, Any]] = []
+    recorded: dict[str, Any] = {}
+    if db is not None and run.get("paper_id"):
+        usage = _recorded_usage(db, run["paper_id"])
+        recorded = _recorded_run(db, run["paper_id"])
+    mode = recorded.get("mode", "single_pass")
+    skills_source = "declared"
+    if run_record is not None and getattr(run_record, "recorded", False):
+        agents = list(run_record.agents)
+        for u in usage:  # a specialist with LLM calls but no recorded step (older runs)
+            if not u["agent"].startswith("strategist") and u["agent"] not in agents:
+                agents.append(u["agent"])
+        agents_source = skills_source = "recorded"
+        skills = {a: list(run_record.skills.get(a, [])) for a in agents}
+    else:
+        if usage:
+            agents = [u["agent"] for u in usage if not u["agent"].startswith("strategist")]
+            agents_source = "recorded"
+        elif template_file is not None and template_file.is_file():
+            agents = _template_agents(template_file, mode)
+            agents_source = "declared"
+        else:
+            agents, agents_source = [], "unknown"
+        # No run record: the skills today's registry and template file give these agents.
+        skills = _skills_for(agents, template_file)
+
+    citations = [e for e in prov.get("edges", []) if e.get("type") == "citation"]
+    files = prov["files"]
+    data_files = sorted(p for p in files if p.startswith("data/"))
+    outputs = sorted(p for p in files if p.startswith(("paper/", "results/", "replication/")))
+
+    uses = [f"template:{template}"] + [f"agent:{a}" for a in agents]
+    uses += sorted({skill_component(s) for ss in skills.values() for s in ss})
+
+    manifest: dict[str, Any] = {
+        "schema": SCHEMA,
+        "id": f"{owner}/{project}",
+        "content_id": "sha256:" + _sha256(prov_path),
+        "title": title,
+        "question": question,
+        "contributors": contributors,
+        "ai": {
+            "backend": run.get("backend"),
+            "model": run.get("model"),
+            "agents": agents,
+            "agents_source": agents_source,
+            "usage": usage,
+        },
+        "process": {
+            "template": template,
+            "mode": mode,
+            "methodology": recorded.get("methodology"),
+            "governance": recorded.get("governance", run.get("governance")),
+            "e2er_version": run.get("e2er_version"),
+            "exported": run.get("exported_at"),
+        },
+        "components": {"skills": skills, "skills_source": skills_source},
+        "literature": [
+            {
+                "cite_key": e.get("key"),
+                "doi": (e.get("external_id") or "").removeprefix("doi:") or None,
+                "status": e.get("status"),
+                "verified_by": e.get("registry"),
+            }
+            for e in citations
+        ],
+        "data": [{"path": p, "sha256": files[p]["sha256"], "bytes": files[p]["bytes"]} for p in data_files],
+        "outputs": [{"path": p, "sha256": files[p]["sha256"]} for p in outputs],
+        "provenance": {
+            "files": len(files),
+            "edges": {
+                t: sum(1 for e in prov.get("edges", []) if e.get("type") == t)
+                for t in sorted({e.get("type") for e in prov.get("edges", [])})
+            },
+        },
+        "verification": verification or [],
+        "dependencies": {"uses": uses, "derived_from": derived_from or []},
+        "repository": repository or {},
+        "license": license_id,
+        "published": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    return manifest
+
+
+def write_manifest(bundle: Path, manifest: dict[str, Any]) -> Path:
+    out = Path(bundle) / MANIFEST_NAME
+    out.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8", newline="\n")
+    return out

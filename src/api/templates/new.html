@@ -1,0 +1,225 @@
+{% extends "base.html" %}
+{% block title %}New study · e2er{% endblock %}
+
+{% block content %}
+<h1>New study</h1>
+
+{% if needs_setup %}
+  <div class="pf-banner bad">e2er is not set up yet. <a href="/setup">Set it up first</a>: it takes a minute.</div>
+{% else %}
+  <div hx-get="/htmx/preflight-banner" hx-trigger="load" hx-swap="innerHTML">
+    <div class="pf-banner">Checking this computer…</div>
+  </div>
+{% endif %}
+
+{% if error %}
+  <p class="error" role="alert">{{ error }}</p>
+{% endif %}
+
+<form method="post" action="/papers" class="paper-form" id="new-study" enctype="multipart/form-data">
+  <label>
+    <span>Research question</span>
+    <textarea name="research_question" rows="4" required
+              placeholder="What is the question this study answers? For a replication, name the Zenodo record (its DOI).">{{ values.research_question }}</textarea>
+  </label>
+
+  <fieldset class="plain">
+    <legend>Template</legend>
+    <small class="muted">The steps the study takes, the checks it must pass, and where it stops for you.</small>
+    <div class="tpl-grid">
+      {% for p in pipelines %}
+        <label class="tpl">
+          <input type="radio" name="pipeline" value="{{ p.name }}" {% if p.name == values.pipeline %}checked{% endif %}>
+          <span class="tpl-name">{{ p.label }}</span>
+          <span class="tpl-desc">{{ p.description }}</span>
+          <span class="tpl-pauses">
+            {% if p.pauses %}<b>Stops for you at:</b> {{ p.pauses | join(", ") }}
+            {% else %}Runs through without stopping{% endif %}
+          </span>
+        </label>
+      {% endfor %}
+    </div>
+  </fieldset>
+
+  <fieldset class="plain" id="data-choice">
+    <legend>Data</legend>
+    <input type="hidden" name="data_choice" value="1">
+    <small class="muted">The study uses the files you tick, and public data it fetches itself (FRED, Yahoo Finance and other sources under Settings).</small>
+    {% if files_problem %}
+      <p class="pick-empty">{{ files_problem }}</p>
+    {% else %}
+    <div class="pick" data-pick="data">
+      {% if data_rows %}
+        <div class="pick-tools">
+          <input type="search" placeholder="Search your data files" data-pick-search aria-label="Search your data files">
+          <button type="button" class="btn-ghost btn-small" data-pick-all>Select all</button>
+          <button type="button" class="btn-ghost btn-small" data-pick-none>Select none</button>
+          <span class="pick-count" data-pick-count></span>
+        </div>
+        <div class="pick-list">
+          {% for f in data_rows %}
+            <label class="pick-row" data-text="{{ f.name | lower }}">
+              <input type="checkbox" name="data_file" value="{{ f.path }}" {% if f.ticked %}checked{% endif %}>
+              <span class="pick-name quoted">{{ f.name }}</span>
+              <span class="pick-meta">{{ f.kind }} · {{ f.size | filesize }}</span>
+            </label>
+          {% endfor %}
+        </div>
+        <p class="pick-note muted">From your data folder: <code class="path">{{ data_dir }}</code></p>
+      {% else %}
+        <p class="pick-empty">{% if data_dir %}Your data folder (<code class="path">{{ data_dir }}</code>) holds no data files.{% else %}No data folder is set (Settings).{% endif %} Add files here, or the study uses public data only.</p>
+      {% endif %}
+      <div class="pick-add">
+        <label class="btn btn-small"><input type="file" name="data_upload" multiple accept="{{ data_accept }}" data-add="data" hidden> Add files</label>
+        <span class="muted small">{{ data_types }}. Files you add here are kept with this study only.</span>
+      </div>
+      <ul class="pick-added" data-added="data"></ul>
+    </div>
+    {% endif %}
+  </fieldset>
+
+  <fieldset class="plain" id="paper-choice">
+    <legend>Papers</legend>
+    <small class="muted">The study reads and cites the papers you tick: from your literature folder, your .bib files and your Library.</small>
+    {% if files_problem %}
+      <p class="pick-empty">{{ files_problem }}</p>
+    {% else %}
+    <div class="pick" data-pick="papers">
+      <div id="paper-list" hx-get="/htmx/new/papers{% if papers_query %}?{{ papers_query }}{% endif %}" hx-trigger="load" hx-swap="innerHTML">
+        <p class="pick-empty">Reading your papers…</p>
+      </div>
+      <div class="pick-add">
+        <label class="btn btn-small"><input type="file" name="paper_upload" multiple accept=".pdf,.bib" data-add="papers" hidden> Add PDFs or a .bib file</label>
+        <span class="muted small">Files you add here are kept with this study only.</span>
+      </div>
+      <ul class="pick-added" data-added="papers"></ul>
+    </div>
+    <label class="check">
+      <input type="checkbox" name="only_my_papers" value="1" {% if values.only_my_papers %}checked{% endif %}>
+      <span>Use only my papers. Otherwise e2er also searches OpenAlex and arXiv for the research question; the study marks those papers as found on the web.</span>
+    </label>
+    {% endif %}
+  </fieldset>
+
+  <label class="check">
+    <input type="checkbox" name="demonstration" value="1" {% if values.demonstration %}checked{% endif %}>
+    <span>Demonstration or test run: the study is published as is and marked as not a research contribution.</span>
+  </label>
+
+  <details class="more">
+    <summary>More options</summary>
+    <label>
+      <span>Title</span>
+      <input type="text" name="title" maxlength="200" value="{{ values.title }}"
+             placeholder="Leave empty to use the first sentence of the question" />
+    </label>
+    <div class="row">
+      <label>
+        <span>Thoroughness</span>
+        <select name="mode">
+          <option value="single_pass" {% if values.mode == 'single_pass' %}selected{% endif %}>One pass (about an hour)</option>
+          <option value="iterative" {% if values.mode == 'iterative' %}selected{% endif %}>Iterative: adds self-critique and polish (much longer)</option>
+        </select>
+      </label>
+      <label>
+        <span>Methodology</span>
+        <select name="methodology">
+          <option value="empirical" {% if values.methodology == 'empirical' %}selected{% endif %}>Empirical: data, identification, estimation</option>
+          <option value="theoretical" {% if values.methodology == 'theoretical' %}selected{% endif %}>Theoretical: a formal model, no data</option>
+          <option value="mixed" {% if values.methodology == 'mixed' %}selected{% endif %}>Mixed: a model and an empirical test</option>
+        </select>
+      </label>
+      <label>
+        <span>Spending limit (USD)</span>
+        <input type="number" name="max_cost_usd" min="0.01" max="500" step="0.01" value="{{ values.max_cost_usd if values.max_cost_usd is not none else default_cap }}" />
+        <small class="muted">{% if billed %}Your provider bills per use; the run stops at this limit.{% elif uncounted_key %}Google bills your Gemini API key and e2er does not count the cost, so no spending limit applies.{% else %}Your provider runs on your subscription: nothing is billed, so no spending limit applies.{% endif %}</small>
+      </label>
+    </div>
+    <fieldset class="plain" id="review-at">
+      <legend>Also stop for you after these steps</legend>
+      <small class="muted">Besides the stops the template has. The run waits after the step, and you review, edit, instruct or send back as at every stop.</small>
+      {% for p in pipelines %}
+        <div class="radio-row review-at-set" data-template="{{ p.name }}"{% if p.name != values.pipeline %} hidden{% endif %}>
+          {% for c in p.review_choices %}
+            <label><input type="checkbox" name="review_at" value="{{ c.name }}" {% if p.name == values.pipeline and c.name in values.review_at %}checked{% endif %}{% if p.name != values.pipeline %} disabled{% endif %}> {{ c.label }}</label>
+          {% endfor %}
+          {% if not p.review_choices %}<span class="muted">This template has no steps to stop after.</span>{% endif %}
+        </div>
+      {% endfor %}
+    </fieldset>
+  </details>
+
+  <button type="submit" class="btn-primary">Start</button>
+</form>
+
+<script>
+(function () {
+  // The stops on offer follow the chosen template: only its own steps can be chosen and sent.
+  const form = document.getElementById('new-study');
+  function sync() {
+    const chosen = (form.querySelector('input[name=pipeline]:checked') || {}).value;
+    form.querySelectorAll('.review-at-set').forEach((set) => {
+      const on = set.dataset.template === chosen;
+      set.hidden = !on;
+      set.querySelectorAll('input').forEach((i) => { i.disabled = !on; if (!on) i.checked = false; });
+    });
+  }
+  form.querySelectorAll('input[name=pipeline]').forEach((r) => r.addEventListener('change', sync));
+  sync();
+
+  // Data files and papers: search, select all or none, and how many are ticked.
+  function wire(pick) {
+    if (!pick || pick.dataset.wired) return;
+    // Its own rows and tools, not those of a group inside it (the Library has its own).
+    const own = (sel) => Array.from(pick.querySelectorAll(sel)).filter((el) => el.closest('[data-pick]') === pick);
+    const rows = () => own('.pick-row');
+    const [count] = own('[data-pick-count]');
+    const [search] = own('[data-pick-search]');
+    const update = () => {
+      if (!count) return;
+      const all = rows().length;
+      const on = rows().filter((r) => r.querySelector('input').checked).length;
+      count.textContent = on + ' of ' + all + ' ticked';
+    };
+    if (!search) return;
+    pick.dataset.wired = '1';
+    search.addEventListener('input', () => {
+      const q = search.value.trim().toLowerCase();
+      rows().forEach((r) => { r.hidden = q && !r.dataset.text.includes(q); });
+    });
+    const setVisible = (on) => { rows().filter((r) => !r.hidden).forEach((r) => { r.querySelector('input').checked = on; }); update(); };
+    own('[data-pick-all]')[0].addEventListener('click', () => setVisible(true));
+    own('[data-pick-none]')[0].addEventListener('click', () => setVisible(false));
+    pick.addEventListener('change', (ev) => { if (ev.target.matches('.pick-row input') && ev.target.closest('[data-pick]') === pick) update(); });
+    update();
+  }
+  document.querySelectorAll('[data-pick]').forEach(wire);
+  document.body.addEventListener('htmx:afterSettle', () => document.querySelectorAll('[data-pick]').forEach(wire));
+
+  // Files added on this page: listed with their size; a type e2er does not read is refused here.
+  const allowed = { data: '{{ data_accept }}'.split(','), papers: ['.pdf', '.bib'] };
+  const kinds = { data: '{{ data_types }}', papers: '.pdf or .bib' };
+  form.querySelectorAll('[data-add]').forEach((input) => {
+    input.addEventListener('change', () => {
+      const which = input.dataset.add;
+      const list = form.querySelector('[data-added="' + which + '"]');
+      list.innerHTML = '';
+      const bad = Array.from(input.files).filter((f) => !allowed[which].some((x) => f.name.toLowerCase().endsWith(x)));
+      if (bad.length) {
+        const li = document.createElement('li');
+        li.className = 'error';
+        li.textContent = bad.map((f) => f.name).join(', ') + ': e2er cannot read ' + (bad.length > 1 ? 'these' : 'this') + '. Use ' + kinds[which] + '.';
+        list.appendChild(li);
+        input.value = '';
+        return;
+      }
+      Array.from(input.files).forEach((f) => {
+        const li = document.createElement('li');
+        li.textContent = f.name + ' (' + (f.size >= 1048576 ? (f.size / 1048576).toFixed(1) + ' MB' : Math.max(1, Math.round(f.size / 1024)) + ' KB') + '), added for this study';
+        list.appendChild(li);
+      });
+    });
+  });
+})();
+</script>
+{% endblock %}

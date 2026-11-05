@@ -1,0 +1,385 @@
+"""ReplayBackend: an LLM backend that replays a recorded run instead of calling a model.
+
+Test-only. It is not in the backend registry and not shipped in the wheel
+(``tests*`` is excluded); the end-to-end harness installs it into a server
+process with :func:`tests.replay.harness.install`.
+
+A *scenario* is a folder ``tests/fixtures/replay/<name>/`` with
+``scenario.json`` and ``files/<specialist>/<workspace-relative path>``, made
+by ``tests/replay/extract.py`` from a recorded demonstration run.
+
+* A specialist call writes that specialist's recorded files into the
+  workspace (text files with ``@@PAPER_ID@@`` / ``@@WORKSPACE@@`` filled in),
+  reports the recorded token counts, and succeeds. Everything that follows
+  (contract checks, post-execution, gates, the researcher steps) is the real
+  code acting on those files.
+* A strategist call answers with the plan the real run followed: the
+  initial phase's groups of specialists, ``complete`` for an iterative
+  decision, ``proceed_to_review`` for a ceiling check, no findings for a
+  self-attack. A scenario for the iterative mode scripts these instead:
+  ``"iterations"`` (round *n*'s decision: its work orders and rationale;
+  after the last round, ``complete``), ``"ceiling_checks"`` (the verdict
+  after round *n*, e.g. ``continue``, then ``pivot`` with
+  ``suggested_pivots``) and ``"self_attack"`` (the self-critique's report).
+  Each answer is chosen by the round number in the prompt, so a resumed run
+  gets the same answers.
+* Calls with no recording fail visibly ("replay has no recording for …"),
+  never silently.
+
+Variations a story needs (a specialist that fails, or writes a different file
+on its first attempt) come from an overrides file named by
+``E2ER_REPLAY_OVERRIDES``, read on every call so a story can change it while
+the server runs::
+
+    {"identification_strategist": {"attempts": [
+        {"replace": {"event_design.json": [["\\"2020-03-16\\"", "\\"2020-03-15\\""]]}}
+    ]},
+     "econometrics_specialist": {"attempts": [{"fail": "no data"}]}}
+
+``{"wait": seconds}`` makes the attempt take that long before it answers, the
+way a slow model call does, so a story can cancel a run while it works.
+
+A scenario can build on another (``"base": "fomc"``): it inherits that
+scenario's plan and recordings and brings only the files it changes
+(``files/<specialist>/<path>`` of its own, used first). ``"merge"`` names
+recorded files that are merged into the study's own instead of replacing them:
+``data.db`` gains the recorded tables it does not have, ``data_sources.json``
+the recorded loads it does not have. The ``byod`` scenario uses both, so the
+data the researcher chose on New study (imported into data.db before the run)
+stays in the study when the recorded data analyst writes its files.
+
+Attempt *n* (counted per paper and specialist in this process) uses entry
+*n* of ``attempts``; later attempts replay the recording unchanged.
+
+A specialist called more than once in a run with different results (the
+targeted corrections after the self-critique, then after the review panel)
+has ``"calls"``: call *n* uses entry *n* (the last one for later calls), each
+a recording of its own whose files are read from ``files/<dir>/`` (``"dir"``,
+default the specialist's name)::
+
+    "patch_revisor": {"calls": [
+        {"dir": "patch_revisor.self_attack", "files": ["paper_draft.tex.edits.json"]},
+        {"files": ["paper_draft.tex.edits.json"]}]}
+
+The replay stands in for the backend and model the run names (``get_backend``
+in the harness passes them): :meth:`ReplayBackend.identity` reports them, so
+the run's ``backend_identity`` event and its export name e.g. ``codex`` and
+``gpt-6-luna``. Overrides under ``"backends"`` apply only to the runs on that
+backend and take the place of the top-level entry for the same specialist, so
+two runs of one question (``e2er run-matrix``) can differ::
+
+    {"backends": {"codex": {"econometrics_specialist": {"attempts": [
+        {"replace": {"estimation_results.json": [["old", "new"]]}}]}}}}
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import re
+import shutil
+import time
+from pathlib import Path
+from typing import Any
+
+from src.modules.llm.base import (
+    CompositeToolHandler,
+    LLMBackend,
+    TokenUsage,
+    ToolHandler,
+    ToolLoopResult,
+)
+from src.modules.llm.tools import FileToolHandler
+
+FIXTURES = Path(__file__).resolve().parent.parent / "fixtures" / "replay"
+ENV_SCENARIO = "E2ER_REPLAY_SCENARIO"
+ENV_OVERRIDES = "E2ER_REPLAY_OVERRIDES"
+
+_TEXT_SUFFIXES = {".md", ".json", ".tex", ".py", ".txt", ".csv", ".bib", ".r", ".R", ".do", ".toml", ".yaml", ".yml"}
+
+
+def scenario_dir(name: str) -> Path:
+    path = Path(name)
+    if not path.is_absolute():
+        path = FIXTURES / name
+    if not (path / "scenario.json").is_file():
+        raise FileNotFoundError(f"replay scenario not found: {path}/scenario.json")
+    return path
+
+
+def _workspace_of(handler: ToolHandler | None) -> Path | None:
+    if isinstance(handler, FileToolHandler):
+        return handler.workspace
+    if isinstance(handler, CompositeToolHandler):
+        for h in handler._handlers:  # noqa: SLF001 — test code reading the composite
+            ws = _workspace_of(h)
+            if ws is not None:
+                return ws
+    return None
+
+
+class ReplayBackend(LLMBackend):
+    """Replays the files a recorded run's specialists wrote (see module docstring)."""
+
+    #: Calls per (paper id, specialist) in this process, across every backend instance.
+    _attempts: dict[tuple[str, str], int] = {}
+    #: Calls per (paper id, specialist) for ``"calls"`` recordings (overrides count separately).
+    _calls: dict[tuple[str, str], int] = {}
+    #: Every call, in order, for assertions: (paper id, specialist or strategist kind).
+    calls: list[tuple[str, str]] = []
+
+    def __init__(
+        self, scenario: str | Path | None = None, *, backend: str | None = None, model: str | None = None
+    ) -> None:
+        name = str(scenario or os.environ.get(ENV_SCENARIO) or "fomc")
+        self.root = scenario_dir(name)
+        self.scenario: dict[str, Any] = json.loads((self.root / "scenario.json").read_text(encoding="utf-8"))
+        #: The scenario this one builds on ("base"), whose recordings fill in what it does not bring.
+        self.base_root: Path | None = None
+        if self.scenario.get("base"):
+            self.base_root = scenario_dir(str(self.scenario["base"]))
+            base = json.loads((self.base_root / "scenario.json").read_text(encoding="utf-8"))
+            own = self.scenario
+            self.scenario = {
+                **base,
+                **own,
+                "specialists": {**(base.get("specialists") or {}), **(own.get("specialists") or {})},
+            }
+        #: The backend and model this replay stands in for (None: the recording's own model).
+        self.backend = backend
+        self._model = model
+
+    def identity(self) -> dict[str, Any]:
+        """The backend and model the run named, as the real backend would report them."""
+        return {
+            "backend": self.backend,
+            "model": self._model or self.scenario.get("model"),
+            "replay": self.scenario.get("name"),
+        }
+
+    # ── overrides ──────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _overrides() -> dict[str, Any]:
+        path = os.environ.get(ENV_OVERRIDES)
+        if not path or not Path(path).is_file():
+            return {}
+        try:
+            data = json.loads(Path(path).read_text(encoding="utf-8"))
+        except ValueError:
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _variant(self, paper_id: str, specialist: str) -> dict[str, Any]:
+        key = (paper_id, specialist)
+        n = ReplayBackend._attempts.get(key, 0)
+        ReplayBackend._attempts[key] = n + 1
+        over = self._overrides()
+        scoped = ((over.get("backends") or {}).get(self.backend or "") or {}).get(specialist)
+        attempts = ((scoped if scoped is not None else over.get(specialist)) or {}).get("attempts") or []
+        return attempts[n] if n < len(attempts) and isinstance(attempts[n], dict) else {}
+
+    # ── the backend ────────────────────────────────────────────────────────
+
+    async def tool_loop(
+        self,
+        system: str,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        tool_handler: ToolHandler | None,
+        max_turns: int = 30,
+        *,
+        paper_id: str | None = None,
+        specialist: str | None = None,
+    ) -> ToolLoopResult:
+        t0 = time.time()
+        if specialist is None:
+            return self._strategist(system, messages, t0)
+        ReplayBackend.calls.append((paper_id or "", specialist))
+        workspace = _workspace_of(tool_handler)
+        rec = (self.scenario.get("specialists") or {}).get(specialist)
+        if workspace is None:
+            return ToolLoopResult(success=False, output="", error="replay: the call has no workspace")
+        if rec is None:
+            return ToolLoopResult(
+                success=False,
+                output="",
+                error=f"replay has no recording for {specialist} in scenario {self.scenario.get('name')}",
+                duration_seconds=time.time() - t0,
+            )
+        rec, folder = self._recording(paper_id or "", specialist, rec)
+        variant = self._variant(paper_id or "", specialist)
+        if variant.get("wait"):
+            await asyncio.sleep(float(variant["wait"]))
+        if variant.get("fail"):
+            return ToolLoopResult(
+                success=False, output="", error=f"replay: {variant['fail']}", duration_seconds=time.time() - t0
+            )
+        written = []
+        skip = set(variant.get("skip") or [])
+        replace: dict[str, list[list[str]]] = variant.get("replace") or {}
+        for rel in rec.get("files") or []:
+            if rel in skip:
+                continue
+            self._write(workspace, folder, rel, paper_id or "", replace.get(rel) or [])
+            written.append(rel)
+        _times_in_order(workspace, written)
+        u = rec.get("usage") or {}
+        return ToolLoopResult(
+            success=True,
+            output=rec.get("output") or f"Wrote {', '.join(written)}.",
+            tool_calls_made=len(written),
+            usage=TokenUsage(
+                input_tokens=int(u.get("input_tokens") or 0),
+                output_tokens=int(u.get("output_tokens") or 0),
+                cache_read_tokens=int(u.get("cache_read_tokens") or 0),
+                cache_write_tokens=int(u.get("cache_write_tokens") or 0),
+            ),
+            duration_seconds=time.time() - t0,
+        )
+
+    def _recording(self, paper_id: str, specialist: str, rec: dict[str, Any]) -> tuple[dict[str, Any], str]:
+        """This call's recording and the folder under ``files/`` its files come from (``"calls"``)."""
+        calls = rec.get("calls")
+        if not calls:
+            return rec, specialist
+        key = (paper_id, specialist)
+        n = ReplayBackend._calls.get(key, 0)
+        ReplayBackend._calls[key] = n + 1
+        one = {**{k: v for k, v in rec.items() if k != "calls"}, **calls[min(n, len(calls) - 1)]}
+        return one, str(one.get("dir") or specialist)
+
+    def _source(self, specialist: str, rel: str) -> Path:
+        own = self.root / "files" / specialist / rel
+        if own.exists() or self.base_root is None:
+            return own
+        return self.base_root / "files" / specialist / rel
+
+    def _recorded_files(self, specialist: str) -> list[str]:
+        """The files the recording of ``specialist`` lists, in this scenario or the one it builds on."""
+        own = (self.scenario.get("specialists", {}).get(specialist) or {}).get("files")
+        if own or self.base_root is None:
+            return list(own or [])
+        base = json.loads((self.base_root / "scenario.json").read_text(encoding="utf-8"))
+        return list((base.get("specialists", {}).get(specialist) or {}).get("files") or [])
+
+    def _write(self, workspace: Path, specialist: str, rel: str, paper_id: str, replace: list[list[str]]) -> None:
+        src = self._source(specialist, rel)
+        dest = workspace / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if rel in (self.scenario.get("merge") or []) and dest.is_file():
+            _merge(src, dest)
+            return
+        if dest.is_symlink() or dest.exists():
+            dest.unlink()
+        if src.suffix not in _TEXT_SUFFIXES:
+            shutil.copyfile(src, dest)
+            return
+        text = src.read_text(encoding="utf-8")
+        # Forward slashes: the recorded files put the path into Python strings and JSON, where a Windows path's
+        # backslashes are escapes (C:\\Users: "truncated \\UXXXXXXXX escape"); Windows takes C:/Users/… as well.
+        text = text.replace("@@WORKSPACE@@", workspace.resolve().as_posix()).replace("@@PAPER_ID@@", paper_id)
+        for old, new in replace:
+            if old not in text:
+                raise AssertionError(f"replay override: {old!r} not found in {specialist}/{rel}")
+            text = text.replace(old, new)
+        # A recording's JSON next to its scripts is a script's output (estimation_results.json): written in this
+        # system's text mode, as the script writes it (CRLF on Windows), or e2er's script log sees it "changed
+        # after the script last wrote it". Everything else as the specialist wrote it, with LF.
+        files = self._recorded_files(specialist)
+        script_output = rel.endswith(".json") and any(str(f).endswith(".py") for f in files)
+        dest.write_text(text, encoding="utf-8", newline=None if script_output else "\n")
+
+    def _strategist(self, system: str, messages: list[dict[str, Any]], t0: float) -> ToolLoopResult:
+        prompt = "\n".join(str(m.get("content", "")) for m in messages if m.get("role") == "user")
+        ReplayBackend.calls.append(("", "strategist"))
+        rounds = (re.search(r"Iteration: (\d+)", prompt) or [None, "0"])[1]
+        n = int(rounds or 0)
+        if "Decide what to do next" in prompt:
+            status = (re.search(r"Paper status: (\w+)", prompt) or [None, ""])[1]
+            groups = self.scenario.get("initial_groups") or []
+            scripted = self.scenario.get("iterations") or []
+            decision: dict[str, Any]
+            if status == "designing" and groups:
+                orders = [
+                    {
+                        "specialist": sp,
+                        "focus": f"Carry out your part of this study as your skills describe ({sp}).",
+                        "parallel_group": g,
+                        "context_tier": 1,
+                    }
+                    for g, group in enumerate(groups)
+                    for sp in group
+                ]
+                decision = {
+                    "action": "dispatch_parallel",
+                    "work_orders": orders,
+                    "rationale": "replay: the plan of the recorded run",
+                }
+            elif status != "designing" and 1 <= n <= len(scripted):
+                decision = {"action": "dispatch_parallel", **scripted[n - 1]}
+            else:
+                decision = {"action": "complete", "rationale": "replay: nothing further in the recorded run"}
+            out = json.dumps(decision)
+        elif "SelfAttackReport" in prompt:
+            out = json.dumps(self.scenario.get("self_attack") or {"findings": [], "overall_severity": 0})
+        elif "verdict" in prompt or "Iteration:" in prompt:
+            checks = self.scenario.get("ceiling_checks") or []
+            verdict = (
+                checks[n - 1]
+                if 1 <= n <= len(checks)
+                else {"verdict": "proceed_to_review", "reason": "replay", "suggested_pivots": []}
+            )
+            out = json.dumps(verdict)
+        else:
+            return ToolLoopResult(
+                success=False, output="", error="replay has no recording for this call", duration_seconds=0.0
+            )
+        return ToolLoopResult(success=True, output=out, duration_seconds=time.time() - t0)
+
+
+def _merge(src: Path, dest: Path) -> None:
+    """Merge a recorded file into the study's own (``"merge"`` in scenario.json)."""
+    if dest.name == "data.db":
+        import sqlite3
+
+        con = sqlite3.connect(dest)
+        try:
+            have = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+            con.execute("ATTACH DATABASE ? AS rec", (str(src),))
+            for (name,) in con.execute("SELECT name FROM rec.sqlite_master WHERE type = 'table'").fetchall():
+                if name not in have:
+                    con.execute(f'CREATE TABLE "{name}" AS SELECT * FROM rec."{name}"')  # noqa: S608 — test fixture
+            con.commit()
+            con.execute("DETACH DATABASE rec")
+        finally:
+            con.close()
+        return
+    if dest.name == "data_sources.json":
+        mine = json.loads(dest.read_text(encoding="utf-8"))
+        recorded = json.loads(src.read_text(encoding="utf-8"))
+
+        def key(load: dict[str, Any]) -> Any:
+            return load.get("table") or load.get("saved_to") or (load.get("connector"), load.get("series"))
+
+        seen = {key(x) for x in mine.get("loads") or []}
+        mine["loads"] = (mine.get("loads") or []) + [x for x in recorded.get("loads") or [] if key(x) not in seen]
+        dest.write_text(json.dumps(mine, indent=2, ensure_ascii=False) + "\n", encoding="utf-8", newline="\n")
+        return
+    raise AssertionError(f"replay: no merge for {dest.name}")
+
+
+def _times_in_order(workspace: Path, written: list[str]) -> None:
+    """Give a call's files increasing modification times (1 ms apart, ending now) in the order the recording lists
+    them, as the recorded run wrote them, seconds apart.
+
+    The replay writes them within a millisecond, and Windows takes a file's time from a clock that advances every
+    ~16 ms: files written in one tick had the same time, and e2er's order by file times (a workspace with no script
+    log, reproduce_recipe.chain_of) left out revise_estimation.py, written in the tick of run_estimation.py (Windows
+    CI, 2026-10-30). ``os.utime`` sets the time exactly, whatever the clock's tick.
+    """
+    end = time.time_ns()
+    for i, rel in enumerate(written):
+        t = end - (len(written) - 1 - i) * 1_000_000
+        os.utime(workspace / rel, ns=(t, t))

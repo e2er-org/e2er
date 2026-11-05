@@ -1,0 +1,218 @@
+"""LLM module — Anthropic API backend with prompt caching and tool-use loop."""
+
+from __future__ import annotations
+
+import asyncio
+import itertools
+import time
+from typing import Any
+
+import anthropic
+
+from ...config import get_settings
+from ...logging_config import get_logger
+from .base import LLMBackend, TokenUsage, ToolHandler, ToolLoopResult
+
+logger = get_logger(__name__)
+
+_CACHE_THRESHOLD_CHARS = 4000  # only cache if system prompt is substantial
+_loop_keys = itertools.count(1)
+#: What each running loop has used so far, by loop key (recorded if the run is stopped mid-loop).
+_spent: dict[int, TokenUsage] = {}
+
+
+class AnthropicBackend(LLMBackend):
+    """Anthropic API backend.
+
+    Runs a multi-turn tool-use loop. Accumulates TokenUsage across all turns.
+    Applies prompt caching to the system prompt when enabled.
+    """
+
+    def __init__(self, model: str | None = None) -> None:
+        settings = get_settings()
+        if not settings.anthropic_api_key:
+            raise ValueError("ANTHROPIC_API_KEY is not set")
+        self._client = anthropic.AsyncAnthropic(
+            api_key=settings.anthropic_api_key,
+            max_retries=5,
+        )
+        self._model = model or settings.anthropic_model
+        self._caching = settings.enable_prompt_caching
+        self._max_tokens = settings.max_tokens_per_call
+
+    async def tool_loop(
+        self,
+        system: str,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        tool_handler: ToolHandler | None,
+        max_turns: int = 30,
+        *,
+        paper_id: str | None = None,
+        specialist: str | None = None,
+    ) -> ToolLoopResult:
+        from ..tracking.usage import loop_finished, record_cancelled_loop
+        from .plan_limit import raise_if_billing
+
+        loop_key = next(_loop_keys)
+        try:
+            result = await self._tool_loop(system, messages, tools, tool_handler, max_turns, paper_id, loop_key)
+            # No credits, or the key's spending limit: the run pauses (like a plan's limit) instead of failing.
+            await raise_if_billing("anthropic", self._model, result, paper_id, specialist)
+            return result
+        except asyncio.CancelledError:
+            # A stopped run: the runner never records this loop's usage, but it was billed.
+            await record_cancelled_loop(paper_id, specialist, "anthropic", self._model, _spent.pop(loop_key, None))
+            raise
+        finally:
+            _spent.pop(loop_key, None)
+            loop_finished(paper_id, loop_key)
+
+    async def _tool_loop(
+        self,
+        system: str,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        tool_handler: ToolHandler | None,
+        max_turns: int,
+        paper_id: str | None,
+        loop_key: int,
+    ) -> ToolLoopResult:
+        from ..tracking.costs import compute_cost
+        from ..tracking.usage import loop_over_budget
+
+        start = time.monotonic()
+        usage = TokenUsage()
+        tool_calls_made = 0
+        msgs = list(messages)
+
+        # Build system with optional cache_control
+        system_content: list[dict[str, Any]] | str
+        if self._caching and len(system) >= _CACHE_THRESHOLD_CHARS:
+            system_content = [
+                {
+                    "type": "text",
+                    "text": system,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ]
+        else:
+            system_content = system
+
+        # Cache first user message if it's large repeated context
+        if self._caching and msgs and isinstance(msgs[0].get("content"), str):
+            first_content = msgs[0]["content"]
+            if len(first_content) >= _CACHE_THRESHOLD_CHARS:
+                msgs[0] = {
+                    **msgs[0],
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": first_content,
+                            "cache_control": {"type": "ephemeral"},
+                        }
+                    ],
+                }
+
+        for turn in range(max_turns):
+            over, spent, cap = await loop_over_budget(
+                paper_id, loop_key, float(compute_cost(self._model, usage, backend="anthropic"))
+            )
+            if over:
+                logger.warning("Anthropic turn %d: spending limit reached ($%.2f of $%.2f); stopping", turn, spent, cap)
+                return ToolLoopResult(
+                    success=False,
+                    output="",
+                    error=f"spending limit reached: ${spent:.2f} of ${cap:.2f}",
+                    tool_calls_made=tool_calls_made,
+                    usage=usage,
+                    duration_seconds=time.monotonic() - start,
+                    stop_reason="budget",
+                )
+            try:
+                response = await self._client.messages.create(
+                    model=self._model,
+                    max_tokens=self._max_tokens,
+                    system=system_content,  # type: ignore[arg-type]
+                    messages=msgs,  # type: ignore[arg-type]
+                    tools=tools,  # type: ignore[arg-type]
+                )
+            except anthropic.APIError as e:
+                logger.error("Anthropic API error on turn %d: %s", turn, e)
+                return ToolLoopResult(
+                    success=False,
+                    output="",
+                    error=str(e),
+                    tool_calls_made=tool_calls_made,
+                    usage=usage,
+                    duration_seconds=time.monotonic() - start,
+                )
+
+            # Accumulate usage
+            u = response.usage
+            usage = usage + TokenUsage(
+                input_tokens=u.input_tokens,
+                output_tokens=u.output_tokens,
+                cache_read_tokens=getattr(u, "cache_read_input_tokens", 0) or 0,
+                cache_write_tokens=getattr(u, "cache_creation_input_tokens", 0) or 0,
+            )
+            _spent[loop_key] = usage
+
+            # Extract text output
+            text_output = " ".join(b.text for b in response.content if hasattr(b, "text"))
+
+            if response.stop_reason == "end_turn":
+                return ToolLoopResult(
+                    success=True,
+                    output=text_output,
+                    tool_calls_made=tool_calls_made,
+                    usage=usage,
+                    duration_seconds=time.monotonic() - start,
+                    stop_reason="end_turn",
+                )
+
+            if response.stop_reason != "tool_use":
+                return ToolLoopResult(
+                    success=False,
+                    output=text_output,
+                    error=f"Unexpected stop_reason: {response.stop_reason}",
+                    tool_calls_made=tool_calls_made,
+                    usage=usage,
+                    duration_seconds=time.monotonic() - start,
+                    stop_reason=response.stop_reason or "unknown",
+                )
+
+            # Execute tool calls
+            tool_results = []
+            for block in response.content:
+                if block.type != "tool_use":
+                    continue
+                tool_calls_made += 1
+                logger.debug("Tool call: %s(%s)", block.name, list(block.input.keys()))
+                if tool_handler is None:
+                    # Caller passed no handler but the model requested a tool —
+                    # surface as an error result so the model sees its mistake.
+                    result_text = "Tool dispatch is disabled for this call."
+                else:
+                    result_text = await tool_handler.handle(block.name, block.input)
+                tool_results.append(
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": result_text,
+                    }
+                )
+
+            # Append assistant turn + tool results
+            msgs.append({"role": "assistant", "content": response.content})
+            msgs.append({"role": "user", "content": tool_results})
+
+        return ToolLoopResult(
+            success=False,
+            output="",
+            error=f"Reached max_turns={max_turns} without end_turn",
+            tool_calls_made=tool_calls_made,
+            usage=usage,
+            duration_seconds=time.monotonic() - start,
+            stop_reason="max_turns",
+        )

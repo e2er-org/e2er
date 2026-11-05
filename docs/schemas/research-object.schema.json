@@ -1,0 +1,523 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/e2er-org/e2er/docs/schemas/research-object.schema.json",
+  "title": "e2er research object",
+  "description": "The manifest `e2er publish` writes into an exported bundle (e2er.json) and submits to the registry. Every field is derived from the bundle, the run database or the publish arguments. content_id is the SHA-256 of provenance.json, which fixes the hash of every other file.",
+  "type": "object",
+  "required": [
+    "schema",
+    "id",
+    "content_id",
+    "question",
+    "contributors",
+    "ai",
+    "process",
+    "dependencies",
+    "verification"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema": {
+      "const": "e2er-research-object/0.1"
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]{0,38}/[a-z0-9][a-z0-9._-]{0,99}$",
+      "description": "owner/project; the owner is a GitHub login"
+    },
+    "content_id": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "title": {
+      "type": "string"
+    },
+    "question": {
+      "type": "string"
+    },
+    "contributors": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "github": {
+            "type": "string"
+          },
+          "orcid": {
+            "type": "string",
+            "pattern": "^\\d{4}-\\d{4}-\\d{4}-\\d{3}[\\dX]$"
+          },
+          "roles": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "anyOf": [
+          {
+            "required": [
+              "github"
+            ]
+          },
+          {
+            "required": [
+              "orcid"
+            ]
+          }
+        ]
+      }
+    },
+    "ai": {
+      "type": "object",
+      "required": [
+        "backend",
+        "model",
+        "agents",
+        "agents_source"
+      ],
+      "properties": {
+        "backend": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "agents": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "agents_source": {
+          "enum": [
+            "recorded",
+            "declared",
+            "unknown"
+          ]
+        },
+        "usage": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        }
+      }
+    },
+    "process": {
+      "type": "object",
+      "properties": {
+        "template": {
+          "type": "string"
+        },
+        "mode": {
+          "type": "string"
+        },
+        "methodology": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "governance": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "e2er_version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "exported": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "components": {
+      "type": "object",
+      "properties": {
+        "skills": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    "literature": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "cite_key": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "doi": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "verified_by": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      }
+    },
+    "data": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "path",
+          "sha256"
+        ],
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "sha256": {
+            "type": "string"
+          },
+          "bytes": {
+            "type": "integer"
+          }
+        }
+      }
+    },
+    "outputs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "path",
+          "sha256"
+        ],
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "sha256": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "properties": {
+        "files": {
+          "type": "integer"
+        },
+        "edges": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "integer"
+          }
+        }
+      }
+    },
+    "verification": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "check",
+          "status"
+        ],
+        "properties": {
+          "check": {
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "PASS",
+              "FAIL",
+              "SKIP"
+            ]
+          },
+          "detail": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "dependencies": {
+      "type": "object",
+      "required": [
+        "uses",
+        "derived_from"
+      ],
+      "properties": {
+        "uses": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "derived_from": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "repository": {
+      "type": "object",
+      "description": "Where the study's files are: a repository at a fixed commit, and the study's folder in it. e2er.org reads the files there and checks them against provenance.json.",
+      "properties": {
+        "url": {
+          "type": "string"
+        },
+        "commit": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "host": {
+          "enum": [
+            "github"
+          ],
+          "description": "github: e2er publish --github pushed the study's files (what e2er pack ships) to this public repository."
+        },
+        "left_out": {
+          "type": "array",
+          "description": "Files of the study that are not in the repository, each with why (kind): \"terms\" (a source's terms keep it out; e2er.org's check accepts it as left out, not missing, when the description names the source's terms), \"size\" (larger than GitHub takes, 100 MiB; accepted when provenance.json records it larger), \"no_data\" (the authors left it out with --no-data). An entry without kind is left out under its source's terms. The study's recipe loads or builds them again.",
+          "items": {
+            "type": "object",
+            "required": [
+              "path",
+              "reason"
+            ],
+            "properties": {
+              "path": {
+                "type": "string"
+              },
+              "reason": {
+                "type": "string"
+              },
+              "kind": {
+                "enum": [
+                  "terms",
+                  "size",
+                  "no_data"
+                ],
+                "description": "Why the file is left out; absent in descriptions from older e2er versions (left out under a source's terms)."
+              }
+            }
+          }
+        }
+      }
+    },
+    "package": {
+      "type": "object",
+      "description": "The study as one .e2er file (what e2er pack writes), hosted by its authors: a GitHub release asset, or a file of the study's code deposit on Zenodo. e2er.org records only this, never the file; readers fetch it with e2er fetch, and e2er verify <file> --against <study address> compares its fingerprint with this one.",
+      "required": [
+        "url",
+        "sha256",
+        "bytes",
+        "host",
+        "fingerprint"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "url": {
+          "type": "string",
+          "pattern": "^https://",
+          "description": "https://github.com/<owner>/<repository>/releases/download/<tag>/<name>.e2er, or https://zenodo.org/records/<id>/files/<name>.e2er."
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$",
+          "description": "SHA-256 of the file's bytes."
+        },
+        "bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "The file's size in bytes."
+        },
+        "host": {
+          "enum": [
+            "github",
+            "zenodo"
+          ]
+        },
+        "fingerprint": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "description": "The package's fingerprint, as its e2er-package.json gives it: SHA-256 over the list of its files with their SHA-256 and size."
+        }
+      }
+    },
+    "license": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "published": {
+      "type": "string"
+    },
+    "access": {
+      "type": "object",
+      "description": "Whether the study's files can be read, and where. public: the PDF link; private: the files are not shared, the publisher's version may be behind a paywall.",
+      "required": [
+        "status"
+      ],
+      "properties": {
+        "status": {
+          "enum": [
+            "public",
+            "private"
+          ]
+        },
+        "pdf": {
+          "type": "string"
+        },
+        "publisher": {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "url": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    "dossier": {
+      "description": "The study's dossier: run settings, the workflow with the intermediate files each step wrote, and every template, specialist, skill and connector used, pinned to its version. The id is sha256 of the document's canonical JSON (keys sorted, no whitespace, UTF-8); the paper's first-page footnote links to url.",
+      "type": "object",
+      "required": [
+        "id",
+        "url",
+        "doc"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "url": {
+          "type": "string"
+        },
+        "doc": {
+          "type": "object"
+        }
+      }
+    },
+    "availability": {
+      "description": "Whether the study's data and code are public, and where. Stated at publishing (e2er publish --data/--code); private unless stated. Optional: manifests written before it existed omit it, which means private.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "data": {
+          "type": "object",
+          "required": [
+            "access"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "access": {
+              "enum": [
+                "public",
+                "private"
+              ],
+              "description": "public: others can obtain it at url/doi. private: only file fingerprints are published."
+            },
+            "url": {
+              "type": "string",
+              "description": "Where the public material lives: a repository at a commit, or https://doi.org/<doi>. Absent when private."
+            },
+            "doi": {
+              "type": "string",
+              "description": "DOI of the public material, e.g. from `e2er publish --zenodo`."
+            },
+            "zenodo": {
+              "type": "string",
+              "description": "The Zenodo record page, when deposited with --zenodo."
+            }
+          }
+        },
+        "code": {
+          "type": "object",
+          "required": [
+            "access"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "access": {
+              "enum": [
+                "public",
+                "private"
+              ],
+              "description": "public: others can obtain it at url/doi. private: only file fingerprints are published."
+            },
+            "url": {
+              "type": "string",
+              "description": "Where the public material lives: a repository at a commit, or https://doi.org/<doi>. Absent when private."
+            },
+            "doi": {
+              "type": "string",
+              "description": "DOI of the public material, e.g. from `e2er publish --zenodo`."
+            },
+            "zenodo": {
+              "type": "string",
+              "description": "The Zenodo record page, when deposited with --zenodo."
+            }
+          }
+        }
+      }
+    },
+    "purpose": {
+      "enum": [
+        "demonstration"
+      ],
+      "description": "Why the study is published. demonstration: a demonstration or test run, published as is and not presented as a research contribution (`e2er run --demonstration` or `e2er publish --demonstration`); e2er.org shows a notice on the study and its dossier."
+    },
+    "kind": {
+      "enum": [
+        "study",
+        "replication"
+      ],
+      "description": "study (the default when absent) or replication: a reproduction of someone else's published study, made with the replication template."
+    }
+  }
+}

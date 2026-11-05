@@ -1,0 +1,523 @@
+"""Read the RISE catalogue of skill packs, and install one.
+
+RISE (github.com/e2er-org/RISE) indexes skill packs published by other research
+projects — each with its own source repository, licence and maintainers. It is a
+catalogue, not a library, and that distinction decides the design here: E2ER
+*installs* packs from their source, it does not vendor them.
+
+Copying them in would mean republishing, under E2ER's MIT licence and on PyPI,
+work that is variously CC BY-NC, unlicensed, or private to its curator. Roughly
+half of the catalogue's 358 skills fall into one of those. Installing on the
+user's own machine raises none of those questions, keeps attribution with the
+authors, and leaves RISE doing the job it was built for.
+
+Installed packs land in ``~/.e2er/skills/<pack>/`` alongside a ``pack.json``
+recording where each file came from and under what licence, so an installed tree
+can always answer "whose is this?".
+"""
+
+from __future__ import annotations
+
+import json
+import re
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Any
+
+from ..logging_config import get_logger
+
+logger = get_logger(__name__)
+
+#: Raw file host for GitHub blob URLs. The catalogue records human-facing
+#: `blob` links; fetching needs the raw equivalent.
+_GITHUB_BLOB = "https://github.com/"
+_GITHUB_RAW = "https://raw.githubusercontent.com/"
+
+
+class CatalogueError(RuntimeError):
+    """The catalogue could not be read, or a pack could not be installed."""
+
+
+class PrivatePackError(CatalogueError):
+    """The pack lives in a private repository; the message says whom to ask for access."""
+
+
+@dataclass
+class CatalogueSkill:
+    slug: str
+    name: str = ""
+    description: str = ""
+    category: str = ""
+    field_: str = ""
+    source_path: str = ""
+    details_url: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class SkillPack:
+    slug: str
+    name: str = ""
+    source_url: str = ""
+    license: str = ""
+    maintainers: tuple[str, ...] = ()
+    compatibility: tuple[str, ...] = ()
+    notes: str = ""
+    skills: list[CatalogueSkill] = field(default_factory=list)
+
+    @property
+    def redistributable(self) -> bool:
+        """Whether E2ER could ship this pack, as opposed to installing it.
+
+        Not used to block anything — installing a public file on your own
+        machine is not redistribution. It exists so `skills list` can show which
+        packs are safe to bundle, which is the question that made this an
+        installer rather than a copy.
+        """
+        lic = (self.license or "").lower()
+        return any(k in lic for k in ("mit", "apache", "bsd", "cc0", "cc by 4", "public domain")) and "nc" not in lic
+
+    @property
+    def private(self) -> bool:
+        """The pack lives in a repository e2er cannot download from: the catalogue says it is private,
+        or names no file to fetch (the 100xOS pack: ``source_url: 'private (…)'``, every ``details_url`` empty).
+        """
+        src = (self.source_url or "").strip().lower()
+        if src.startswith("private") or (self.license or "").strip().lower().startswith("private"):
+            return True
+        return bool(self.skills) and not any(s.details_url for s in self.skills)
+
+    @property
+    def owner(self) -> str:
+        """Who can give access: the maintainers, else "its owner"."""
+        return ", ".join(self.maintainers) or "its owner"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "slug": self.slug,
+            "name": self.name,
+            "source_url": self.source_url,
+            "license": self.license,
+            "maintainers": list(self.maintainers),
+            "compatibility": list(self.compatibility),
+            "skills": [s.to_dict() for s in self.skills],
+        }
+
+
+# ── reading the catalogue ────────────────────────────────────────────────────
+
+
+#: The public RISE catalogue, read when no local checkout is configured.
+RISE_REPO = "https://github.com/e2er-org/RISE"
+_RISE_TARBALL = "https://codeload.github.com/e2er-org/RISE/tar.gz/refs/heads/main"
+#: A downloaded copy older than this is fetched again.
+_REFRESH_SECONDS = 24 * 3600
+_MAX_TARBALL_BYTES = 200 * 1024 * 1024
+#: One pack manifest (skills/<pack>.yml): the largest in the catalogue is a few dozen KB.
+_MAX_MANIFEST_BYTES = 2 * 1024 * 1024
+#: Pack manifests read from one download (the catalogue holds a few dozen).
+_MAX_MANIFESTS = 2000
+
+
+def downloaded_catalogue_dir() -> Path:
+    """Where e2er keeps its copy of the catalogue's pack list from GitHub."""
+    return Path.home() / ".e2er" / "cache" / "rise"
+
+
+def catalogue_path(explicit: str | Path | None = None) -> Path:
+    """Where the catalogue is read from: --catalogue, else RISE_PATH, else e2er's downloaded copy."""
+    if explicit:
+        return Path(explicit).expanduser()
+
+    try:
+        from ..config import get_settings
+
+        configured = get_settings().rise_path
+    except Exception:
+        configured = None
+
+    if configured:
+        return Path(configured).expanduser()
+    return downloaded_catalogue_dir()
+
+
+def _fetch_tarball(url: str, max_bytes: int | None = None) -> bytes:
+    """The RISE tarball, streamed with a cap: the size is checked while the bytes arrive."""
+    import httpx
+
+    cap = _MAX_TARBALL_BYTES if max_bytes is None else max_bytes
+    body = bytearray()
+    with httpx.stream("GET", url, follow_redirects=True, timeout=60) as resp:
+        resp.raise_for_status()
+        for chunk in resp.iter_bytes():
+            body.extend(chunk)
+            if len(body) > cap:
+                raise CatalogueError("the RISE download is larger than expected")
+    return bytes(body)
+
+
+def _manifests_from_tarball(data: bytes) -> dict[str, bytes]:
+    """The pack manifests (``<repo>-main/skills/<pack>.yml``) of the RISE tarball, each read with a size cap.
+
+    A member's declared size is checked before it is read, and the read itself is bounded, so one
+    huge (or highly compressed) member cannot fill memory; past ``_MAX_MANIFESTS`` the rest are ignored.
+    """
+    import io
+    import tarfile
+
+    manifests: dict[str, bytes] = {}
+    with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tar:
+        for member in tar:
+            parts = member.name.split("/")
+            if not (member.isfile() and len(parts) == 3 and parts[1] == "skills" and parts[2].endswith(".yml")):
+                continue
+            if parts[2].startswith(".") or not safe_slug(parts[2][: -len(".yml")].lower()):
+                continue
+            if member.size > _MAX_MANIFEST_BYTES:
+                logger.warning("skipping %s in the RISE download: %d bytes", parts[2], member.size)
+                continue
+            fh = tar.extractfile(member)
+            if fh is None:
+                continue
+            blob = fh.read(_MAX_MANIFEST_BYTES + 1)
+            if len(blob) > _MAX_MANIFEST_BYTES:
+                continue
+            manifests[parts[2]] = blob
+            if len(manifests) >= _MAX_MANIFESTS:
+                break
+    return manifests
+
+
+def _download_catalogue(root: Path) -> None:
+    """Fetch the pack manifests (skills/*.yml) of the public RISE catalogue into ``root``.
+
+    Only the manifests are kept: packs are installed from their own sources.
+    A fresh copy (under a day old) is reused. When GitHub cannot be reached, an
+    older copy is used with a warning; with no copy at all, the error says how to
+    point e2er to a catalogue instead.
+    """
+    import time
+
+    skills_dir = root / "skills"
+    stamp = root / ".downloaded"
+    if stamp.is_file() and time.time() - stamp.stat().st_mtime < _REFRESH_SECONDS and skills_dir.is_dir():
+        return
+    try:
+        manifests = _manifests_from_tarball(_fetch_tarball(_RISE_TARBALL))
+    except Exception as e:  # noqa: BLE001 — any failure ends in the same advice
+        if skills_dir.is_dir() and any(skills_dir.glob("*.yml")):
+            logger.warning("could not refresh the RISE catalogue from GitHub (%s); using the copy in %s", e, root)
+            return
+        raise CatalogueError(
+            f"could not download the RISE catalogue from {RISE_REPO} ({e}). Check the internet connection, "
+            "or clone the repository and point e2er to it: set RISE_PATH=/path/to/RISE in .env, or pass "
+            "--catalogue /path/to/RISE."
+        ) from e
+    if not manifests:
+        raise CatalogueError(
+            f"the download from {RISE_REPO} held no skill packs. Clone the repository and set RISE_PATH, "
+            "or pass --catalogue /path/to/RISE."
+        )
+    skills_dir.mkdir(parents=True, exist_ok=True)
+    for old in skills_dir.glob("*.yml"):
+        old.unlink()
+    for name, data in manifests.items():
+        (skills_dir / name).write_bytes(data)
+    stamp.write_text(time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), encoding="utf-8", newline="\n")
+
+
+def _pack_from(raw: dict[str, Any], slug: str) -> SkillPack:
+    meta = raw.get("pack") or {}
+    skills = []
+    for entry in raw.get("skills") or []:
+        if not isinstance(entry, dict):
+            continue
+        skills.append(
+            CatalogueSkill(
+                slug=str(entry.get("slug", "")),
+                name=str(entry.get("name", "")),
+                description=str(entry.get("description", "")),
+                category=str(entry.get("category", "")),
+                field_=str(entry.get("field", "")),
+                source_path=str(entry.get("source_path", "")),
+                details_url=str(entry.get("details_url", "")),
+            )
+        )
+    return SkillPack(
+        slug=str(meta.get("slug", slug)),
+        name=str(meta.get("name", slug)),
+        source_url=str(meta.get("source_url", "")),
+        license=str(meta.get("license", "")),
+        maintainers=tuple(meta.get("maintainers") or ()),
+        compatibility=tuple(meta.get("compatibility") or ()),
+        notes=str(meta.get("notes", "")),
+        skills=skills,
+    )
+
+
+def read_catalogue(path: str | Path | None = None) -> list[SkillPack]:
+    """Every pack in the catalogue, sorted by slug. Never raises on one bad file."""
+    import yaml
+
+    root = catalogue_path(path)
+    if root == downloaded_catalogue_dir():
+        _download_catalogue(root)
+    skills_dir = root / "skills"
+    if not skills_dir.is_dir():
+        raise CatalogueError(
+            f"no RISE catalogue at {root}: the folder has no skills/ list. Point e2er to a clone of "
+            f"{RISE_REPO} with RISE_PATH=/path/to/RISE in .env or --catalogue /path/to/RISE, or unset "
+            "RISE_PATH to use e2er's own copy from GitHub."
+        )
+
+    packs: list[SkillPack] = []
+    for manifest in sorted(skills_dir.glob("*.yml")):
+        try:
+            raw = yaml.safe_load(manifest.read_text(encoding="utf-8")) or {}
+        except Exception as e:  # noqa: BLE001 — one malformed pack must not hide the rest
+            logger.warning("skipping unreadable pack %s: %s", manifest.name, e)
+            continue
+        if isinstance(raw, dict) and raw.get("pack"):
+            packs.append(_pack_from(raw, manifest.stem))
+    return packs
+
+
+def find_pack(slug: str, path: str | Path | None = None) -> SkillPack:
+    for pack in read_catalogue(path):
+        if pack.slug == slug:
+            return pack
+    raise CatalogueError(f"no pack named {slug!r} in the catalogue. `e2er skills list` shows what there is.")
+
+
+# ── installing ───────────────────────────────────────────────────────────────
+
+
+#: A pack or skill slug: it becomes a folder or file name under the install root. The catalogue's
+#: own slugs use lowercase letters, digits, ``-`` and ``_`` and run up to 70 characters
+#: (theory_lab-personas-tier6_social_humanities-science_technology_studies).
+_SAFE_SLUG = re.compile(r"^[a-z0-9][a-z0-9_-]{0,95}$")
+
+
+def safe_slug(slug: object) -> bool:
+    """May ``slug`` name a folder or file under the install root? No ``/``, ``..`` or uppercase."""
+    return isinstance(slug, str) and bool(_SAFE_SLUG.fullmatch(slug))
+
+
+def _inside(root: Path, name: str) -> Path:
+    """``root / name`` when ``name`` is a safe slug and the path stays inside ``root``, else CatalogueError."""
+    if not safe_slug(name):
+        raise CatalogueError(f"refusing the slug {name!r}: only a-z, 0-9, - and _ (up to 96 characters)")
+    base = root.resolve()
+    target = (base / name).resolve()
+    if target.parent != base:
+        raise CatalogueError(f"refusing the slug {name!r}: it leads outside {base}")
+    return target
+
+
+def install_root() -> Path:
+    """Where installed packs live. Searched by the skill loader."""
+    return Path.home() / ".e2er" / "skills"
+
+
+def _raw_url(details_url: str) -> str:
+    """Turn a GitHub blob link into a fetchable raw link."""
+    if details_url.startswith(_GITHUB_BLOB) and "/blob/" in details_url:
+        return details_url.replace(_GITHUB_BLOB, _GITHUB_RAW, 1).replace("/blob/", "/", 1)
+    return details_url
+
+
+def _candidate_urls(details_url: str) -> list[str]:
+    """The raw URL, then the same path on the other default branch.
+
+    The catalogue records `/blob/main/` for every pack, and not every
+    repository uses `main` — theorist-toolbox is on `master`, so all eleven of
+    its skills 404'd on the first real install. Rather than treat a
+    catalogue-wide assumption as truth, try the recorded branch and then the
+    obvious alternative. Two requests in the worst case, no API token needed.
+    """
+    primary = _raw_url(details_url)
+    urls = [primary]
+    for a, b in (("/main/", "/master/"), ("/master/", "/main/")):
+        if a in primary:
+            urls.append(primary.replace(a, b, 1))
+            break
+
+    # Same story with filename casing: the catalogue records skill.md for one
+    # entry and SKILL.md for its ten siblings, and the repository has SKILL.md
+    # throughout. Raw GitHub is case-sensitive, so that one 404s.
+    cased: list[str] = []
+    for u in urls:
+        if u.endswith("/skill.md"):
+            cased.append(u[: -len("skill.md")] + "SKILL.md")
+        elif u.endswith("/SKILL.md"):
+            cased.append(u[: -len("SKILL.md")] + "skill.md")
+    return urls + cased
+
+
+def private_message(pack: SkillPack) -> str:
+    """Why a pack cannot be installed when its repository is private or gone, and what to do."""
+    return (
+        f"“{pack.name}” lives in a repository that is private or no longer available, so e2er cannot download it. "
+        f"To install it, ask {pack.owner} for access."
+    )
+
+
+#: GitHub's answers for a repository the caller may not see (private) or that is gone.
+_NO_ACCESS = frozenset({401, 403, 404, 410, 451})
+
+
+def _status_of(error: BaseException) -> int | None:
+    response = getattr(error, "response", None)
+    code = getattr(response, "status_code", None)
+    return code if isinstance(code, int) else None
+
+
+async def install_pack(
+    pack: SkillPack,
+    *,
+    dest: Path | None = None,
+    on_event: Any = None,
+) -> dict[str, Any]:
+    """Fetch a pack's skill files. Returns a report; never raises for one bad file.
+
+    A pack the catalogue marks as private raises CatalogueError with :func:`private_message`
+    before anything is written. When GitHub refuses every file (401, 403, 404: a private or deleted
+    repository), the report's ``reason`` says so in plain words and no empty pack folder is left.
+    """
+    from .fetch.http import fetch_bytes
+
+    if pack.private:
+        raise PrivatePackError(private_message(pack))
+    root = dest or install_root()
+    root.mkdir(parents=True, exist_ok=True)
+    # A catalogue entry is someone else's YAML: "../../.claude" as a slug wrote CLAUDE.md into ~/.claude.
+    target = _inside(root, pack.slug)
+    existed = target.is_dir()
+    target.mkdir(parents=True, exist_ok=True)
+    statuses: list[int | None] = []
+
+    written: list[dict[str, str]] = []
+    failed: list[dict[str, str]] = []
+
+    for skill in pack.skills:
+        if not safe_slug(skill.slug):
+            failed.append({"skill": skill.slug[:80], "error": "refused: the slug is not a plain name (a-z, 0-9, -, _)"})
+            if on_event:
+                on_event("fail", skill.slug[:80], "refused: not a plain name")
+            continue
+        candidates = _candidate_urls(skill.details_url) if skill.details_url else []
+        if not candidates:
+            failed.append({"skill": skill.slug, "error": "no source URL in the catalogue"})
+            if on_event:
+                on_event("fail", skill.slug, "no source URL in the catalogue")
+            continue
+
+        data, url, last_error, status = None, "", "", None
+        for candidate in candidates:
+            try:
+                data = await fetch_bytes(candidate, max_bytes=2 * 1024 * 1024)
+                url = candidate
+                break
+            except Exception as e:  # noqa: BLE001 — a private repo or moved file is normal
+                last_error = str(e)[:200]
+                status = _status_of(e) if status is None or status == 404 else status
+
+        if data is None:
+            statuses.append(status)
+            failed.append({"skill": skill.slug, "error": last_error})
+            if on_event:
+                on_event("fail", skill.slug, last_error[:120])
+            continue
+
+        out = target / f"{skill.slug}.md"
+        if out.resolve().parent != target or out.is_symlink():
+            failed.append({"skill": skill.slug, "error": "refused: the file would land outside the pack's folder"})
+            continue
+        out.write_bytes(data)
+        written.append({"skill": skill.slug, "file": out.name, "url": url})
+        if on_event:
+            on_event("ok", skill.slug, out.name)
+
+    reason = ""
+    if not written and statuses and all(code in _NO_ACCESS for code in statuses):
+        reason = private_message(pack)
+    if not written and not existed:
+        # Nothing came: no folder that reads as an installed pack with 0 files.
+        import shutil
+
+        shutil.rmtree(target, ignore_errors=True)
+        return {
+            "pack": pack.slug,
+            "installed": 0,
+            "failed": len(failed),
+            "path": str(target),
+            "reason": reason,
+            "failures": failed,
+        }
+
+    # The provenance of an installed tree. Without this, six months later
+    # nobody can say whose file this is or what licence it arrived under.
+    (target / "pack.json").write_text(
+        json.dumps(
+            {
+                "pack": pack.to_dict() | {"skills": []},
+                "installed": written,
+                "failed": failed,
+            },
+            indent=2,
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+        newline="\n",
+    )
+
+    return {
+        "pack": pack.slug,
+        "installed": len(written),
+        "failed": len(failed),
+        "path": str(target),
+        "reason": reason,
+        "failures": failed,
+    }
+
+
+def installed_packs(dest: Path | None = None) -> list[dict[str, Any]]:
+    """What is installed, read back from each pack.json."""
+    root = dest or install_root()
+    if not root.is_dir():
+        return []
+
+    out: list[dict[str, Any]] = []
+    for pack_dir in sorted(p for p in root.iterdir() if p.is_dir()):
+        manifest = pack_dir / "pack.json"
+        meta: dict[str, Any] = {}
+        if manifest.is_file():
+            try:
+                meta = json.loads(manifest.read_text(encoding="utf-8"))
+            except (ValueError, OSError):
+                meta = {}
+        out.append(
+            {
+                "slug": pack_dir.name,
+                "files": len(list(pack_dir.glob("*.md"))),
+                "license": (meta.get("pack") or {}).get("license", "unknown"),
+                "source_url": (meta.get("pack") or {}).get("source_url", ""),
+                "path": str(pack_dir),
+            }
+        )
+    return out
+
+
+def remove_pack(slug: str, dest: Path | None = None) -> bool:
+    import shutil
+
+    root = dest or install_root()
+    if not root.is_dir():
+        return False
+    target = _inside(root, slug)
+    if not target.is_dir() or (root / slug).is_symlink():
+        return False
+    shutil.rmtree(target)
+    return True

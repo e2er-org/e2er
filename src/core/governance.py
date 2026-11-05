@@ -1,0 +1,142 @@
+"""Governance regimes — which mechanisms BLOCK a run (WS-B).
+
+E2ER's institutions are mechanical: specialist output contracts, the
+estimation gate, the numbers gate, the citation gate. The regime decides
+which of them *block*:
+
+  * ``full``      — every mechanism blocks (E2ER's default stack)
+  * ``contracts`` — only the specialist output contracts block
+  * ``off``       — nothing blocks
+
+A mechanism that is not enforced still RUNS. It computes its verdict and
+logs a ``gate_shadow`` event instead of a ``gate_enforced`` one, so what the
+institutions *would* have caught is measured rather than absent. That
+shadowing is what makes the governance experiment's ``off`` cell a real
+control: same pipeline, same specialists, same verdicts computed — only the
+blocking removed.
+
+The matrix lives here, not on the runner, because enforcement decisions are
+made at two levels: the strategist runner (the three deterministic gates)
+and the specialist layer (output contracts, the contract-coaching retry, and
+the missing-artifact cascade guard). Both must read the same table, or a
+regime is only half-applied — which is exactly how ``off`` and ``contracts``
+became indistinguishable.
+
+Not governance, and therefore regime-independent: the budget cap, explicit
+specialist/backend errors, and the circuit breaker that stops a genuinely
+failing specialist from being re-dispatched forever. Those are operational
+limits, not verification institutions — no regime should turn them off.
+"""
+
+from __future__ import annotations
+
+#: Re-exported so callers reason about check kinds without importing the
+#: specialist layer. Defined there because that is where checks are produced.
+from .specialists.contract_check import KIND_RELIABILITY, KIND_VERIFICATION  # noqa: F401
+
+REGIMES: tuple[str, ...] = ("off", "contracts", "full")
+DEFAULT_REGIME = "full"
+
+#: Every mechanism a regime can switch between blocking and shadow.
+#: `field_network` (the field map's completeness check: too many papers without
+#: an internal citation or without references) only in the field-map template.
+#: `event_window` runs only in templates that declare it (event studies),
+#: `preregistration` (nothing estimated before the freeze) only in templates with
+#: a preregister step, and `reproduction` only in the replication template; they
+#: are listed so that `full` enforces them and `off`/`contracts` shadow them.
+#: `did_design` and `did_results` run only in the policy-evaluation template,
+#: `spatial_design` and `spatial_results` only in the spatial-analysis template.
+GATES: tuple[str, ...] = (
+    "contracts",
+    "estimation",
+    "numbers",
+    "citations",
+    "event_window",
+    "reproduction",
+    "preregistration",
+    "field_network",
+    # The descriptive template's checks: the loaded data (units, duplicates,
+    # missing values, coverage) before the analysis, and every figure re-read
+    # from the data it names.
+    "data_quality",
+    "figure_data",
+    # The time-series template's checks: the forecast setup frozen with its
+    # hold-out before any model is fitted, and the out-of-sample evaluation
+    # against that hold-out.
+    "forecast_design",
+    "forecast_evaluation",
+    "did_design",
+    "did_results",
+    "spatial_design",
+    "spatial_results",
+    # The systematic-review template's checks: every record screened with its reasons,
+    # every extracted number traced to its source, the synthesis held to its contract.
+    "meta_screening",
+    "meta_extraction",
+    "meta_synthesis",
+    # The text-analysis template's checks (text_checks.py): the corpus design, the
+    # corpus as built, the results recounted, and the hand-checked dictionary sample.
+    "corpus_design",
+    "corpus",
+    "text_results",
+    "text_validation",
+    # The abstract (src/core/abstract.py): words, statistics, numbers that are results,
+    # a finding, the last sentence. Enforced, it sends the writer back once; it never halts.
+    "abstract",
+)
+
+#: Deterministic steps of a template whose failure means the run cannot go on,
+#: not that a claim failed verification: the replication package could not be
+#: fetched and verified, or the sandbox could not run. Like a reliability
+#: contract failure they block in every regime, so they are not in GATES (a
+#: regime cannot switch them off) and are recorded as enforced wherever they fail.
+RELIABILITY_CHECKS: tuple[str, ...] = (
+    "package_integrity",
+    "sandbox",
+    # The field map's computation steps: retrieval from OpenAlex, main path,
+    # robustness, map. A failure means the step could not run, not that a claim failed.
+    "field_retrieve",
+    "field_main_path",
+    "field_robustness",
+    "field_map",
+    # The systematic-review template's search and full-text retrieval: a failure means
+    # the records or texts could not be read, not that a claim failed.
+    "meta_search",
+    "meta_fulltext",
+)
+
+_ENFORCEMENT: dict[str, frozenset[str]] = {
+    "full": frozenset(GATES),
+    "contracts": frozenset({"contracts"}),
+    "off": frozenset(),
+}
+
+
+def enforces(regime: str, gate: str) -> bool:
+    """True iff `gate` should BLOCK under `regime`. Unknown regime → `full`,
+    so a typo fails closed (all institutions on) rather than silently open.
+    A reliability check (RELIABILITY_CHECKS) blocks in every regime."""
+    if gate in RELIABILITY_CHECKS:
+        return True
+    return gate in _ENFORCEMENT.get(regime, _ENFORCEMENT[DEFAULT_REGIME])
+
+
+def enforces_check(regime: str, gate: str, kind: str) -> bool:
+    """True iff a check of `kind` should BLOCK under `regime`.
+
+    Reliability checks block in EVERY regime, including ``off``. Whether the
+    estimation script ran and wrote a parseable non-empty result is a question
+    about the pipeline, not about the paper, and the answer is the same in
+    every arm of the experiment.
+
+    Conflating the two is what made the ``off`` cell meaningless. In the
+    2026-08-05 validation cell the estimation script crashed on a timezone
+    comparison and wrote ``{}``; because ``off`` shadowed the artifact check,
+    nothing flipped the specialist to failure, the captured traceback was
+    never fed back for a retry, and the drafter wrote four tables of invented
+    numbers over the hole. The run measured a broken pipeline, not an
+    ungoverned one, and fabrication was confounded with completion.
+    """
+    if kind == KIND_RELIABILITY:
+        return True
+    return enforces(regime, gate)

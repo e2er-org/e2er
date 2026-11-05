@@ -1,0 +1,37 @@
+cff-version: 1.2.0
+message: "If you use e2er in your research, please cite it as below."
+type: software
+title: "e2er (End-to-End Research)"
+abstract: >
+  e2er is the open infrastructure for publishing, verifying, reproducing and
+  reusing AI-enabled research. Templates describe research processes as a
+  sequence of steps. Each template organizes specialists, i.e., AI agents with
+  defined roles, and each specialist draws on skills, i.e., written descriptions
+  of methods. Researchers can adjust any template, specialist, or skill and
+  publish their version for fellow researchers. Researchers decide at which
+  steps the process pauses for their review. A study produced with e2er comes
+  with a dossier that helps others verify and reproduce the work and attributes
+  everyone whose templates, specialists, and skills it used.
+version: "0.20.1"
+date-released: "2026-11-04"
+license: MIT
+repository-code: "https://github.com/e2er-org/e2er"
+url: "https://github.com/e2er-org/e2er"
+authors:
+  - name: "The e2er authors"
+keywords:
+  - empirical research automation
+  - large language models
+  - information systems
+  - econometrics
+  - causal inference
+  - blockchain data
+  - research pipeline
+preferred-citation:
+  type: software
+  title: "e2er (End-to-End Research): The Open Infrastructure for Publishing, Verifying, Reproducing and Reusing AI-Enabled Research"
+  authors:
+    - name: "The e2er authors"
+  year: 2026
+  version: "0.20.1"
+  url: "https://github.com/e2er-org/e2er"

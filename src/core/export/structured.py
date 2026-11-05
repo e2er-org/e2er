@@ -1,0 +1,745 @@
+"""Assemble a clean, portable project folder from a finished run's workspace.
+
+The workspace (``Tests/workspaces/<uuid>/``) is a flat scratch dir the pipeline
+writes by hardcoded filename. This module *copies* those artifacts into a
+navigable tree the human actually wants — without touching the workspace:
+
+    <dest_root>/<title>-<YYYYMMDD>-<NN>/
+    ├── README.md   ├── paper/   ├── code/(+scratch/)   ├── data/
+    ├── results/    ├── design/   └── reviews/
+
+Design points (see docs/STRUCTURED_EXPORT_SPEC.md):
+  - **Copy, never symlink** — the folder must survive being moved/shared.
+  - **Versioned slug** — ``NN`` auto-increments, so re-export never overwrites.
+  - **Best-effort** — exports whatever artifacts exist, so a stopped/failed run
+    still yields its reviews + draft. Missing files are simply skipped.
+"""
+
+from __future__ import annotations
+
+import glob
+import json
+import re
+import shutil
+from pathlib import Path
+
+from ...logging_config import get_logger
+from ..run_outcome import review_detail
+
+logger = get_logger(__name__)
+
+# Destination subdir → list of (source pattern, optional rename). Patterns are
+# matched against top-level workspace files via glob; the first capture of a
+# rename applies only to a single exact match.
+EXPORT_MAP: dict[str, list[tuple[str, str | None]]] = {
+    "paper": [
+        ("paper_draft.tex", "paper.tex"),
+        ("abstract.tex", None),
+        ("literature.bib", "refs.bib"),
+        ("paper_draft.pdf", "paper.pdf"),
+        ("paper.pdf", None),
+    ],
+    # How to run the study again (`e2er reproduce`): the recipe sits at the
+    # top of the folder, beside README.md.
+    ".": [
+        ("reproduce.json", None),
+    ],
+    "code": [
+        ("run_estimation.py", None),
+        ("*.do", None),  # stata, if a specialist ever writes one
+        # the pinned environment and the script that reloads inputs that cannot be shipped
+        ("requirements.txt", None),
+        ("get_data.py", None),
+    ],
+    "data": [
+        ("data.db", None),
+        ("data_summary.md", None),
+        ("data_dictionary.json", None),
+        # what e2er-data recorded per external-source load (release, URLs, SHA-256)
+        ("data_sources.json", None),
+        # A text study's corpus: one entry per document (source, licence, SHA-256, tokens).
+        ("corpus_manifest.json", None),
+    ],
+    "results": [
+        ("estimation_results.json", None),
+        ("robustness_results.json", None),
+        ("summary_statistics.json", None),
+        ("number_verification.json", None),
+        ("figure_spec.json", None),
+        ("table_spec.json", None),
+        ("table_render_report.json", None),
+        # The field map (field-map template): computed by code, read by the number check.
+        ("field_map_results.json", None),
+        ("completeness_report.json", None),
+        ("completeness_report.md", None),
+        ("main_path.json", None),
+        ("main_path.md", None),
+        ("robustness.json", None),
+        ("robustness.md", None),
+        ("field_boundary_counts.json", None),
+        ("reading_list.json", None),
+        # The descriptive and time-series templates' checks (data_quality.py, forecast_checks.py).
+        ("data_quality.json", None),
+        ("data_quality.md", None),
+        ("figure_check.json", None),
+        ("forecast_check.json", None),
+        # What the method checks of the policy-evaluation and spatial-analysis templates found.
+        ("did_design_check.json", None),
+        ("did_check.json", None),
+        ("spatial_design_check.json", None),
+        ("spatial_check.json", None),
+        # The systematic-review template: the records found, the search as run, the screening
+        # counts, where each full text came from, every extracted number with its source and
+        # trace, the flow counts and the cite keys (full texts themselves are not exported).
+        ("records.json", None),
+        ("search_log.json", None),
+        ("search_counts.md", None),
+        ("screening_check.json", None),
+        ("screening_sample.md", None),
+        ("fulltext_log.json", None),
+        ("extraction_check.json", None),
+        ("extraction_check.md", None),
+        ("prisma_counts.json", None),
+        ("meta_references.json", None),
+        # What the text-analysis template's checks found (text_checks.py), the sample the
+        # analysis drew of each dictionary measure, and the text validator's judgements.
+        ("corpus_check.json", None),
+        ("text_check.json", None),
+        ("validation_sample.json", None),
+        ("text_validation.json", None),
+        ("text_validation.md", None),
+        ("text_validation_check.json", None),
+        ("*.csv", None),  # model-generated intermediate outputs at workspace root
+    ],
+    "design": [
+        ("paper_plan.md", None),
+        ("literature_review.md", None),
+        ("identification_strategy.md", None),
+        # The machine-readable pre-registration sidecar — belongs with the
+        # design docs, not the misc/ catch-all. It is what `e2er verify`
+        # re-checks the estimation against.
+        ("identification_spec.json", None),
+        # An event study's design is a pre-registered plan file too: the lock
+        # fingerprints it, so `e2er verify` looks for it here.
+        ("event_design.json", None),
+        # The designs the policy-evaluation and spatial-analysis templates check.
+        ("did_design.json", None),
+        ("spatial_design.json", None),
+        # The text-analysis template's corpus design (corpus, preprocessing, analyses).
+        ("corpus_design.json", None),
+        ("econometric_spec.md", None),
+        ("model_spec.md", None),
+        # The frozen pre-registration and its fingerprints (researcher step),
+        # and the instructions the researcher gave during the run.
+        ("preregistration.md", None),
+        ("preregistration.lock.json", None),
+        ("researcher_instructions.md", None),
+        # The field map's judgement files: the boundaries and the lanes.
+        ("field_boundary.json", None),
+        ("field_boundary.md", None),
+        ("field_lanes.json", None),
+        ("field_lanes.md", None),
+        # The time-series template's forecast setup and the freeze of its hold-out.
+        ("forecast_design.json", None),
+        ("forecast_design.md", None),
+        ("holdout_freeze.json", None),
+        # The systematic-review template's judgement files: protocol, screening, extraction.
+        ("review_protocol.json", None),
+        ("review_protocol.md", None),
+        ("screening.json", None),
+        ("screening.md", None),
+        ("extraction.json", None),
+        ("extraction.md", None),
+    ],
+    # Loose exploration scripts + logs the model writes (analysis.py, explore.py,
+    # q.py, run_estimation.log, …). The broad globs run last so canonical files
+    # (run_estimation.py) are already claimed and skipped via `already`.
+    "code/scratch": [
+        ("*.py", None),
+        ("*.log", None),
+    ],
+    "reviews": [
+        ("review_*.md", None),
+        ("review_aggregation.json", None),
+        ("self_attack_report.json", None),
+        ("self_attack_corrections.json", None),
+        ("polish_corrections.json", None),
+        ("polish_*.md", None),
+        ("citation_integrity.json", None),
+        # The number check's record when the run went on with tables that differ
+        # from the results (the researcher's decision, or a regime that does not
+        # stop): e2er verify reads the decision from here.
+        ("number_check.json", None),
+        # The abstract step (src/core/abstract.py): what its check found, and the
+        # points the reviewers made about the abstract that the writer was given.
+        ("abstract_check.json", None),
+        ("abstract_findings.json", None),
+    ],
+}
+
+# Top-level files we never copy into misc/ (internal/bookkeeping or already
+# consumed into README).
+_MISC_EXCLUDE = {"manifest.json"}
+
+
+def slugify(title: str, max_len: int = 60) -> str:
+    """Title → kebab-case slug. Empty/garbage titles fall back to ``paper``."""
+    s = re.sub(r"[^0-9a-zA-Z]+", "-", (title or "").lower()).strip("-")
+    s = re.sub(r"-+", "-", s)[:max_len].strip("-")
+    return s or "paper"
+
+
+def resolve_versioned_slug(dest_root: Path, title: str, date_str: str) -> str:
+    """``<slug>-<YYYYMMDD>-<NN>`` with the smallest unused 2-digit ``NN`` for
+    that ``<slug>-<date>`` prefix in ``dest_root``."""
+    base = f"{slugify(title)}-{date_str}"
+    n = 1
+    existing = {p.name for p in dest_root.iterdir()} if dest_root.is_dir() else set()
+    while f"{base}-{n:02d}" in existing:
+        n += 1
+    return f"{base}-{n:02d}"
+
+
+def create_versioned_folder(dest_root: Path, title: str, date_str: str) -> Path:
+    """Create ``<slug>-<YYYYMMDD>-<NN>`` with the smallest free ``NN``, atomically.
+
+    ``mkdir`` without ``exist_ok`` either creates the folder or fails because
+    it exists; two exports started at the same moment therefore never share
+    one folder (the second takes the next number).
+    """
+    base = f"{slugify(title)}-{date_str}"
+    n = 1
+    while True:
+        out = dest_root / f"{base}-{n:02d}"
+        try:
+            out.mkdir()
+            return out
+        except FileExistsError:
+            n += 1
+
+
+def _leaves_workspace(path: Path, workspace: Path) -> bool:
+    """A symbolic link (at ``path`` or above it) that resolves outside the workspace."""
+    try:
+        return not path.resolve().is_relative_to(workspace.resolve())
+    except OSError:
+        return True
+
+
+def _skip(src: Path, workspace: Path) -> str | None:
+    """Why ``src`` is not exported, or None. Never exported: OS clutter, dotfiles
+    (``.env`` holds keys), key files, and links that lead out of the workspace."""
+    from .bundle_files import is_leftover, never_exported
+
+    if never_exported(src.name):
+        return "a dotfile, key file or operating-system file"
+    try:
+        parts = src.relative_to(workspace).parts[:-1]
+    except ValueError:
+        parts = ()
+    if any(part.startswith(".") for part in parts):
+        # sandbox/run/.cache/x.json: pack leaves out every path with a hidden folder, so export does too
+        # (the package lacked a file provenance.json listed).
+        return "in a hidden folder"
+    if is_leftover(src.name):
+        return "a backup, lock file or earlier version of an output"
+    if _leaves_workspace(src, workspace):
+        return "a link to something outside the workspace"
+    return None
+
+
+def _copytree(src: Path, dst: Path, workspace: Path) -> None:
+    """``shutil.copytree`` minus what export never copies (see :func:`_skip`)."""
+
+    def ignore(folder: str, names: list[str]) -> set[str]:
+        out = set()
+        for name in names:
+            why = _skip(Path(folder) / name, workspace)
+            if why:
+                logger.warning("export: left out %s: %s", Path(folder, name), why)
+                out.add(name)
+        return out
+
+    why = _skip(src, workspace)
+    if why:
+        logger.warning("export: left out %s: %s", src.name, why)
+        return
+    shutil.copytree(src, dst, dirs_exist_ok=True, ignore=ignore)
+
+
+def _copy_matches(
+    workspace: Path,
+    dest_dir: Path,
+    pattern: str,
+    rename: str | None,
+    already: set[str],
+    notes: list[str] | None = None,
+) -> None:
+    """Copy top-level files matching ``pattern`` into ``dest_dir``, skipping any
+    basename already claimed by an earlier (more specific) mapping entry.
+
+    A file whose target is already taken (``paper_draft.pdf`` and ``paper.pdf``
+    both map to ``paper/paper.pdf``) never overwrites it: the earlier entry
+    wins, the later file stays unclaimed and lands in ``misc/``, and ``notes``
+    says so (the README lists it).
+    """
+    for src in sorted(workspace.glob(pattern)):
+        if not src.is_file() or src.name in already:
+            continue
+        why = _skip(src, workspace)
+        if why:
+            logger.warning("export: left out %s: %s", src.name, why)
+            already.add(src.name)
+            continue
+        # Rename only when the pattern is an exact (glob-free) single file.
+        out_name = rename if (rename and not any(c in pattern for c in "*?[")) else src.name
+        target = dest_dir / out_name
+        if target.exists():
+            msg = (
+                f"`{dest_dir.name}/{out_name}` is the workspace file listed first for it; "
+                f"the workspace's `{src.name}` is in `misc/{src.name}`"
+            )
+            logger.warning("export: %s", msg)
+            if notes is not None:
+                notes.append(msg)
+            continue
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            shutil.copy2(src, target)
+            already.add(src.name)
+        except OSError as e:  # noqa: PERF203 — per-file tolerance
+            logger.warning("export: could not copy %s: %s", src.name, e)
+            continue
+        if dest_dir.name == "scratch":
+            _redact_secrets(target, notes)
+
+
+def _redact_secrets(target: Path, notes: list[str] | None) -> None:
+    """A scratch log or script holds what the model printed (an environment dump, a request URL with its
+    ``api_key=``): every key or token in it is replaced (secret_scan, the check pack and publishing run)."""
+    from ..secret_scan import redact_text
+
+    try:
+        text = target.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return
+    cleaned, kinds = redact_text(text)
+    if not kinds:
+        return
+    target.write_text(cleaned, encoding="utf-8", newline="\n")
+    msg = f"`code/scratch/{target.name}`: removed what looked like a {', '.join(kinds)} from the export's copy"
+    logger.warning("export: %s", msg)
+    if notes is not None:
+        notes.append(msg)
+
+
+#: A rebuilt output larger than this is left out of the bundle (and logged).
+MAX_OUTPUT_BYTES = 200 * 1024 * 1024
+
+
+def _copy_reproduction_outputs(workspace: Path, out: Path, left_out: list[dict] | None = None) -> None:
+    """Copy the sandbox's logs and the output files its run wrote into the bundle.
+
+    ``sandbox/logs/`` goes in whole. From the run folder (``sandbox_log.json``
+    → ``run_dir``) go the files the entry points wrote (``outputs`` with
+    ``written_by_run``) and every file ``reproduction_report.json`` reads a
+    number from, at the same relative paths, so the bundle has the workspace's
+    layout and ``e2er verify`` re-reads each compared number from its file.
+    Nothing from the package itself is copied: those files are not results of
+    the run. ``reproduction_check.json`` and the report go to misc/ with the
+    other top-level files; provenance.json hashes all of it.
+    """
+    logs = workspace / "sandbox" / "logs"
+    if logs.is_dir():
+        _copytree(logs, out / "sandbox" / "logs", workspace)
+    log = _read_json(workspace / "sandbox_log.json")
+    log = log if isinstance(log, dict) else {}
+    run_rel = str(log.get("run_dir") or "sandbox/run")
+    run_dir = (workspace / run_rel).resolve()
+    if not run_dir.is_relative_to(workspace.resolve()) or not run_dir.is_dir():
+        return
+    dest_run = out / run_dir.relative_to(workspace.resolve())
+    wanted = {str(o.get("path")) for o in log.get("outputs") or [] if isinstance(o, dict) and o.get("written_by_run")}
+    report = _read_json(workspace / "reproduction_report.json")
+    for res in (report.get("results") if isinstance(report, dict) else None) or []:
+        for comp in (res.get("comparisons") or []) if isinstance(res, dict) else []:
+            src = comp.get("source") if isinstance(comp, dict) else None
+            if isinstance(src, dict) and isinstance(src.get("file"), str):
+                wanted.add(src["file"])
+    for rel in sorted(wanted):
+        src_path = (run_dir / rel).resolve()
+        if not rel or not src_path.is_relative_to(run_dir) or not src_path.is_file():
+            continue
+        if _skip(run_dir / rel, workspace):
+            continue
+        size = src_path.stat().st_size
+        if size > MAX_OUTPUT_BYTES:
+            dest_rel = (dest_run / rel).relative_to(out).as_posix()
+            logger.warning("export: %s is larger than %d bytes; left out of the bundle", rel, MAX_OUTPUT_BYTES)
+            if left_out is not None:
+                left_out.append(
+                    {
+                        "path": dest_rel,
+                        "kind": "size",
+                        "bytes": size,
+                        "reason": f"an output of the reproduction larger than {MAX_OUTPUT_BYTES // (1024 * 1024)} MB",
+                    }
+                )
+            continue
+        dest = dest_run / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src_path, dest)
+
+
+def _copy_data_folder(workspace: Path, out: Path, notes: list[str]) -> None:
+    """Copy ``workspace/data/`` into ``data/``: every file a source's terms let the study pass on, with the
+    recipe's rules (no link out of the workspace unless the run recorded it as the researcher's file, at most
+    200 MB, no hidden or leftover file). A file already there (data.db, the records) is kept."""
+    from .reproduce_recipe import MAX_INPUT_BYTES, _loads, _restricted, _saved
+
+    src_root = workspace / "data"
+    if not src_root.is_dir() or src_root.is_symlink():
+        return
+    loads = _loads(workspace)
+    restricted = _restricted()
+    unshippable = {x for e in loads if e.get("connector") in restricted and (x := _saved(e))}
+    recorded = {
+        f.get("path"): f.get("sha256")
+        for e in loads
+        if e.get("connector") == "data-folder"
+        for f in e.get("files") or []
+        if isinstance(f, dict)
+    }
+    for src in sorted(src_root.rglob("*")):
+        rel = src.relative_to(workspace).as_posix()
+        if src.is_dir() or rel in unshippable:
+            continue
+        target = out / rel
+        outside = _leaves_workspace(src, workspace)
+        if target.exists() or (_skip(src, workspace) and not outside):
+            continue
+        try:
+            if outside:
+                import hashlib
+
+                if not src.is_file() or recorded.get(rel) != hashlib.sha256(src.read_bytes()).hexdigest():
+                    logger.warning("export: left out %s: a link to something outside the workspace", rel)
+                    continue
+            size = src.stat().st_size
+            if size > MAX_INPUT_BYTES:
+                notes.append(f"`{rel}` ({size / (1024 * 1024):.0f} MB) is left out: larger than 200 MB")
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(src, target)
+        except OSError as e:  # noqa: PERF203 — per-file tolerance
+            logger.warning("export: could not copy %s: %s", rel, e)
+
+
+def _read_json(path: Path) -> dict:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def _render_readme(
+    workspace: Path,
+    manifest: dict,
+    slug: str,
+    notes: list[str] | None = None,
+    out: Path | None = None,
+    no_recipe: str = "",
+) -> str:
+    title = manifest.get("title") or "Untitled"
+    rq = manifest.get("research_question") or "—"
+    review = review_detail(_read_json(workspace / "review_aggregation.json"))
+
+    lines = [
+        f"# {title}",
+        "",
+        f"**Research question:** {rq}",
+    ]
+    if review:
+        # A score, nothing else: six reviewer specialists each score the draft
+        # from one angle; the score is their weighted average.
+        lines += ["", f"**e2er's internal quality review:** {review}"]
+
+    # Run provenance disclosure — the governance regime this paper ran under
+    # is load-bearing: under `contracts`/`off` the deterministic gates ran in
+    # SHADOW (computed + logged, but did not block), so numbers/citations may
+    # not have been enforced. Backend/model disclosed alongside.
+    regime = manifest.get("governance") or "full"
+    backend = manifest.get("backend")
+    model = manifest.get("model")
+    run_bits = [f"governance=`{regime}`"]
+    if backend:
+        run_bits.append(f"backend=`{backend}`")
+    if model:
+        run_bits.append(f"model=`{model}`")
+    lines += ["", "**Run:** " + ", ".join(run_bits)]
+    if regime != "full":
+        lines += [
+            "",
+            f"> ⚠️ Ran under the `{regime}` governance regime: the deterministic "
+            "verification gates ran in shadow (logged, not enforced). See the "
+            "`gate_shadow` events for what a full-governance run would have caught.",
+        ]
+
+    # Headline coefficients, if an estimation ran.
+    est = _read_json(workspace / "estimation_results.json")
+    coefs = (est.get("main") or {}).get("coefficients") or {}
+    if coefs:
+        lines += ["", "## Headline estimates", "", "| term | estimate | p-value |", "| --- | --- | --- |"]
+        for term, c in list(coefs.items())[:8]:
+            est_v = c.get("estimate")
+            p_v = c.get("p_value")
+            est_s = f"{est_v:.4g}" if isinstance(est_v, (int, float)) else "—"
+            p_s = f"{p_v:.3g}" if isinstance(p_v, (int, float)) else "—"
+            lines.append(f"| `{term}` | {est_s} | {p_s} |")
+
+    data_line = "- `data/` — the data summary and dictionary"
+    if (workspace / "data.db").is_file():
+        data_line = "- `data/` — the study's data (`data.db`, SQLite) with the data summary and dictionary"
+    if (workspace / "data_sources.json").is_file():
+        data_line += "; `data_sources.json` records where each input came from and under which terms"
+    code_line = "- `code/` — the estimation script (`code/scratch/` holds exploratory scripts and logs)"
+    folder = out or workspace
+    if (workspace / "requirements.txt").is_file() or (folder / "code" / "requirements.txt").is_file():
+        code_line += "; `requirements.txt` pins the packages it runs with"
+    if (workspace / "get_data.py").is_file() or (folder / "code" / "get_data.py").is_file():
+        code_line += "; `get_data.py` loads the inputs the folder does not ship"
+    lines += [
+        "",
+        "## Folder guide",
+        "",
+        "- `paper/` — the manuscript (`paper.tex`, `abstract.tex`, `refs.bib`, compiled `paper.pdf`)",
+        code_line,
+        data_line,
+        "- `results/` — estimation/robustness JSON + figures",
+        "- `design/` — research plan, identification strategy, econometric spec",
+        "- `reviews/` — the six reviewer reports and the combined score (`review_aggregation.json`)",
+        "",
+    ]
+    if notes:
+        lines += ["## Export notes", ""] + [f"- {n}" for n in notes] + [""]
+    lines += ["## Reproduce", ""]
+    if (folder / "reproduce.json").is_file():
+        lines += [
+            "`reproduce.json` says how to run the study's code again. With e2er installed:",
+            "",
+            "```bash",
+            "e2er reproduce .",
+            "```",
+            "",
+            "This runs the code in a folder of its own, in a new environment with the pinned packages, "
+            "and compares every result value and every table with the ones in this folder.",
+        ]
+    elif no_recipe:
+        lines += [f"This folder has no `reproduce.json`, so `e2er reproduce` cannot run it: {no_recipe}."]
+    else:
+        lines += [
+            "This folder has no `reproduce.json`, so `e2er reproduce` cannot run it. The estimation script "
+            "(`code/run_estimation.py`) was written to run in the study's workspace, with its inputs in `data/`; "
+            "the folder ships only the inputs listed under `data/`.",
+        ]
+    lines += ["", f"_Exported as `{slug}` from e2er._"]
+    return "\n".join(lines) + "\n"
+
+
+def _drop_unused_tables(workspace: Path, out: Path) -> None:
+    """Leave out of ``paper/tables/`` a table the renderer no longer writes and the paper does not include.
+
+    The renderer sets such tables aside itself (``.history/tables/``); this
+    covers a workspace from before it did, where a table from an earlier
+    table_spec.json still sits in tables/ with ``---`` in every cell.
+    """
+    from ..pipeline.verify_numbers import included_tables, rendered_tables
+
+    report = workspace / "table_render_report.json"
+    if not report.is_file():
+        return  # nothing says what the renderer wrote: keep everything
+    paper_tex = out / "paper" / "paper.tex"
+    text = paper_tex.read_text(encoding="utf-8", errors="replace") if paper_tex.is_file() else ""
+    keep = set(rendered_tables(workspace)) | included_tables(text)
+    for path in sorted((out / "paper" / "tables").glob("*.tex")):
+        if path.name not in keep:
+            logger.warning(
+                "export: left out tables/%s: not rendered from table_spec.json and not in the paper", path.name
+            )
+            path.unlink()
+
+
+_UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+
+def export_paper(
+    workspace: Path,
+    dest_root: Path,
+    *,
+    date_str: str,
+    slug: str | None = None,
+    template: str | None = None,
+    paper_id: str | None = None,
+) -> Path:
+    """Assemble the structured project folder. Returns the created directory.
+
+    Best-effort: copies whatever artifacts exist; missing ones are skipped.
+    ``template`` is the template the study was run with (the papers row's
+    ``pipeline``); without it, the one manifest.json records. It is written to
+    provenance.json (``run.template``), where ``e2er publish`` reads it.
+    ``paper_id`` is the run's id, for a manifest.json without one (runs before
+    0.14 wrote none, and their folder is named by the id): provenance.json's
+    ``run.paper_id`` is how the finish page and the next export find the folder.
+    """
+    workspace = Path(workspace)
+    dest_root = Path(dest_root)
+    dest_root.mkdir(parents=True, exist_ok=True)
+
+    manifest = _read_json(workspace / "manifest.json")
+    if not isinstance(manifest, dict):
+        manifest = {}
+    if template:
+        manifest = {**manifest, "pipeline": template}
+    if not manifest.get("paper_id"):
+        recorded = paper_id or (workspace.name if _UUID.match(workspace.name) else None)
+        if recorded:
+            manifest = {**manifest, "paper_id": recorded}
+    title = manifest.get("title") or workspace.name
+    if slug:
+        out = dest_root / slug
+        out.mkdir()  # an explicit folder must be new: export never writes into an earlier one
+    else:
+        out = create_versioned_folder(dest_root, title, date_str)
+        slug = out.name
+
+    copied_names: set[str] = set()
+    notes: list[str] = []
+    for subdir, patterns in EXPORT_MAP.items():
+        dest_dir = out / subdir
+        for pattern, rename in patterns:
+            _copy_matches(workspace, dest_dir, pattern, rename, copied_names, notes)
+    # literature.bib is shipped as refs.bib; point the paper at it so the
+    # bundle compiles on its own (otherwise every citation becomes "?").
+    paper_tex = out / "paper" / "paper.tex"
+    if paper_tex.is_file():
+        from ..bibliography import point_bibliography
+
+        text = paper_tex.read_text(encoding="utf-8")
+        fixed = point_bibliography(text, paper_tex.parent)
+        if fixed != text:
+            paper_tex.write_text(fixed, encoding="utf-8", newline="\n")
+
+    # Figures: copy a figures/ dir if the renderer produced one.
+    fig_src = workspace / "figures"
+    if fig_src.is_dir():
+        _copytree(fig_src, out / "results" / "figures", workspace)
+
+    # Tables: the deterministic renderer writes one .tex per table into
+    # tables/, and paper.tex includes each with \input{tables/<name>.tex}.
+    # They must land under paper/ because \input resolves relative to the
+    # including file. Without this the bundle carries two .tex files and fails
+    # to compile on the first pass — and `e2er verify` does not notice, because
+    # it only scans the main .tex for inline tabulars.
+    tbl_src = workspace / "tables"
+    if tbl_src.is_dir():
+        _copytree(tbl_src, out / "paper" / "tables", workspace)
+        _drop_unused_tables(workspace, out)
+
+    # The field map: the network for other tools (Pajek, GEXF, VOSviewer, CSV)
+    # and the papers retrieved from OpenAlex for each boundary (CC0), which the
+    # main paths are computed from. The page cache is left behind.
+    if (workspace / "exports").is_dir():
+        _copytree(workspace / "exports", out / "results" / "exports", workspace)
+    if (workspace / "fieldmap" / "boundaries").is_dir():
+        _copytree(workspace / "fieldmap" / "boundaries", out / "data" / "fieldmap", workspace)
+
+    # Replication: the audit log + query SQL + replication estimation script
+    # (audit_log.csv, data_queries.sql, estimation.py). Previously dropped
+    # entirely — it is the backbone of a reproducible bundle.
+    repl_src = workspace / "replication"
+    if repl_src.is_dir():
+        _copytree(repl_src, out / "replication", workspace)
+
+    # A reproduction: what the sandbox run wrote, so `e2er verify` can re-read
+    # every compared number offline (see _copy_reproduction_outputs).
+    left_out: list[dict] = []
+    if (workspace / "reproduction_report.json").is_file():
+        _copy_reproduction_outputs(workspace, out, left_out)
+    for item in left_out:
+        notes.append(
+            f"`{item['path']}` ({item['bytes'] / (1024 * 1024):.0f} MB) is left out: {item['reason']}; "
+            "`e2er verify` cannot re-read the numbers compared from it"
+        )
+
+    # The study's data folder (e2er-data --save-to files, the researcher's own files). The recipe copies the
+    # inputs its scripts read; a template without a working recipe (a systematic review, a field map, a text
+    # study, a run whose recipe failed) shipped data_sources.json naming files the folder lacked.
+    _copy_data_folder(workspace, out, notes)
+
+    # misc/ — top-level files we didn't map (no silent loss), minus internal ones.
+    for src in sorted(workspace.iterdir()):
+        if not src.is_file() or src.name in copied_names or src.name in _MISC_EXCLUDE or src.name.startswith("."):
+            continue
+        if _skip(src, workspace):
+            continue
+        _copy_matches(workspace, out / "misc", glob.escape(src.name), None, copied_names, notes)
+
+    # How to run the study's code again (`e2er reproduce`), written from what the run recorded.
+    from .reproduce_recipe import write_recipe
+
+    try:
+        outcome = write_recipe(workspace, out, date_str=date_str)
+        no_recipe = outcome.reason
+    except Exception as e:  # noqa: BLE001 — best-effort, like the rest of the export
+        logger.warning("export: reproduce.json was not written: %s", e)
+        no_recipe = f"e2er could not write it ({type(e).__name__}: {e})"
+    (out / "README.md").write_text(
+        _render_readme(workspace, manifest, slug, notes, out=out, no_recipe=no_recipe), encoding="utf-8", newline="\n"
+    )
+
+    # The shareable view, rendered from the provenance about to be written, so
+    # that provenance.json (written LAST, after every other file exists)
+    # fingerprints it like every other file: an edited report.html fails verify.
+    from .provenance import build_provenance, results_code_record, write_provenance
+    from .report import write_report
+
+    try:
+        code_record = results_code_record(workspace, out)
+    except Exception as e:  # noqa: BLE001 — best-effort, like the rest of the export
+        logger.warning("export: the results' script runs were not recorded: %s", e)
+        code_record = None
+    try:
+        from ..derived_data import export_record
+
+        derived_record = export_record(workspace, out)
+    except Exception as e:  # noqa: BLE001 — best-effort; publish and pack still read the folder's scripts
+        logger.warning("export: the data built from restricted sources were not recorded: %s", e)
+        derived_record = []
+    from .provenance import recorded_run_identity
+
+    ran_with = recorded_run_identity(manifest.get("paper_id"))
+    write_report(
+        out,
+        manifest,
+        build_provenance(
+            out,
+            manifest,
+            exported_at=date_str,
+            results_from_code=code_record,
+            derived_data=derived_record,
+            ran_with=ran_with,
+            left_out=left_out,
+        ),
+    )
+    write_provenance(
+        out,
+        manifest,
+        exported_at=date_str,
+        results_from_code=code_record,
+        derived_data=derived_record,
+        ran_with=ran_with,
+        left_out=left_out,
+    )
+
+    logger.info("Exported paper %s → %s", workspace.name, out)
+    return out

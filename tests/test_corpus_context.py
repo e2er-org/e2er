@@ -1,0 +1,503 @@
+"""The pipeline reading the corpus.
+
+Two things have to hold. When a corpus exists, its verified claims reach the
+drafter and its papers reach the bibliography, so a cite has something behind
+it. When one does not — the normal case for a first-time user — nothing changes
+at all, and nothing warns.
+"""
+
+from __future__ import annotations
+
+import sqlite3
+
+import pytest
+
+from src.core.strategist.context import build_tier2_context
+from src.modules.literature import corpus, corpus_context
+from src.modules.literature.review import Claim, Evidence, StructuredReview, stamp, verify_review
+
+SOURCE = (
+    "We find no detectable change in the equity loading of bitcoin following the listing. "
+    "Our control group consists of never-listed cryptocurrencies, which may be affected by spillovers. "
+    "We estimate a difference-in-differences specification with asset and day fixed effects."
+)
+FINDING = "We find no detectable change in the equity loading of bitcoin"
+LIMITATION = "never-listed cryptocurrencies, which may be affected by spillovers"
+
+
+def _review(*, doi: str = "10.1/a", title: str = "Spot ETFs and bitcoin", year: int = 2024) -> StructuredReview:
+    review = StructuredReview(
+        title=title,
+        authors=["A. Author", "B. Coauthor"],
+        year=year,
+        doi=doi,
+        source="openalex",
+        key_findings=[Claim(text="No change in equity loading.", evidence=Evidence(quote=FINDING, locator="Results"))],
+        limitations=[Claim(text="Controls may be contaminated.", evidence=Evidence(quote=LIMITATION))],
+    )
+    stamp(review, source_text=SOURCE, model="test-model")
+    verify_review(review, SOURCE)
+    return review
+
+
+@pytest.fixture
+def db_path(tmp_path):
+    path = tmp_path / "corpus.db"
+    with corpus.connect(path) as conn:
+        corpus.add_review(conn, _review())
+    return path
+
+
+# ---------------------------------------------------------------------------
+# Gathering
+# ---------------------------------------------------------------------------
+
+
+def test_claims_bearing_on_the_question_are_found(db_path):
+    evidence = corpus_context.gather(["did the ETF listing change the equity loading"], db=db_path)
+
+    assert evidence.ok
+    quotes = {h.quote for h in evidence.hits}
+    assert FINDING in quotes
+    assert len(evidence.papers) == 1
+
+
+def test_the_same_claim_matched_by_two_queries_appears_once(db_path):
+    evidence = corpus_context.gather(["equity loading bitcoin", "bitcoin equity loading change"], db=db_path)
+
+    assert len([h for h in evidence.hits if h.quote == FINDING]) == 1
+
+
+def test_no_corpus_is_not_an_error(tmp_path):
+    """The normal case for a first-time user. It must cost nothing and warn about nothing."""
+    missing = tmp_path / "does-not-exist.db"
+    evidence = corpus_context.gather(["anything"], db=missing)
+
+    assert not evidence.ok
+    assert evidence.hits == []
+    # connect() creates the file it is given, so consulting a corpus that was
+    # never built would leave ~/.e2er/corpus.db behind on every paper run for
+    # people who never asked for one. Looking must not be a side effect.
+    assert not missing.exists()
+
+
+def test_an_unreadable_corpus_does_not_break_the_run(tmp_path):
+    broken = tmp_path / "corpus.db"
+    broken.write_bytes(b"this is not a database")
+
+    evidence = corpus_context.gather(["anything"], db=broken)
+    assert not evidence.ok
+
+
+def test_no_query_means_no_lookup(db_path):
+    assert not corpus_context.gather([], db=db_path).ok
+    assert not corpus_context.gather(["", "   "], db=db_path).ok
+
+
+def test_an_empty_corpus_yields_nothing(tmp_path):
+    with corpus.connect(tmp_path / "c.db") as conn:
+        assert not corpus_context.gather(["anything"], conn=conn).ok
+
+
+# ---------------------------------------------------------------------------
+# Rendering
+# ---------------------------------------------------------------------------
+
+
+def test_the_evidence_file_carries_the_quotes(db_path, tmp_path):
+    evidence = corpus_context.gather(["equity loading"], db=db_path)
+    written = corpus_context.write_evidence(tmp_path / "ws", evidence)
+
+    assert written is not None
+    text = written.read_text(encoding="utf-8")
+
+    assert FINDING in text, "a claim without its quote is exactly what this replaces"
+    assert "No change in equity loading." in text
+    assert "Spot ETFs and bitcoin" in text
+    assert "Results" in text  # the locator
+    assert "10.1/a" in text
+
+
+def test_nothing_found_writes_no_file(tmp_path):
+    """An empty file reads like a corpus that was consulted and had nothing to
+    say, which a reader cannot tell from one that was never built."""
+    written = corpus_context.write_evidence(tmp_path / "ws", corpus_context.CorpusEvidence())
+
+    assert written is None
+    assert not (tmp_path / "ws" / "literature").exists()
+
+
+def test_claims_are_grouped_by_paper(tmp_path):
+    """Two findings from one study are one piece of evidence, not two."""
+    path = tmp_path / "corpus.db"
+    with corpus.connect(path) as conn:
+        corpus.add_review(conn, _review(doi="10.1/a", title="Paper A", year=2024))
+        corpus.add_review(conn, _review(doi="10.1/b", title="Paper B", year=2022))
+
+    evidence = corpus_context.gather(["equity loading spillovers"], db=path)
+    text = corpus_context.render_markdown(evidence)
+
+    assert text.count("## Paper A") == 1
+    assert text.count("## Paper B") == 1
+    assert text.index("## Paper A") < text.index("## Paper B"), "newest first"
+    assert "**Findings**" in text
+    assert "**Limitations the authors concede**" in text
+
+
+def test_a_quote_spanning_lines_stays_one_blockquote(tmp_path):
+    """Found rendering the real corpus.
+
+    Quotes are verbatim spans of PDF text and routinely contain newlines mid
+    sentence. Emitted as-is, the second line loses its `>` prefix and the
+    blockquote breaks apart — the quote stops looking like a quote.
+    """
+    source = "1) what are the common IT elements?\n2) How do they connect to alignment?"
+    review = StructuredReview(
+        title="Wrapped",
+        doi="10.1/w",
+        year=2024,
+        research_question=Claim(
+            text="Two questions.",
+            evidence=Evidence(quote="1) what are the common IT elements?\n2) How do they connect to alignment?"),
+        ),
+    )
+    stamp(review, source_text=source, model="m")
+    verify_review(review, source)
+
+    path = tmp_path / "corpus.db"
+    with corpus.connect(path) as conn:
+        corpus.add_review(conn, review)
+
+    text = corpus_context.render_markdown(corpus_context.gather(["IT elements"], db=path))
+
+    quote_lines = [ln for ln in text.splitlines() if "what are the common IT elements" in ln]
+    assert len(quote_lines) == 1, "the quote must not be split across lines"
+    assert quote_lines[0].lstrip().startswith(">")
+    assert "How do they connect" in quote_lines[0]
+
+
+def test_a_field_heading_is_separated_from_the_previous_claim(db_path, tmp_path):
+    """Without a blank line the heading runs into the bullet above it."""
+    text = corpus_context.render_markdown(corpus_context.gather(["equity loading spillovers"], db=db_path))
+    lines = text.splitlines()
+
+    for i, line in enumerate(lines):
+        if line.startswith("**") and i > 0:
+            assert lines[i - 1] == "", f"heading {line!r} has no blank line before it"
+
+
+def test_the_file_says_the_quotes_were_checked(db_path, tmp_path):
+    evidence = corpus_context.gather(["equity loading"], db=db_path)
+    text = corpus_context.render_markdown(evidence)
+
+    assert "located in the source text" in text
+    assert "citation gate" in text
+
+
+# ---------------------------------------------------------------------------
+# Reaching the pipeline
+# ---------------------------------------------------------------------------
+
+
+def test_corpus_papers_become_citable(db_path):
+    evidence = corpus_context.gather(["equity loading"], db=db_path)
+    papers = evidence.as_metadata()
+
+    assert len(papers) == 1
+    assert papers[0].doi == "10.1/a"
+    assert papers[0].bibtex_key
+    assert "Spot ETFs" in papers[0].to_bibtex()
+
+
+def test_the_drafter_sees_the_evidence(db_path, tmp_path):
+    """Written to disk is not the same as reaching the model."""
+    workspace = tmp_path / "ws"
+    evidence = corpus_context.gather(["equity loading"], db=db_path)
+    corpus_context.write_evidence(workspace, evidence)
+
+    context = build_tier2_context(workspace, "paper-1")
+
+    assert "Evidence From The Corpus" in context
+    assert FINDING in context
+
+
+def test_without_a_corpus_the_context_is_unchanged(tmp_path):
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    context = build_tier2_context(workspace, "paper-1")
+
+    assert "Evidence From The Corpus" not in context
+
+
+class TestStagedPdfsAreRead:
+    """`workspace/<id>/literature/` holds the papers the researcher supplied.
+
+    Going to the web for literature while ignoring the PDFs already on disk was
+    the wrong order: those are the only papers guaranteed to be readable.
+    """
+
+    async def test_staged_pdfs_are_ingested_before_evidence_is_gathered(self, tmp_path, monkeypatch):
+        ws = tmp_path / "ws"
+        (ws / "literature").mkdir(parents=True)
+        (ws / "literature" / "a.pdf").write_bytes(b"%PDF-1.4 fake")
+
+        seen: dict[str, int] = {}
+
+        async def _fake_ingest(conn, papers, **kw):
+            from src.modules.literature.ingest import IngestReport
+
+            seen["n"] = len(papers)
+            return IngestReport(considered=len(papers), stored=len(papers))
+
+        monkeypatch.setattr("src.modules.literature.ingest.ingest_papers", _fake_ingest)
+
+        stored = await corpus_context.ingest_staged_pdfs(ws, db=tmp_path / "c.db")
+
+        assert seen["n"] == 1, "the staged PDF must reach the ingest loop"
+        assert stored == 1
+
+    async def test_no_literature_folder_costs_nothing(self, tmp_path, monkeypatch):
+        async def _never(*a, **k):
+            raise AssertionError("must not run without a literature folder")
+
+        monkeypatch.setattr("src.modules.literature.ingest.ingest_papers", _never)
+        assert await corpus_context.ingest_staged_pdfs(tmp_path / "ws", db=tmp_path / "c.db") == 0
+
+    async def test_an_empty_literature_folder_costs_nothing(self, tmp_path, monkeypatch):
+        ws = tmp_path / "ws"
+        (ws / "literature").mkdir(parents=True)
+
+        async def _never(*a, **k):
+            raise AssertionError("must not run with no PDFs")
+
+        monkeypatch.setattr("src.modules.literature.ingest.ingest_papers", _never)
+        assert await corpus_context.ingest_staged_pdfs(ws, db=tmp_path / "c.db") == 0
+
+    async def test_it_can_be_switched_off(self, tmp_path, monkeypatch):
+        """One model call per paper is real money on a metered backend."""
+        ws = tmp_path / "ws"
+        (ws / "literature").mkdir(parents=True)
+        (ws / "literature" / "a.pdf").write_bytes(b"%PDF-1.4 fake")
+
+        async def _never(*a, **k):
+            raise AssertionError("must not spend when CORPUS_AUTOINGEST is off")
+
+        monkeypatch.setattr("src.modules.literature.ingest.ingest_papers", _never)
+        monkeypatch.setattr("src.config.get_settings", _settings_with(corpus_autoingest=False))
+
+        assert await corpus_context.ingest_staged_pdfs(ws, db=tmp_path / "c.db") == 0
+
+    async def test_a_failure_does_not_cost_the_run(self, tmp_path, monkeypatch):
+        ws = tmp_path / "ws"
+        (ws / "literature").mkdir(parents=True)
+        (ws / "literature" / "a.pdf").write_bytes(b"%PDF-1.4 fake")
+
+        async def _boom(*a, **k):
+            raise RuntimeError("backend unavailable")
+
+        monkeypatch.setattr("src.modules.literature.ingest.ingest_papers", _boom)
+
+        assert await corpus_context.ingest_staged_pdfs(ws, db=tmp_path / "c.db") == 0
+
+
+def _settings_with(**overrides):
+    """A settings object with fields overridden, without touching the cached one.
+
+    get_settings() is cached, so mutating what it returns would leak the
+    override into every test that ran afterwards — the kind of pollution that
+    surfaces as an unrelated failure three files later.
+    """
+    import copy
+
+    from src.config import get_settings
+
+    patched = copy.copy(get_settings())
+    for k, v in overrides.items():
+        object.__setattr__(patched, k, v)
+    return lambda: patched
+
+
+async def test_acquisition_seeds_the_bibliography_from_the_corpus(db_path, tmp_path, monkeypatch):
+    """End to end through the real stage: corpus → literature.bib + evidence file."""
+    from src.config import get_settings
+    from src.modules.literature.discovery import acquire_literature
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    monkeypatch.setattr("src.modules.literature.corpus_context.corpus_path", lambda explicit=None: db_path)
+    monkeypatch.setattr("src.modules.literature.registry.search_sources", lambda s: [])
+
+    async def _no_store(item, paper_id):
+        return None
+
+    monkeypatch.setattr("src.modules.literature.storage.store_paper", _no_store)
+
+    written = await acquire_literature(workspace, "paper-1", ["equity loading bitcoin"], get_settings())
+
+    assert written == 1, "the corpus paper alone should produce a bibliography"
+    bib = (workspace / "literature.bib").read_text(encoding="utf-8")
+    assert "Spot ETFs" in bib
+    assert (workspace / "literature" / "corpus_evidence.md").is_file()
+
+
+async def test_an_existing_bibliography_is_kept_and_the_library_papers_join_it_as_the_researchers(
+    db_path, tmp_path, monkeypatch
+):
+    """The researcher's bibliography stays as it is; the Library's papers whose claims the evidence
+    quotes join it, marked as the researcher's (the Library is theirs), and the evidence is written."""
+    from src.config import get_settings
+    from src.modules.literature.discovery import acquire_literature
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    (workspace / "literature.bib").write_text(
+        "@article{mine2020,\n  title = {Mine},\n}\n", encoding="utf-8", newline="\n"
+    )
+
+    monkeypatch.setattr("src.modules.literature.corpus_context.corpus_path", lambda explicit=None: db_path)
+    monkeypatch.setattr("src.modules.literature.registry.search_sources", lambda s: [])
+
+    async def _no_store(item, paper_id):
+        return None
+
+    monkeypatch.setattr("src.modules.literature.storage.store_paper", _no_store)
+
+    written = await acquire_literature(workspace, "paper-1", ["equity loading"], get_settings())
+
+    assert written == 1
+    bib = (workspace / "literature.bib").read_text(encoding="utf-8")
+    assert bib.startswith("@article{mine2020,") and "Spot ETFs" in bib
+    assert "e2er_source = {researcher}" in bib
+    assert (workspace / "literature" / "corpus_evidence.md").is_file()
+
+
+#: A question the corpus search matches on one common word ("controls") and that the Library paper does not
+#: bear on: the 2026-10-25 live test, where an unemployment study got 20 crypto and NFT papers this way.
+UNRELATED = "How did annual unemployment rates evolve in Germany, France and Italy, with controls for age?"
+
+
+def _acquire_offline(monkeypatch, db_path):
+    monkeypatch.setattr("src.modules.literature.corpus_context.corpus_path", lambda explicit=None: db_path)
+    monkeypatch.setattr("src.modules.literature.registry.search_sources", lambda s: [])
+
+    async def _no_store(item, paper_id):
+        return None
+
+    monkeypatch.setattr("src.modules.literature.storage.store_paper", _no_store)
+
+
+async def test_a_library_paper_unrelated_to_the_question_is_no_filler(db_path, tmp_path, monkeypatch):
+    from src.config import get_settings
+    from src.modules.literature.discovery import acquire_literature
+
+    assert corpus_context.gather([UNRELATED], db=db_path).ok, "the corpus search must match it for the test to bite"
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    _acquire_offline(monkeypatch, db_path)
+
+    await acquire_literature(workspace, "paper-1", [UNRELATED], get_settings())
+
+    bib = workspace / "literature.bib"
+    assert not bib.is_file() or "Spot ETFs" not in bib.read_text(encoding="utf-8")
+    assert not (workspace / "literature" / "corpus_evidence.md").exists()
+
+
+async def test_the_studys_own_paper_keeps_its_claims_whatever_the_question(db_path, tmp_path, monkeypatch):
+    """A study that supplies its papers (prepare_papers wrote them into literature.bib first) keeps their
+    evidence, related to the question's words or not."""
+    from src.config import get_settings
+    from src.modules.literature.discovery import acquire_literature
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    (workspace / "literature.bib").write_text(
+        "@article{author2024spot,\n  title = {Spot ETFs and bitcoin},\n  doi = {10.1/a},\n"
+        "  e2er_source = {researcher},\n}\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    _acquire_offline(monkeypatch, db_path)
+
+    await acquire_literature(workspace, "paper-1", [UNRELATED], get_settings())
+
+    assert FINDING in (workspace / "literature" / "corpus_evidence.md").read_text(encoding="utf-8")
+
+
+def test_relevance_reads_the_title_and_the_matched_claims():
+    from src.modules.literature.discovery import question_terms, relevant_evidence
+
+    hit = corpus.ClaimHit(field="key_findings", text="No change in equity loading.", quote=FINDING, locator="",
+                          key="k1", title="untitled", year=2024, doi="")  # fmt: skip
+    row = corpus.PaperRow(key="k1", doi="", title="untitled", authors=[], year=2024, source="pdf", n_claims=1)
+    ev = corpus_context.CorpusEvidence(hits=[hit], papers={"k1": row}, queries=["q"])
+    # A file-name title: the claims carry the paper's subject.
+    assert relevant_evidence(ev, question_terms("Did the listing change the equity loading?"), set()).papers
+    assert not relevant_evidence(ev, question_terms(UNRELATED), set()).papers
+
+
+async def test_a_corpus_failure_does_not_stop_acquisition(tmp_path, monkeypatch):
+    from src.config import get_settings
+    from src.modules.literature.discovery import acquire_literature
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    def _boom(*a, **k):
+        raise sqlite3.DatabaseError("corpus is toast")
+
+    monkeypatch.setattr("src.modules.literature.corpus_context.gather", lambda *a, **k: corpus_context.CorpusEvidence())
+    monkeypatch.setattr("src.modules.literature.registry.search_sources", lambda s: [])
+    monkeypatch.setattr("src.modules.literature.corpus.search_claims", _boom)
+
+    written = await acquire_literature(workspace, "paper-1", ["q"], get_settings())
+    assert written == 0
+
+
+async def test_a_limit_of_zero_sends_no_literature_request(tmp_path, monkeypatch):
+    """LITERATURE_ACQUIRE_LIMIT=0: no search source is even built, so nothing reaches OpenAlex or arXiv."""
+    from src.config import get_settings
+    from src.modules.literature.discovery import acquire_literature
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    def _no_sources(settings):
+        raise AssertionError("a literature search source was built with the limit 0")
+
+    monkeypatch.setattr("src.modules.literature.registry.search_sources", _no_sources)
+    monkeypatch.setattr("src.modules.literature.corpus_context.gather", lambda *a, **k: corpus_context.CorpusEvidence())
+    written = await acquire_literature(workspace, "paper-1", ["equity loading bitcoin"], get_settings(), limit=0)
+    assert written == 0 and not (workspace / "literature.bib").exists()
+
+
+async def test_the_lit_search_keeps_only_library_papers_on_the_query_and_asks_the_web_otherwise(monkeypatch, tmp_path):
+    """The 2026-10-25 live test: `e2er-lit search "shocks and institutions European unemployment"` answered with
+    ten crypto and NFT papers of the local library, and the web search never ran."""
+    import json
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from src.modules.literature import tools
+    from src.modules.literature.models import PaperMetadata, SearchResult
+
+    rows = [
+        {"title": "Mapping the NFT revolution: market trends", "abstract": "NFT sales in Europe.", "doi": "10.1/n"},
+        {"title": "Shocks, institutions and European unemployment", "abstract": "", "doi": "10.1/u"},
+    ]
+    monkeypatch.setattr("src.modules.literature.storage.search_literature", AsyncMock(return_value=rows))
+    monkeypatch.setattr("src.home.paper_id_of", lambda ws: "p1")
+    web_hit = PaperMetadata(title="Labour market institutions and unemployment in Europe", doi="10.1/w")
+    web = SimpleNamespace(name="openalex", search=AsyncMock(return_value=SearchResult([web_hit], "openalex", "q")))
+    monkeypatch.setattr("src.modules.literature.registry.search_sources", lambda s: [web])
+    monkeypatch.setattr("src.config.get_settings", lambda: SimpleNamespace(literature_local_enabled=True))
+    handler = tools.LiteratureToolHandler(tmp_path)
+
+    out = json.loads(await handler._search({"query": "shocks and institutions European unemployment"}))
+    assert out["source"] == "local_library"
+    assert [p["title"] for p in out["papers"]] == ["Shocks, institutions and European unemployment"]
+
+    rows.pop()
+    out = json.loads(await handler._search({"query": "shocks and institutions European unemployment"}))
+    assert out["source"] == "openalex", "no library paper on the query: the web is asked"

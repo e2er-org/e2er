@@ -1,0 +1,195 @@
+{% extends "base.html" %}
+{% block title %}{{ paper.title[:70] }} · e2er{% endblock %}
+
+{% block content %}
+{% if study %}
+<p class="crumb">
+  <a href="/studies/{{ study.key }}">{{ study.title }}</a> · run {{ study.version }} of {{ study.of }}
+  {% if study.archived %} · <span class="muted">archived</span>{% endif %}
+</p>
+{% endif %}
+<h1>{{ paper.title }}</h1>
+<p class="sub">{{ paper.research_question }}</p>
+{% if demonstration %}<p><span class="tag" id="demo-label">Demonstration or test run</span> <span class="muted">published as is and marked as not a research contribution</span></p>{% endif %}
+<p class="muted">
+  Template: {{ template_label }} · {{ "one pass" if (paper.mode or "single_pass") == "single_pass" else "iterative (longer)" }}
+  {% if paper.github_repo %} · <a href="{{ paper.github_repo }}" target="_blank" rel="noopener">{{ paper.github_repo }}</a>{% endif %}
+</p>
+
+{% if reading %}
+<section class="read-row">
+  {% for r in reading %}
+    <a class="read-card{% if r.primary %} primary{% endif %}"
+       href="/api/papers/{{ paper.id }}/artifacts/{{ r.path }}" target="_blank" rel="noopener">
+      <span class="rc-label">{{ r.label }}</span>
+      <span class="rc-path">{{ r.path }}</span>
+    </a>
+  {% endfor %}
+</section>
+{% endif %}
+
+<!-- Live-updating section: status, cost meter, recent events.
+     Fetched on page load and polled every 3 seconds via HTMX. -->
+<section id="live"
+         hx-get="/htmx/papers/{{ paper.id }}/live"
+         hx-trigger="load, every 3s"
+         hx-swap="innerHTML">
+  <p class="muted">Loading status…</p>
+</section>
+
+<section id="budget-box" class="waiting-box" hidden>
+  <span><strong>The spending limit was reached.</strong> The work done so far is kept. Raise the limit to continue.</span>
+  <label class="field">
+    <span>New spending limit (USD)</span>
+    <input type="number" id="budget-cap" min="0.01" step="0.01" value="{{ suggested_cap | round(0) | int }}">
+  </label>
+  <button type="button" class="btn-primary" id="budget-resume">Resume with this limit</button>
+  <p class="form-note" id="budget-msg" role="status"></p>
+</section>
+
+{% if rerun_steps %}
+<details id="rerun-box" class="card"{% if not rerun_open %} hidden{% endif %}>
+  <summary><strong>Run again from a step</strong></summary>
+  <p class="card-note">The step you choose and every step after it run again, also after the run failed or
+    stopped. Your remark goes to the specialists and into the dossier, and the run stops again where it waits for you.</p>
+  <label class="field">
+    <span>Step</span>
+    <select id="rerun-step">
+      {% for st in rerun_steps %}<option value="{{ st.name }}">{{ st.label }}</option>{% endfor %}
+    </select>
+  </label>
+  <label class="field">
+    <span>Remark: what should change</span>
+    <textarea id="rerun-remark" rows="3" style="width:100%" placeholder="For instance: use the corrected event dates."></textarea>
+  </label>
+  <button type="button" class="btn-primary" id="rerun-go">Run again from this step</button>
+  <p class="form-note" id="rerun-msg" role="status"></p>
+</details>
+{% endif %}
+
+{% if prereg %}
+<section class="card" id="prereg-box">
+  <h2>Pre-registration</h2>
+  <p class="card-note">Frozen {{ prereg.frozen_at }} · fingerprint <code>{{ (prereg.sha256 or "")[:16] }}…</code>
+    {% if prereg.deposit %} · deposited on {{ prereg.deposit.service }}{% if prereg.deposit.doi %}: doi {{ prereg.deposit.doi }}{% endif %}{% endif %}</p>
+  {% if not prereg.deposit %}
+    <p class="card-note">Deposit it on Zenodo with your own account for a DOI. e2er uses the Zenodo key saved under
+      <a href="/setup#card-keys">Settings</a>.</p>
+    <label class="check"><input type="checkbox" id="prereg-sandbox"> <span>Use Zenodo's test site (sandbox.zenodo.org, with its own key)</span></label>
+    <button type="button" class="btn" id="prereg-deposit">Deposit on Zenodo</button>
+    <p class="form-note" id="prereg-msg" role="status"></p>
+  {% endif %}
+</section>
+{% endif %}
+
+<script>
+(function () {
+  const pid = '{{ paper.id }}';
+  const call = (url, body) => e2er.call('POST', url, body || {});
+  // The live panel says whether the run is working, and whether the spending limit stopped it.
+  function sync() {
+    const f = document.getElementById('live-flags');
+    if (!f) return;
+    const box = document.getElementById('budget-box');
+    if (box) box.hidden = f.dataset.budget !== '1';
+    const rr = document.getElementById('rerun-box');
+    if (rr) rr.hidden = f.dataset.rerun !== '1';
+  }
+  document.body.addEventListener('htmx:afterSettle', sync);
+  const say = (id, t) => { const m = document.getElementById(id); if (m) m.textContent = t; };
+  const budget = document.getElementById('budget-resume');
+  if (budget) budget.addEventListener('click', async () => {
+    const cap = Number(document.getElementById('budget-cap').value);
+    if (!(cap > 0)) { say('budget-msg', 'Enter a limit above zero.'); return; }
+    budget.disabled = true;
+    try { await call('/api/papers/' + pid + '/resume', { max_cost_usd: cap }); say('budget-msg', 'Resumed with a limit of $' + cap + '.'); document.getElementById('budget-box').hidden = true; }
+    catch (e) { say('budget-msg', e.message); }
+    budget.disabled = false;
+  });
+  const rerun = document.getElementById('rerun-go');
+  if (rerun) rerun.addEventListener('click', async () => {
+    const step = document.getElementById('rerun-step').value;
+    const remark = document.getElementById('rerun-remark').value.trim();
+    if (!remark) { say('rerun-msg', 'Write what should change first.'); return; }
+    rerun.disabled = true;
+    try {
+      const d = await call('/api/papers/' + pid + '/rerun', { step, remark });
+      const rec = d.recorded || {};
+      const names = rec.rerun_labels || rec.reruns || [];
+      say('rerun-msg', 'Running again: ' + names.join(', ') + '. Recorded for the dossier.');
+      document.getElementById('rerun-remark').value = '';
+    } catch (e) { say('rerun-msg', e.message); }
+    rerun.disabled = false;
+  });
+  const dep = document.getElementById('prereg-deposit');
+  if (dep) dep.addEventListener('click', async () => {
+    dep.disabled = true; say('prereg-msg', 'Depositing…');
+    try { const d = await call('/api/papers/' + pid + '/preregistration/deposit', { sandbox: document.getElementById('prereg-sandbox').checked }); say('prereg-msg', 'Deposited: doi ' + d.doi + ' ' + (d.url || '')); }
+    catch (e) { say('prereg-msg', e.message); dep.disabled = false; }
+  });
+  // Approving or refusing a data query (the buttons sit in the live panel, which is redrawn every few seconds).
+  document.body.addEventListener('click', async (ev) => {
+    const b = ev.target.closest('[data-query]');
+    if (!b) return;
+    b.disabled = true;
+    try { await call('/api/queries/' + b.dataset.query + '/approve', { approved: b.dataset.approve === '1' }); b.closest('li').remove(); }
+    catch (e) { e2er.notice(e.message); b.disabled = false; }
+  });
+})();
+</script>
+
+<section class="card" id="inputs-panel">
+  <div class="card-h"><h2>Data and papers</h2></div>
+  <div hx-get="/htmx/papers/{{ paper.id }}/inputs"
+       hx-trigger="load delay:400ms{% if inputs_live %}, every 15s{% endif %}"
+       hx-swap="innerHTML">
+    <p class="muted">Loading…</p>
+  </div>
+</section>
+
+<section>
+  <h2>Files</h2>
+  {% if not groups %}
+    <p class="muted">No files yet.</p>
+  {% else %}
+  <p class="muted">
+    Grouped by the part of the study that wrote them. A file that should have been written and was not is shown in red.
+  </p>
+  {% for g in groups %}
+    <details class="ag ag-{{ g.status }}"{% if g.status == "fail" %} open{% endif %}>
+      <summary>
+        <span class="ag-name">{{ g.name }}</span>
+        <span class="ag-badge b-{{ g.status }}">
+          {%- if g.status == "pass" -%}complete
+          {%- elif g.status == "fail" -%}incomplete
+          {%- else -%}·{%- endif -%}
+        </span>
+        <span class="ag-note">{{ g.note }}</span>
+      </summary>
+      <ul class="ag-files">
+        {% for f in g.files %}
+          <li class="f-{{ f.status }}">
+            {% if f.status == "missing" %}
+              <span class="f-path">{{ f.p }}</span>
+            {% else %}
+              <a class="f-path" href="/api/papers/{{ paper.id }}/artifacts/{{ f.p }}" target="_blank" rel="noopener">{{ f.p }}</a>
+            {% endif %}
+            {% if f.note %}<span class="f-note">{{ f.note }}</span>{% endif %}
+            <span class="f-size">{% if f.status in ("missing", "none") %}·{% else %}{{ f.b | filesize }}{% endif %}</span>
+          </li>
+        {% endfor %}
+      </ul>
+    </details>
+  {% endfor %}
+  {% endif %}
+  <p>
+    <a class="btn" href="/api/papers/{{ paper.id }}/audit-bundle" id="download-all">Download all files</a>
+  </p>
+</section>
+
+<details class="tech">
+  <summary>Technical details</summary>
+  <p class="small mono">Run id {{ paper.id }} · template {{ paper.pipeline or "empirical" }} · mode {{ paper.mode or "single_pass" }} · {{ paper.backend or "" }} {{ paper.model or "" }}</p>
+  <p class="small mono">Folder {{ paper.workspace }}</p>
+</details>
+{% endblock %}

@@ -1,0 +1,1187 @@
+"""Specialist execution — owns the tool-use loop for each specialist call."""
+
+from __future__ import annotations
+
+import re
+import time
+from pathlib import Path
+
+from ...logging_config import get_logger
+from ...modules.llm.base import CompositeToolHandler, LLMBackend, ToolHandler, ToolLoopResult
+from ...modules.llm.tools import FILE_TOOLS, FileToolHandler
+from ...modules.tracking.costs import compute_cost
+from ...modules.tracking.usage import save_usage
+from ..governance import DEFAULT_REGIME, enforces_check
+from ..specialists.contracts import Contribution, WorkOrder
+
+logger = get_logger(__name__)
+
+#: The specialists who plan the study before the data architect: they see the sources available too.
+PLANNING_SPECIALISTS = frozenset({"idea_developer", "identification_strategist"})
+
+_MAX_TURNS = 80  # Bumped from 40 after May 2026 hack-event run: data_analyst hit the
+# 40-cap while paginating the new Allium developer endpoints (each get-transfers /
+# get-wallet-tx page = ~2 turns; 10 events × 3 endpoints × 3 pages = ~180 turns
+# in the worst case). Previously 25 was enough when only SQL was wired up.
+# 80 gives data_analyst headroom for real paginated data extraction; specialists
+# that don't need it won't burn what they don't use — turns is a cap, not a target.
+
+
+async def run_specialist(
+    work_order: WorkOrder,
+    backend: LLMBackend,
+    workspace: Path,
+    model: str,
+    extra_tools: list[dict] | None = None,
+    extra_handlers: list[ToolHandler] | None = None,
+    backend_name: str = "anthropic",
+    governance: str = DEFAULT_REGIME,
+) -> Contribution:
+    """Execute a specialist using the pipeline's own tool-use loop.
+
+    This replaces the Claude Code CLI subprocess pattern — we own the loop,
+    which enables intercepting tool calls for guardrails.
+
+    ``governance`` selects whether the output-contract check BLOCKS (see
+    :mod:`src.core.governance`). It is always COMPUTED and logged; under
+    ``off`` the verdict is recorded in shadow and the run continues.
+    """
+    from ...skills.loader import load_skills_for_specialist
+
+    t0 = time.time()
+    paper_id = work_order.paper_id
+    specialist = work_order.specialist
+
+    skills_text = load_skills_for_specialist(specialist)
+    has_allium = any((t.get("name") == "query_allium") for t in (extra_tools or []))
+    # A populated per-paper data.db means the researcher's data is queryable via
+    # the query_data tool — steer data specialists to SQL-explore it (see the
+    # inline mandate in _build_system_prompt).
+    from ...db.paper_data_db import has_data_db as _has_data_db
+
+    has_data_db = _has_data_db(workspace)
+    system = _build_system_prompt(
+        specialist,
+        skills_text,
+        has_allium=has_allium,
+        has_data_db=has_data_db,
+        max_turns=_MAX_TURNS,
+        sidecars=work_order.sidecar_artifacts,
+        shell=backend_name in _CLI_TOOL_ALIASES_BY_BACKEND,
+    )
+    set_aside = set_aside_previous_outputs(workspace, work_order)
+    user_prompt = _build_user_prompt(work_order)
+    already_there = [
+        f for f in [work_order.output_file, *work_order.sidecar_artifacts] if f and (workspace / f).is_file()
+    ]
+    if set_aside:
+        user_prompt += (
+            "\n\n## Earlier output\nYour earlier output was moved aside so you write fresh files: "
+            + ", ".join(f"`{new}` (was `{old}`)" for old, new in set_aside)
+            + ". Read them if useful; write the required files anew."
+        )
+    elif already_there:
+        # The Claude Code CLI's Write tool refuses to overwrite a file that was
+        # not read in the same session; a retry that tries to rewrite its own
+        # earlier output then fails every attempt (seen live, 2026-09-29).
+        user_prompt += (
+            "\n\n## Existing files\nThese files already exist from an earlier attempt: "
+            + ", ".join(f"`{f}`" for f in already_there)
+            + ". Read each one before you write it (the write tool refuses to overwrite a file you have not read)."
+        )
+
+    if specialist == "data_architect":
+        # Exactly the sources this study can load from now; the contract check holds the architect to them.
+        from .data_sources import sources_block
+
+        user_prompt += "\n\n" + sources_block(workspace)
+    elif specialist in PLANNING_SPECIALISTS:
+        # The specialists who plan before the architect see the same list, so the plan names real sources.
+        from .data_sources import sources_block
+
+        user_prompt += "\n\n" + sources_block(workspace, planning=True)
+
+    # Cross-attempt half of the self-correction loop: if a PRIOR attempt's
+    # script crashed when the runner executed it, feed the captured traceback
+    # into this attempt. Script-writing specialists can now also run their own
+    # code in-session via `e2er-run`, which is the cheap loop; this remains the
+    # backstop for a crash that only shows up in the runner's clean re-run.
+    from .post_execution import read_execution_error
+
+    exec_feedback = read_execution_error(workspace, specialist)
+    if exec_feedback:
+        user_prompt = f"{user_prompt}\n\n{exec_feedback}"
+        logger.info("%s: prior runner execution crashed — injecting the traceback into this attempt", specialist)
+
+    # Same loop for contract violations: if the prior attempt's output was
+    # rejected by check_specialist_artifacts, the WHY used to live only in
+    # result.error / the log — the retry was blind (and read_execution_error
+    # can't carry it: it early-returns when the sidecar is populated, which is
+    # exactly the populated-but-noncompliant state). Consume-once feedback.
+    from .contract_check import read_contract_feedback
+
+    contract_feedback = read_contract_feedback(workspace, specialist)
+    if contract_feedback:
+        user_prompt = f"{user_prompt}\n\n{contract_feedback}"
+        logger.info("%s: prior attempt violated its output contract — injecting the violation", specialist)
+
+    # The researcher's own instructions from researcher steps: persistent (not
+    # consume-once), so every specialist after the step works under them.
+    from ..pipeline.researcher import instructions_block
+
+    researcher_block = instructions_block(workspace)
+    if researcher_block:
+        user_prompt = f"{user_prompt}\n\n{researcher_block}"
+
+    # CLI backend uses Claude Code's native tool names (Write/Read/Edit/Glob)
+    # rather than the SDK's (write_file/read_file/...). Translate references
+    # in both prompts so the model finds the tools it's told to call.
+    # Discovered May 2026 NFT-paper run #3: specialists "succeeded" with
+    # tools_called=0 because they read "use `write_file`" but only `Write`
+    # was available, and just emitted text instead.
+    # Codex and Gemini have their own names too (apply_patch / shell; replace),
+    # and the same failure: a prompt naming a tool the CLI does not have.
+    if backend_name in _CLI_TOOL_ALIASES_BY_BACKEND:
+        system = _translate_tool_names_for_cli(system, backend_name)
+        user_prompt = _translate_tool_names_for_cli(user_prompt, backend_name)
+
+    tools = list(FILE_TOOLS)
+    if extra_tools:
+        tools.extend(extra_tools)
+
+    file_handler = FileToolHandler(workspace)
+    handlers: list[ToolHandler] = list(extra_handlers or []) + [file_handler]
+    handler = CompositeToolHandler(handlers)
+
+    messages = [{"role": "user", "content": user_prompt}]
+
+    logger.info(
+        "%s: starting tool_loop (system=%d chars, user=%d chars, %d tools, max_turns=%d)",
+        specialist,
+        len(system),
+        len(user_prompt),
+        len(tools),
+        _MAX_TURNS,
+    )
+    t_loop = time.time()
+
+    # The time limit of this call, as the template or its step sets it (CLI backends).
+    from ...modules.llm.cli_support import call_timeout
+    from ..pipeline.components import timeout_for
+
+    limit_token = call_timeout.set(timeout_for(specialist))
+    try:
+        result = await backend.tool_loop(
+            system=system,
+            messages=messages,
+            tools=tools,
+            tool_handler=handler,
+            max_turns=_MAX_TURNS,
+            # Forwarded so the CLI backend can wire E2ER_PAPER_ID / E2ER_SPECIALIST
+            # into the subprocess env. SDK backends ignore them — the in-process
+            # tool handler already carries this state.
+            paper_id=paper_id,
+            specialist=specialist,
+        )
+    finally:
+        call_timeout.reset(limit_token)
+
+    duration = time.time() - t0
+    logger.info(
+        "%s: tool_loop returned in %.1fs (success=%s, tools_called=%d, tokens=%d)",
+        specialist,
+        time.time() - t_loop,
+        result.success,
+        result.tool_calls_made,
+        result.usage.total_tokens,
+    )
+
+    if result.success and backend_name in _SDK_BACKENDS:
+        _keep_answer_as_markdown_output(workspace, specialist, work_order.output_file, result.output)
+
+    # v0.9 post-M4.3: runner-side post-specialist execution. The
+    # positive path that complements M4.3's negative path — if the
+    # specialist wrote a known execution-script (e.g.
+    # `run_estimation.py` for econometrics_specialist) but didn't
+    # populate the sidecar, the runner shells out and executes the
+    # script itself. Backend-agnostic, idempotent, auditable.
+    if result.success:
+        from .post_execution import maybe_execute_specialist_script
+
+        attempt = maybe_execute_specialist_script(workspace, specialist)
+        if attempt.ran:
+            logger.info(
+                "%s: post-exec ran=%s rc=%s populated=%s reason=%s",
+                specialist,
+                attempt.ran,
+                attempt.returncode,
+                attempt.populated_sidecar,
+                attempt.reason,
+            )
+        # The results files are the output of the script as shipped: one the script log does not trace
+        # to its last run is run again here (the contract check below fails it when the rerun differs).
+        from .post_execution import confirm_results_from_code
+
+        confirm_results_from_code(workspace, specialist)
+
+    # v0.9 M4.3: output-contract enforcement. A specialist that
+    # returns success=True while its declared artifact is empty
+    # (e.g., M4's estimation_results.json == "{}") is a false-success
+    # — the pipeline would then write a paper around a hollow
+    # contract. Flip the result to failure so the circuit breaker
+    # trips after _MAX_SPECIALIST_ATTEMPTS instead of paying the
+    # rest of the run.
+    #
+    # WS-B: the CHECK always runs; `governance` decides whether a VERIFICATION
+    # failure blocks. A RELIABILITY failure (missing, unparseable, `{}`) blocks
+    # in every regime — it means the run is broken, not that the paper is
+    # ungoverned, and letting it through is what produced the 2026-08-05 cell.
+    violations: list[str] = []
+    if result.success:
+        from .contract_check import check_specialist_artifacts
+
+        contract_failures = [c for c in check_specialist_artifacts(workspace, specialist) if not c.ok]
+        if contract_failures:
+            # Reliability failures (file missing, unparseable, `{}`) block in
+            # EVERY regime — they mean the run is broken, not that the paper is
+            # ungoverned. Only verification failures follow the matrix.
+            blocking = [c for c in contract_failures if enforces_check(governance, "contracts", c.kind)]
+            shadowed = [c for c in contract_failures if c not in blocking]
+            summary = "; ".join(f"{c.artifact}: {c.reason}" for c in contract_failures)
+            await _log_contract_gate(paper_id, specialist, summary, enforced=bool(blocking), regime=governance)
+            if shadowed:
+                logger.warning(
+                    "%s: %d verification violation(s) NOT enforced under governance=%s (shadow) — %s",
+                    specialist,
+                    len(shadowed),
+                    governance,
+                    "; ".join(f"{c.artifact}: {c.reason}" for c in shadowed),
+                )
+            if blocking:
+                violations = [f"{c.artifact}: {c.reason}" for c in blocking]
+                block_summary = "; ".join(violations)
+                logger.warning("%s: contract violation — %s", specialist, block_summary)
+                result.success = False
+                existing = (result.error or "").strip()
+                prefix = f"{existing} | " if existing else ""
+                result.error = f"{prefix}contract violation: {block_summary}"
+                if result.diagnostic:
+                    # Why the backend wrote nothing (Codex: its sandbox refused), for the researcher;
+                    # not in the feedback below, which goes to the model.
+                    result.error += f" | {result.diagnostic}"
+                # Persist the violation for the NEXT attempt's prompt (consumed
+                # once by read_contract_feedback above) — without this the retry
+                # is blind and just re-fails until the circuit breaker pauses.
+                from .contract_check import write_contract_feedback
+
+                write_contract_feedback(workspace, specialist, block_summary)
+
+    # Pass backend_name so flat-rate CLI backends (claude_code / codex /
+    # gemini) cost as $0 — M4.1 fix.
+    cost = compute_cost(model, result.usage, backend=backend_name)
+    try:
+        await save_usage(
+            paper_id=paper_id,
+            specialist=specialist,
+            backend=backend_name,
+            model=model,
+            usage=result.usage,
+        )
+    except Exception as e:
+        logger.warning("Could not save usage: %s", e)
+    await record_attempt_usage(paper_id, specialist, backend_name, model, result, cost)
+
+    output_file = _find_output_file(workspace, specialist, work_order.output_file)
+
+    # Persist a row in `contributions` so the audit bundle has a permanent
+    # record of every specialist invocation (success or failure).
+    try:
+        from ...db.client import execute
+
+        await execute(
+            """
+            INSERT INTO contributions
+                (paper_id, specialist, output_file, success, error_msg,
+                 usage_tokens, cost_usd, duration_sec)
+            VALUES (%(p)s, %(sp)s, %(of)s, %(s)s, %(em)s, %(ut)s, %(cu)s, %(ds)s)
+            """,
+            {
+                "p": paper_id,
+                "sp": specialist,
+                "of": output_file,
+                "s": result.success,
+                "em": result.error or None,
+                "ut": result.usage.total_tokens,
+                "cu": str(cost),
+                "ds": round(duration, 2),
+            },
+        )
+    except Exception as e:
+        logger.debug("Contribution log skipped (no DB?): %s", e)
+
+    if violations and getattr(result, "sandbox_blocked", False):
+        # The backend's sandbox refused this call's writes (Codex on Linux or Windows): every
+        # further attempt meets the same sandbox, so the run pauses now instead of retrying.
+        raise _sandbox_blocked(specialist, backend_name, result.error or "", result.diagnostic)
+
+    if not result.success and getattr(result, "stop_reason", "") == "timeout":
+        # The call ran out of time: the run pauses (dispatcher/runner), Resume gives a fresh attempt.
+        raise _timed_out(specialist, backend_name, result.error or "", duration)
+
+    return Contribution(
+        paper_id=paper_id,
+        specialist=specialist,
+        output=result.output,
+        output_file=output_file,
+        usage_tokens=result.usage.total_tokens,
+        cost_usd=float(cost),
+        duration_seconds=duration,
+        success=result.success,
+        error=result.error or "",
+        contract_violations=violations,
+    )
+
+
+def set_aside_previous_outputs(workspace: Path, work_order: WorkOrder) -> list[tuple[str, str]]:
+    """Move a rewriting specialist's earlier output files into the hidden ``.history`` folder.
+
+    For specialists that write their files whole each time
+    (``SPECIALIST_REWRITES_OUTPUTS``), so a retry or a send-back starts from no
+    file: the CLI backend's write tool cannot overwrite a file it has not read,
+    and a stale file must never pass a contract check it did not earn. The
+    earlier version goes to ``.history/<name>.<n>`` (n counts up), which export,
+    "Download all files" and the dashboard leave out; before 0.14.0 it went to
+    ``<name>.previous`` next to the output, and every export carried it.
+    """
+    from .registry import SPECIALIST_REWRITES_OUTPUTS
+
+    if work_order.specialist not in SPECIALIST_REWRITES_OUTPUTS:
+        return []
+    moved: list[tuple[str, str]] = []
+    for name in [work_order.output_file, *work_order.sidecar_artifacts]:
+        path = workspace / name if name else None
+        if path is not None and path.is_file():
+            n = 1
+            while (workspace / HISTORY_DIR / f"{name}.{n}").exists():
+                n += 1
+            target = workspace / HISTORY_DIR / f"{name}.{n}"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            path.replace(target)
+            moved.append((name, target.relative_to(workspace).as_posix()))
+    return moved
+
+
+#: Where earlier versions of rewritten outputs go (hidden: never exported or listed).
+HISTORY_DIR = ".history"
+
+
+async def record_attempt_usage(
+    paper_id: str, specialist: str, backend_name: str, model: str, result: ToolLoopResult, cost: object
+) -> None:
+    """One ``attempt_usage`` event per specialist attempt: its tokens, calls and cost.
+
+    ``llm_usage`` holds the totals; this keeps what one attempt sent (fresh,
+    cached and cache-write input, output), how many calls it made, how large
+    the conversation got and how many older exchanges were summarised, so a
+    costly attempt can be read back from the run's events.
+    """
+    u = result.usage
+    payload = {
+        "backend": backend_name,
+        "model": model,
+        "success": bool(result.success),
+        "stop_reason": result.stop_reason,
+        "turns": int(getattr(result, "turns", 0) or 0),
+        "tool_calls": int(result.tool_calls_made or 0),
+        "input_tokens": u.input_tokens,
+        "cache_read_tokens": u.cache_read_tokens,
+        "cache_write_tokens": u.cache_write_tokens,
+        "output_tokens": u.output_tokens,
+        "peak_prompt_tokens": int(getattr(result, "peak_prompt_tokens", 0) or 0),
+        "summarised_exchanges": int(getattr(result, "summarised_exchanges", 0) or 0),
+        "cost_usd": str(cost),
+    }
+    try:
+        from ...db.events import log_event
+
+        await log_event(paper_id, "attempt_usage", specialist=specialist, payload=payload)
+    except Exception as e:  # noqa: BLE001 — bookkeeping must not fail the specialist
+        logger.debug("could not record attempt usage: %s", e)
+
+
+async def _log_contract_gate(
+    paper_id: str,
+    specialist: str,
+    detail: str,
+    *,
+    enforced: bool,
+    regime: str,
+) -> None:
+    """Record a contract verdict in the same shape the three deterministic
+    gates use (`_record_gate` in the runner), so the experiment harvests
+    shadowed contract violations alongside shadowed gate failures."""
+    try:
+        from ...db.events import log_event
+
+        await log_event(
+            paper_id,
+            "gate_enforced" if enforced else "gate_shadow",
+            stage="contracts",
+            payload={
+                "gate": "contracts",
+                "passed": False,
+                "enforced": enforced,
+                "regime": regime,
+                "specialist": specialist,
+                "detail": detail[:2000],
+            },
+        )
+    except Exception as e:  # noqa: BLE001 — measurement must never break a run
+        logger.debug("Could not log contract gate event: %s", e)
+
+
+_DATA_SPECIALISTS = frozenset(["data_analyst", "data_architect", "econometrics_specialist"])
+
+# Specialists that write an execution script and can therefore run it. Kept in
+# step with EXECUTION_CONVENTIONS (post_execution) and the CLI allowlist
+# (modules/llm/claude_code.allowed_tools_for) — a test pins the three together.
+_SCRIPT_WRITING_SPECIALISTS = frozenset(["data_analyst", "econometrics_specialist"])
+
+# What each script-writing specialist can already put in its narrative artifact
+# BEFORE running anything — i.e. the part of the artifact that is design, not
+# result. Used by the Write Order block in `_build_system_prompt`.
+_FIRST_WRITE_CONTENT: dict[str, str] = {
+    "econometrics_specialist": (
+        "the estimating equation, the sample, the fixed effects, the controls, the "
+        "clustering, and what each robustness check is meant to test — all of it is "
+        "in `identification_strategy.md` and your work order"
+    ),
+    "data_analyst": (
+        "the data sources, the intended sample construction (raw N -> each inclusion/"
+        "exclusion filter -> final N), and the variable definitions — all of it is in "
+        "`data_dictionary.json` and your work order"
+    ),
+}
+
+
+# Tool-name aliases. The Anthropic SDK exposes JSON-schema tools named
+# `write_file`, `read_file`, `edit_file`, `list_directory` (defined in
+# src/modules/llm/tools.py). The Claude Code CLI exposes its own native
+# tools named `Write`, `Read`, `Edit`, `Glob`. The system + user prompts
+# reference the SDK names; when the active backend is the CLI, we translate
+# those names so the model finds the tool it's instructed to call.
+_CLI_TOOL_ALIASES = {
+    "write_file": "Write",
+    "read_file": "Read",
+    "edit_file": "Edit",
+    "list_directory": "Glob",
+}
+
+#: Per CLI backend. Codex writes and edits files with `apply_patch` and reads
+#: and lists them through its shell; Gemini's file tools carry the SDK names
+#: already, except editing, which is `replace`.
+_CLI_TOOL_ALIASES_BY_BACKEND: dict[str, dict[str, str]] = {
+    "claude_code": _CLI_TOOL_ALIASES,
+    "codex": {
+        "write_file": "apply_patch",
+        "read_file": "cat",
+        "edit_file": "apply_patch",
+        "list_directory": "ls",
+    },
+    "gemini": {"edit_file": "replace"},
+}
+
+
+def _translate_tool_names_for_cli(text: str, backend_name: str = "claude_code") -> str:
+    """Replace SDK tool names with the CLI backend's own equivalents.
+
+    Replaces both backtick-quoted forms (`write_file`) and bare references
+    that appear in skill files. Order matters: replace the longest names
+    first so we don't truncate (e.g. read_file before read).
+    """
+    aliases = _CLI_TOOL_ALIASES_BY_BACKEND.get(backend_name, {})
+    for sdk_name, cli_name in sorted(aliases.items(), key=lambda kv: -len(kv[0])):
+        text = text.replace(f"`{sdk_name}`", f"`{cli_name}`")
+        text = text.replace(sdk_name, cli_name)
+    return text
+
+
+def wrapper_rules(specialist: str) -> list[str]:
+    """How a CLI specialist runs e2er's commands: one plain command per call.
+
+    The 2026-10-25 live test: the literature scanner wrapped two searches in one line,
+    ``(e2er-lit search "…" 2>&1 | head -40; e2er-lit search "…" 2>&1 | head -40)``. Claude Code
+    refused it ("This command can't be checked before it runs"), and the scanner wrote its review
+    without a single search. A command is allowed by its name (``Bash(e2er-lit:*)``); a subshell,
+    pipe, chain, redirection or heredoc around it is a command Claude Code cannot match, so it is refused.
+    """
+    from ...modules.llm.claude_code import allowed_tools_for
+
+    names = [t[len("Bash(") : -len(":*)")] for t in allowed_tools_for(specialist) if t.startswith("Bash(")]
+    names = [n for n in names if n != "e2er-allium-query"]  # the old name of `e2er-data allium`
+    lit = "e2er-lit" in names
+    example = '`e2er-lit search "unemployment convergence euro area"`' if lit else "`e2er-data query tables`"
+    short = ['`e2er-lit search "<query>" --limit 5`'] if lit else []
+    short += ['a `LIMIT` in `e2er-data query sql "SELECT ... LIMIT 20"`', "`--save-to <file.csv>` on a data download"]
+    return [
+        "## Running e2er's commands: one plain command per call",
+        f"Your shell runs e2er's own commands ({', '.join(f'`{n}`' for n in names)}) and refuses any "
+        "command it cannot check before it runs. Run each as a single plain command:",
+        f"- One command per call, e.g. {example}. For two commands, make two calls.",
+        "- No subshell `( ... )`, no pipe `|`, no `;`, `&&` or `||`, no redirection (`>`, `2>&1`, `<`), "
+        "no heredoc (`<<`), no `$( ... )`, no `cd` in front of the command.",
+        "- Keep output short with the command's own options, never with `head` or `tail`: "
+        f"{', '.join(short)}. Read a long file with the Read tool.",
+        "- A refused command did not run. When the shell answers \"This command can't be checked before it "
+        'runs", "requires approval" or "contains multiple operations", run the same e2er command again at once, '
+        "alone and plain. Never skip the step or write as if it had run.",
+        "",
+    ]
+
+
+def _build_system_prompt(
+    specialist: str,
+    skills_text: str,
+    has_allium: bool = False,
+    has_data_db: bool = False,
+    max_turns: int = 80,
+    sidecars: list[str] | tuple[str, ...] = (),
+    shell: bool = False,
+) -> str:
+    """The specialist's system prompt. ``shell``: a CLI backend, whose shell runs e2er's commands
+    (:func:`wrapper_rules`)."""
+    from ..specialists.registry import SPECIALIST_ARTIFACTS
+
+    name = specialist.replace("_", " ").title()
+    if specialist == "econometrics_specialist":
+        from ..pipeline.result_kinds import active_kind as _kind_now
+
+        if _kind_now() != "regression":
+            # The template's results are not regressions (results = "descriptive", ...).
+            name = "Analysis"
+    # Early-write deadline: aim to have a first version of the canonical
+    # artifact written by the half-way point. For data-heavy specialists
+    # this leaves headroom to append findings as paginated queries come in.
+    # For light specialists (reviewers, polish) it's effectively "write
+    # promptly" — they'll finish well before the cap.
+    early_write_by = max(10, max_turns // 2)
+    if specialist in _SCRIPT_WRITING_SPECIALISTS:
+        # Script writers spend most of their budget in the write -> e2er-run
+        # -> fix loop, so "by mid-budget" lands while they are still deep in
+        # debugging and the narrative artifact never gets written at all.
+        # The 2026-08-12 canary reproduced this twice for
+        # econometrics_specialist: run_estimation.py, summary_statistics.json,
+        # figure_spec.json and robustness_results.json all written,
+        # econometric_spec.md missing — once cut off at the timeout, once
+        # finishing on its own in 24 minutes inside a 30-minute cap. So it is
+        # not a budget problem, it is an ordering problem: their first write
+        # belongs BEFORE the script, not after it.
+        early_write_by = max(5, max_turns // 8)
+    lines = [
+        f"You are the {name} specialist in an end-to-end empirical research pipeline.",
+        "You produce high-quality academic research outputs.",
+        "",
+        "## Turn Budget (read this before planning)",
+        f"You have at most {max_turns} agentic turns for this invocation. Each tool",
+        "call costs ~1 turn. Plan accordingly:",
+        f"- Write a FIRST version of your canonical artifact within turn {early_write_by}.",
+        "  A partial-but-existing file is far more useful to the pipeline than a",
+        "  perfect-but-never-written one. The integration cascade halts if your",
+        "  canonical file is missing.",
+        "- Use the remaining turns to append, refine, and back-fill with data.",
+        "- Do NOT save the write_file call for the last turn — if you run out of",
+        "  turns mid-thought, the canonical artifact is gone and the pipeline fails.",
+        "- If you're paginating data: limit one page per call, write what you have",
+        "  to the artifact, then page only if the analysis genuinely requires it.",
+        "",
+    ]
+    if shell:
+        lines.extend(wrapper_rules(specialist))
+    # Output discipline. The single-artifact rule below is the right rule for
+    # writers, reviewers and polish specialists. It is FALSE for a specialist
+    # whose work order carries sidecars (and, for the script writers, an
+    # analysis script): telling those "one specialist = one artifact" and
+    # "produce exactly one final write_file at the end" contradicts the work
+    # order they are handed, and the file they drop is the narrative one —
+    # which is the file the pipeline gates on.
+    if sidecars:
+        lines.extend(
+            [
+                "## Output Discipline (strict)",
+                "1. Your work order names a primary artifact AND one or more "
+                "machine-readable sidecar files. ALL of them are required — the "
+                "pipeline halts if any is missing.",
+                "2. Beyond those files (and any analysis script you need in order to "
+                "produce them), do not create indexes, completion reports, status "
+                "files, checklists, READMEs, or manifests.",
+                "3. Do not invent filenames for the deliverables. The orchestrator "
+                "collects only the files named in the work order — anything else you "
+                "write is scratch, and no downstream stage will read it.",
+                "4. After the last required write_file succeeds, end your turn — no further commentary.",
+                "",
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                "## Output Discipline (strict)",
+                "1. Your work order names ONE output file. Write that single file with `write_file`.",
+                "2. Do not create indexes, summaries, completion reports, status files, "
+                "checklists, READMEs, manifests, or any auxiliary deliverables. "
+                "One specialist = one artifact.",
+                "3. Do not invent additional filenames. The orchestrator only collects "
+                "the canonical artifact named in the work order.",
+                "4. After the single write_file call succeeds, end your turn — no "
+                "further commentary, no follow-up files.",
+                "5. If you need to gather information, use read_file or other tools, "
+                "but produce exactly one final write_file at the end.",
+                "",
+            ]
+        )
+    if specialist in _SCRIPT_WRITING_SPECIALISTS:
+        lines.extend(
+            [
+                "## Write Order — the narrative artifact comes FIRST",
+                f"Write `{SPECIALIST_ARTIFACTS.get(specialist, 'your canonical artifact')}` "
+                "BEFORE you write or run any script, and do it from the design you were "
+                "already given (your work order plus the design documents in your "
+                f"context): {_FIRST_WRITE_CONTENT.get(specialist, 'what you intend to do and why')}. "
+                "None of that depends on results, so none of it is a reason to wait.",
+                "Then, and only then:",
+                "  - write your analysis script and iterate on it (see the next section)",
+                "  - come back and fill the realized numbers into the artifact you already wrote",
+                "Two reasons this order is not negotiable. A specification written before "
+                "the analysis is the artifact a referee wants; one written afterwards is a "
+                "description of whatever the code happened to produce, and it cannot "
+                "contradict the code even when the code is wrong. And debugging is where "
+                "budgets die — if you run out of turns in the write/run/fix loop with the "
+                "narrative file already on disk, the pipeline continues; without it, every "
+                "downstream stage halts and all of your script work is discarded.",
+                "",
+            ]
+        )
+        lines.extend(
+            [
+                "## RUN YOUR SCRIPT BEFORE YOU FINISH (do not hand over untested code)",
+                "You write an execution script, and you can execute it: "
+                "`e2er-run <your_script.py>` (via Bash). It runs one workspace-relative "
+                ".py file and prints its stdout and traceback.",
+                "The loop you are expected to follow:",
+                "  1. write the script",
+                "  2. `e2er-run` it",
+                "  3. read the traceback and FIX it",
+                "  4. repeat until it exits cleanly and its results file is populated",
+                "Code that has not been executed is a hypothesis. A script that crashes "
+                "leaves your results file empty, and the pipeline then has nothing to put "
+                "in the paper's tables — which is exactly how a draft ends up with "
+                "invented numbers. Do not end your turn on a script you have not run.",
+                "Common crashes worth pre-empting: comparing tz-aware and tz-naive "
+                "timestamps, joining on mismatched dtypes, and indexing a column that "
+                "the real data does not have.",
+                "",
+            ]
+        )
+    if specialist in _DATA_SPECIALISTS and has_data_db:
+        lines.extend(
+            [
+                "## Local Data Warehouse — query it before you model (DO NOT GUESS COLUMNS)",
+                "Your context includes a 'Local Data Warehouse (data.db)' block listing the "
+                "available tables, their columns + types, row counts, and sample rows. Run "
+                'read-only SQL against it with `e2er-data query sql "SELECT ..."` (via Bash; '
+                "use `e2er-data query tables` to list tables). On SDK backends the same "
+                "capability is the `query_data(sql)` tool. Use it:",
+                "- BEFORE defining any variable or treatment, inspect the REAL columns with "
+                "`SELECT DISTINCT <col>` / `GROUP BY` to see the actual values. Do NOT invent a "
+                "proxy for something the data already records (e.g. don't derive a treatment from "
+                "addresses when a labelled column exists) — a wrong proxy is a construct-validity "
+                "error referees reject.",
+                "- Profile and aggregate in SQL — counts, group means, time ranges, missingness — "
+                "rather than loading millions of rows into memory; query_data returns only the "
+                "window/aggregate you ask for.",
+                "- query_data calls are recorded for the replication package, so they double as your "
+                "data-provenance trail; document the key queries in your output.",
+                "- Record the SAMPLE CONSTRUCTION: COUNT(*) the raw rows, then after each inclusion/"
+                "exclusion filter, so you can report a sample-flow (raw N -> each filter + rows dropped "
+                "-> final N). A missing sample-flow is a standard referee complaint; state how missing "
+                "values were handled (dropped vs. coded zero) too.",
+                "The final reproducible estimation script may still read the data files with pandas — "
+                "but VERIFY column names + meanings via query_data first so it operates on real "
+                "fields, not assumptions.",
+                "",
+            ]
+        )
+    from ..pipeline.result_kinds import RESULTS_FILE, active_causal, active_kind
+    from ..pipeline.result_kinds import get as _result_kind
+
+    kind = active_kind() if specialist == "econometrics_specialist" else "regression"
+    if specialist == "econometrics_specialist" and kind != "regression":
+        k = _result_kind(kind)
+        lines.extend(
+            [
+                f"## This study reports {k.label} (the template's results contract)",
+                f"You are this study's analysis specialist. Its results are {k.label}, not regression "
+                f"estimates: write them to {RESULTS_FILE} exactly as your {k.schema_skill} skill specifies, "
+                f'starting with "result_kind": "{kind}". A deterministic check reads the file and fails the step '
+                "on a missing block or numbers that contradict each other.",
+                "- Compute every number in your script from the data; never type a result by hand.",
+                "- Do not estimate a regression or claim a causal effect the design does not support.",
+                "",
+            ]
+        )
+    elif specialist == "econometrics_specialist" and not active_causal():
+        lines.extend(
+            [
+                "## This study makes no causal claim",
+                "Report the regression estimates the analysis plan names in estimation_results.json (see your "
+                "estimation-results-schema skill). There is no identification_spec.json to implement; describe "
+                "associations as associations.",
+                "",
+            ]
+        )
+    elif specialist == "econometrics_specialist":
+        lines.extend(
+            [
+                "## Headline estimate MUST be the IDENTIFIED specification (not a raw gap)",
+                "Your primary result must implement the design in `identification_strategy.md` — its "
+                "fixed effects, controls, and clustering — and report it FIRST in "
+                "estimation_results.json under a clear primary key (e.g. `main`).",
+                "- A raw / unconditional difference in means (a two-coefficient `const + treatment` "
+                "regression with no fixed effects or controls) is at most a DESCRIPTIVE baseline. It "
+                "is NOT your headline estimate — reporting it as the main result is the single most "
+                "common reason these papers score low on identification.",
+                "- The identified spec's `diagnostics` must reflect what was actually estimated "
+                "(e.g. fixed-effects absorbed, number of clusters, within-R^2) — not nulls.",
+                "- If the identification strategy can't be estimated on the data, say so explicitly in "
+                "your spec and explain why; do not silently substitute a raw gap and move on.",
+                "",
+            ]
+        )
+    if specialist == "data_analyst" and has_allium:
+        lines.extend(
+            [
+                "## Mandatory Data Sourcing — DO NOT SYNTHESIZE",
+                "The Allium tool `query_allium` is wired into your tool list. You MUST use it.",
+                '- Do NOT write "synthetic", "calibrated", "plausible", "illustrative", "hypothetical" '
+                'or "representative" numbers. Inventing data is a hard failure.',
+                "- Workflow:",
+                "  1. Call `list_allium_tables` once to confirm the table you'll query.",
+                "  2. Submit a `query_allium` call with `query_type='feasibility'` (auto-approved, "
+                "samples 1000 rows). Inspect the result.",
+                "  3. Submit production queries with `query_type='production'`. These return a "
+                "`query_id` and require human approval — poll `check_approval` until status='approved' "
+                "(typically takes minutes; do NOT give up). Once approved, query_allium returns the rows.",
+                "  4. Build the data_summary.md from the actual returned rows. Cite the query_ids.",
+                "- If a query is rejected or never approves within reasonable time, report this in "
+                "data_summary.md as a transparent failure — do NOT fall back to invented data.",
+                "",
+            ]
+        )
+    if specialist in _NO_ABSTRACT_WRITERS and _abstract_step_follows():
+        lines.extend(
+            [
+                "## The abstract is written after you",
+                "Do not write an abstract. Leave \\begin{abstract} ... \\end{abstract} out of paper_draft.tex "
+                "(an empty \\begin{abstract}\\end{abstract} may mark where it goes). The template's abstract "
+                "step writes the abstract from the final paper, after the revision, and the compiler puts it "
+                "into the paper.",
+                "",
+            ]
+        )
+    if skills_text:
+        lines.append("## Your Expertise\n")
+        lines.append(skills_text)
+    return "\n".join(lines)
+
+
+#: Writers of the whole draft, who leave the abstract to the abstract step (src/core/abstract.py).
+# The template writers that draft the whole paper (the systematic review's and the field map's)
+# leave the abstract out too where an abstract step follows.
+_NO_ABSTRACT_WRITERS = frozenset({"paper_drafter", "revisor", "meta_review_writer", "field_review_writer"})
+
+
+def _abstract_step_follows() -> bool:
+    """Does the running template write the abstract in a step of its own (``abstract``)?"""
+    from ..pipeline.components import active
+
+    spec = active()
+    return spec is not None and spec.step("abstract") is not None
+
+
+_BIB_SPECIALISTS = frozenset(
+    [
+        "literature_scanner",
+        "paper_drafter",
+        "section_writer",
+        "abstract_writer",
+        "revisor",
+    ]
+)
+
+
+def _build_user_prompt(work_order: WorkOrder) -> str:
+    from ..specialists.registry import ALL_REVIEWERS
+
+    parts = [f"## Work Order\n{work_order.focus}"]
+    if work_order.context:
+        parts.append(f"\n## Context\n{work_order.context}")
+    bib = _load_reference_summary(work_order.specialist, work_order.paper_id)
+    if bib:
+        parts.append(f"\n{bib}")
+    workspace_bib = _workspace_bib_for_prompt(work_order.specialist, work_order.paper_id)
+    if workspace_bib:
+        parts.append(f"\n{workspace_bib}")
+    local_pdfs = _list_local_pdfs_for_prompt(work_order.specialist, work_order.paper_id)
+    if local_pdfs:
+        parts.append(f"\n{local_pdfs}")
+    # Reviewers get the full draft + supporting docs pre-loaded above.
+    # Stop them from re-reading via read_file (each tool result re-enters
+    # the conversation history on every subsequent turn — quadratic blow-up).
+    if work_order.specialist in ALL_REVIEWERS:
+        parts.append(
+            "\n## Reviewing Instructions\n"
+            "The full paper draft and all supporting documents are already "
+            "above in your Context. Do NOT call read_file or list_directory to "
+            "fetch them again — they are already here, and re-reading them "
+            "wastes tokens.\n"
+            "\n"
+            "That is the ONLY tool restriction, and it does not apply to "
+            "writing. You MUST still call write_file. Your review is delivered "
+            "by writing the file — not by describing it in your reply. A reply "
+            "that contains the review as text while the file is unwritten is a "
+            "FAILED invocation: the pipeline reads the file and never reads "
+            "your reply, so the review is discarded and the entire review is "
+            "run again from scratch. Read the material in your context, then "
+            "make exactly one write_file call.\n"
+            "\n## MANDATORY closing format — parser-enforced\n"
+            "The text you write INTO the file must end with these two lines "
+            "EXACTLY, on their own lines, no markdown bold, no extra "
+            "punctuation. (This is a requirement on the file's contents, not "
+            "on your reply — a reply that ends with these lines while the file "
+            "is unwritten still counts as a failed invocation.)\n"
+            "```\n"
+            "OVERALL SCORE: <number>/10\n"
+            "RECOMMENDATION: <Accept | Minor Revision | Major Revision | Reject>\n"
+            "```\n"
+            "The mechanical review aggregator parses these two lines to compute "
+            "the panel verdict. Reviews without them are dropped from the "
+            "weighted average, which biases the aggregation and may hide a "
+            "MECHANISM_FAIL or HARD_REJECT signal. Do not end with prose; "
+            "end with the two required lines."
+        )
+    if work_order.output_file:
+        if work_order.sidecar_artifacts:
+            # Multi-file output. The primary markdown artifact AND each
+            # machine-readable JSON sidecar are required. verify_numbers
+            # and downstream consumers depend on the JSON files; emitting
+            # only the markdown silently breaks the anti-hallucination
+            # gate.
+            sidecar_lines = "\n".join(
+                f"  - `./{f}` — see your skill files for the schema this file must follow"
+                for f in work_order.sidecar_artifacts
+            )
+            parts.append(
+                f"\n## Required Output — multiple files\n"
+                f"You MUST write ALL of the following files directly in the "
+                f"current working directory. Each file has a different role; "
+                f"the pipeline fails downstream if any is missing or has the "
+                f"wrong shape.\n\n"
+                f"Primary narrative:\n"
+                f"  - `./{work_order.output_file}` — human-readable markdown\n\n"
+                f"Machine-readable sidecars (your skills define the schema):\n"
+                f"{sidecar_lines}\n\n"
+                f"Rules:\n"
+                f"- Write `./{work_order.output_file}` FIRST, from the design you were "
+                f"given, before you write or run any script. Its design content — what "
+                f"you intend to do and why — does not depend on results, and if you run "
+                f"out of turns while debugging, a file that exists is the difference "
+                f"between a pipeline that continues and one that halts.\n"
+                f"- Do NOT create subdirectories. Do NOT add prefixes like "
+                f"`workspace/`, `{work_order.specialist}/`, `output/`. Each "
+                f"file must appear at the exact path shown above, relative "
+                f"to cwd.\n"
+                f"- Use the EXACT filenames listed — do not rename, extend, "
+                f"or add suffixes.\n"
+                f"- The JSON sidecars must be valid JSON. Numeric fields "
+                f"must be plain numbers (not strings). Missing data → use "
+                f'`null`, not `"N/A"`.\n'
+                f"- If you genuinely cannot produce a sidecar (e.g. data "
+                f"acquisition failed, no estimation was run), write an "
+                f"empty JSON object `{{}}` rather than omitting the file. "
+                f"The downstream gate distinguishes 'empty' from 'missing' "
+                f"and an empty file is the honest signal.\n"
+                f"- After all `write_file` calls succeed, end your turn — "
+                f"no further commentary."
+            )
+        else:
+            parts.append(
+                f"\n## Required Output\n"
+                f"Write your work to EXACTLY ONE file at this exact path, directly in "
+                f"the current working directory: `./{work_order.output_file}`.\n"
+                f"Do NOT create subdirectories. Do NOT add prefixes like "
+                f"`workspace/`, `{work_order.specialist}/`, `output/`, etc. The file "
+                f"must appear as `./{work_order.output_file}` relative to cwd, "
+                f"nothing else. Use the exact filename — do not rename or extend it.\n"
+                f"After the single `write_file` call succeeds, end your turn — "
+                f"no further commentary, no follow-up files."
+            )
+    return "\n".join(parts)
+
+
+def _load_reference_summary(specialist: str, paper_id: str | None = None) -> str:
+    """The researcher's own papers for this study, with the keys that are in its ``literature.bib``.
+
+    Read from the study's own ``literature.bib`` (the entries tagged
+    ``e2er_source = {researcher}``), which ``study_inputs.prepare_papers``
+    wrote before any specialist ran: the papers the researcher chose on New
+    study, or without a choice every paper of their folders, .bib files and
+    Zotero libraries.
+
+    Before 0.15.0 this block read the researcher's .bib file and Zotero
+    libraries afresh at every prompt and showed their entries as citable,
+    while none of them was ever written into the study's bibliography: a paper
+    that cited one failed the citation check (missing_in_bib). Now a key shown
+    here is a key in the file, because it is read from the file.
+    """
+    if specialist not in _BIB_SPECIALISTS or not paper_id:
+        return ""
+    from ...config import get_settings
+    from ...home import find_workspace
+    from ...modules.literature.models import SOURCE_FIELD
+    from ..pipeline.verify_citations import load_bib
+
+    workspace = find_workspace(paper_id, get_settings().workspace_root)
+    entries = [(k, f) for k, f in load_bib(workspace / "literature.bib").items() if f.get(SOURCE_FIELD) == "researcher"]
+    if not entries:
+        return ""
+    pdfs = _staged_pdfs_by_key(workspace)
+    lines = [f"## The Researcher's Own Papers ({len(entries)}, chosen for this study)"]
+    lines.append(
+        "Cite ONLY keys that are in literature.bib, using the exact `\\cite{key}` shown at the start of each "
+        "entry. Do NOT invent citations or cite papers that are not listed; a `\\cite{}` to any other key "
+        "compiles as an undefined reference. These are the papers the researcher brought: build on them first. "
+        "If the list doesn't cover a claim, rephrase without a citation rather than fabricating one."
+    )
+    if pdfs:
+        lines.append("Entries marked [PDF] can be read in full with the `read_reference` tool (pass the path).")
+    lines.append("")
+    for key, f in entries[:60]:
+        names = [a.strip() for a in str(f.get("author") or "").split(" and ") if a.strip()]
+        authors = ", ".join(names[:2]) + (" et al." if len(names) > 2 else "")
+        year = f" ({f['year']})" if f.get("year") else ""
+        venue = f.get("journal") or f.get("booktitle") or ""
+        journal = f". _{venue}_" if venue else ""
+        pdf = f" [PDF: {pdfs[key]}]" if key in pdfs else ""
+        lines.append(f'- `\\cite{{{key}}}` — {authors}{year}. "{str(f.get("title") or "").strip("{}")}"{journal}{pdf}')
+    if len(entries) > 60:
+        lines.append(f"  ... and {len(entries) - 60} more in literature.bib.")
+    return "\n".join(lines)
+
+
+def _staged_pdfs_by_key(workspace: Path) -> dict[str, str]:
+    """The study's PDFs by the key of their entry (from study_inputs.json)."""
+    from ..study_inputs import read_record
+
+    items = (read_record(workspace).get("papers") or {}).get("items") or []
+    return {str(i["key"]): str(i["pdf"]) for i in items if isinstance(i, dict) and i.get("key") and i.get("pdf")}
+
+
+def _list_local_pdfs_for_prompt(specialist: str, paper_id: str) -> str:
+    """List the PDFs staged into the study's ``literature/`` folder (the researcher's papers).
+
+    Surfaced only to bib-relevant specialists, alongside the reference summary,
+    so they know they can read these in full via ``read_reference(path=...)``.
+    Returns "" when there's nothing to show.
+    """
+    if specialist not in _BIB_SPECIALISTS:
+        return ""
+    from ...config import get_settings
+    from ...home import find_workspace
+
+    workspace = find_workspace(paper_id, get_settings().workspace_root)
+    lit_dir = workspace / "literature"
+    if not lit_dir.is_dir():
+        return ""
+    pdfs = sorted(p.name for p in lit_dir.iterdir() if p.suffix.lower() == ".pdf")
+    if not pdfs:
+        return ""
+    listing = "\n".join(f"- literature/{p}" for p in pdfs[:30])
+    suffix = f"\n  ... and {len(pdfs) - 30} more." if len(pdfs) > 30 else ""
+    return (
+        "## The Researcher's PDFs (in the study's literature/ folder)\n"
+        "Read any of these in full via `read_reference(path=...)`:\n"
+        f"{listing}{suffix}"
+    )
+
+
+_BIB_ENTRY_RE = re.compile(r"^@\w+\s*\{\s*([^,\s]+)", re.MULTILINE)
+_BIB_FIELD_RE = re.compile(r"^\s*(title|year|e2er_source)\s*=\s*[{\"]?(.*?)[}\"]?,?\s*$", re.MULTILINE | re.IGNORECASE)
+#: How the citable list marks where an entry came from (the e2er_source field).
+_SOURCE_MARK = {"researcher": "  [researcher's paper]", "web": "  [found on the web]", "template": "  [method source]"}
+
+
+def _workspace_bib_for_prompt(specialist: str, paper_id: str, limit: int = 40) -> str:
+    """List the keys in the workspace's literature.bib — the only citable ones.
+
+    Deterministic counterpart to `e2er-lit list`. The 2026-09-01 repeats cell
+    failed precisely because the model was never *told* what it could cite: on
+    CLI backends the literature tools are unreachable (see
+    `modules/llm/claude_code.py`), no bibliography was written, and both
+    reviewed drafts cited real papers from memory that nothing backed. Putting
+    the key list in the prompt does not depend on the model choosing to call
+    anything.
+
+    Returns "" when there is no bibliography, which is itself the signal: the
+    citation instructions below only make sense once something is citable.
+    """
+    if specialist not in _BIB_SPECIALISTS:
+        return ""
+    from ...config import get_settings
+    from ...home import find_workspace
+
+    bib_path = find_workspace(paper_id, get_settings().workspace_root) / "literature.bib"
+    if not bib_path.is_file():
+        return ""
+    try:
+        text = bib_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+
+    entries: list[tuple[str, str, str, str]] = []
+    for block in text.split("\n@"):
+        block = block if block.lstrip().startswith("@") else "@" + block
+        m = _BIB_ENTRY_RE.search(block)
+        if not m:
+            continue
+        fields = {k.lower(): v.strip().rstrip(",").strip('{}" ') for k, v in _BIB_FIELD_RE.findall(block)}
+        entries.append((m.group(1), fields.get("year", ""), fields.get("title", ""), fields.get("e2er_source", "")))
+    if not entries:
+        return ""
+
+    # The template's method sources first, so a long list never cuts them off.
+    entries.sort(key=lambda e: e[3] != "template")
+    shown = entries[:limit]
+    lines = [f"- \\cite{{{k}}}  {y or '????'}  {t[:110]}{_SOURCE_MARK.get(src, '')}" for k, y, t, src in shown]
+    more = f"\n  ... and {len(entries) - limit} more in literature.bib." if len(entries) > limit else ""
+    return (
+        f"## Citable References ({len(entries)} in literature.bib)\n"
+        "These keys are the ONLY ones that resolve. Cite them exactly as shown. "
+        "A key that is not in this list does not compile — LaTeX emits an undefined "
+        "reference and the citation gate reports it as missing_in_bib. Do not cite "
+        "from memory.\n"
+        'If you need a work that is not here, run `e2er-lit search "<query>"` first; '
+        "that records it and makes its key citable.\n"
+        + (
+            "Entries marked [method source] are the methods literature of this study's template: where the "
+            "paper describes a method the study used (in the methods or data section), cite its source from "
+            "these. Cite only the methods the study used; leave the others out.\n"
+            if any(e[3] == "template" for e in entries)
+            else ""
+        )
+        + "\n".join(lines)
+        + more
+    )
+
+
+#: Backends whose tool loop runs in-process (the model's final answer is plain text we hold).
+_SDK_BACKENDS = frozenset({"anthropic", "openrouter"})
+#: A final answer shorter than this is a sign-off ("Done."), not the document.
+_MIN_ANSWER_CHARS = 300
+
+
+def _keep_answer_as_markdown_output(workspace: Path, specialist: str, expected: str, answer: str) -> bool:
+    """Save the specialist's final answer as its Markdown output when it wrote no file.
+
+    Open models on OpenRouter (DeepSeek V4 Pro, 2026-10-10) sometimes answer a
+    reviewer's work order with the whole review as their reply and never call
+    ``write_file``: the contract check then failed "file not written" and the
+    retry cost a whole new review. For a Markdown output the reply is the
+    document, so it is written there verbatim, and the run log says so. JSON,
+    LaTeX and scripts are never filled this way: their contracts check content
+    that a chat reply is not.
+    """
+    from ..specialists.registry import SPECIALIST_ARTIFACTS
+
+    target = expected or SPECIALIST_ARTIFACTS.get(specialist, "")
+    text = (answer or "").strip()
+    if not target.endswith(".md") or len(text) < _MIN_ANSWER_CHARS:
+        return False
+    path = (workspace / target).resolve()
+    root = workspace.resolve()
+    if root not in path.parents or path.exists():
+        return False
+    if _find_output_file(workspace, specialist, target):  # written, but under a subfolder
+        return False
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text + "\n", encoding="utf-8", newline="\n")
+    logger.warning("%s: wrote no %s; its final answer (%d chars) was saved as that file", specialist, target, len(text))
+    return True
+
+
+def _find_output_file(workspace: Path, specialist: str, expected: str) -> str:
+    """Locate the specialist's canonical artifact in the workspace.
+
+    Looks first at the expected path. If the model nested the file in a
+    subdirectory (CLI backend behaviour observed May 2026: writes to
+    `workspace/<specialist>/<artifact>` or similar despite explicit "no
+    subdirectories" instruction), recover by scanning the workspace for
+    any file matching the basename and moving it to the canonical location.
+    """
+    from ..specialists.registry import SPECIALIST_ARTIFACTS
+
+    target = expected or SPECIALIST_ARTIFACTS.get(specialist, "")
+    if not target:
+        return ""
+
+    canonical = workspace / target
+    if canonical.exists():
+        return str(canonical)
+
+    # Recovery: find by basename, prefer shortest path (least nesting),
+    # ignore replication/ (legitimate subdir).
+    basename = Path(target).name
+    candidates = [p for p in workspace.rglob(basename) if p.is_file() and "replication" not in p.parts]
+    if not candidates:
+        return ""
+    candidates.sort(key=lambda p: len(p.parts))
+    found = candidates[0]
+    logger.warning(
+        "%s: artifact found at %s instead of canonical %s — moving to canonical location",
+        specialist,
+        found.relative_to(workspace),
+        target,
+    )
+    canonical.parent.mkdir(parents=True, exist_ok=True)
+    found.rename(canonical)
+    return str(canonical)
+
+
+def _sandbox_blocked(specialist: str, backend_name: str, error: str, diagnostic: str) -> Exception:
+    """The pause for a call whose writes the backend's sandbox refused, with the sentence the researcher reads."""
+    from ...modules.llm.plan_limit import SandboxBlockedError
+    from .. import labels
+
+    status = (
+        f"Paused: the sandbox of the AI command-line tool refused to let {labels.specialist(specialist)} write "
+        f"its files, and every further attempt would meet the same refusal. {diagnostic} "
+        "Press Resume once this is fixed."
+    ).strip()
+    return SandboxBlockedError(backend_name, error, status, specialist=specialist)
+
+
+def _timed_out(specialist: str, backend_name: str, error: str, seconds: float) -> Exception:
+    """The pause for a call that ran into its time limit, with the sentence the researcher reads."""
+    import re as _re
+
+    from ...modules.llm.plan_limit import CallTimedOutError
+    from .. import labels
+
+    m = _re.search(r"limit (\d+)s", error)
+    limit = int(m.group(1)) if m else int(seconds)
+    minutes = max(1, round(limit / 60))
+    who = labels.specialist(specialist)
+    status = (
+        f"Paused: one call ran into its time limit ({minutes} minutes, {limit:,} s) and was stopped ({who}). "
+        "The files it wrote are kept. Press Resume to give it a new attempt; to allow more time, set "
+        f"[timeouts] {specialist} = <minutes> in the template (or CLAUDE_CODE_TIMEOUT / CODEX_TIMEOUT in .env)."
+    )
+    return CallTimedOutError(backend_name, error, status, specialist=specialist)

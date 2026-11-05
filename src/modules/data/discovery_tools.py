@@ -1,0 +1,325 @@
+"""Data module — discovery + unified fetch tools (M3a).
+
+Agents discover which data sources fit the research question via
+``list_data_sources`` (served from the registry catalog), then pull series
+data through a single ``fetch_data`` tool. Allium stays its own guarded
+``query_allium`` tool — the catalog tells the agent to use that for
+blockchain data.
+
+This keeps the data-specialist context tiny (two tools) and lets new
+providers appear in the catalog with zero added context.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Any
+
+from ...logging_config import get_logger
+from ..llm.base import ToolHandler
+
+logger = get_logger(__name__)
+
+DATA_DISCOVERY_TOOLS: list[dict[str, Any]] = [
+    {
+        "name": "list_data_sources",
+        "description": (
+            "List the structured data sources available for this paper and what each is "
+            "for. Call this FIRST, in light of the research question, to decide which "
+            "source(s) to use. Returns each source's name, purpose, and (for series "
+            "sources) the methods and parameters you can pass to fetch_data."
+        ),
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "fetch_data",
+        "description": (
+            "Fetch public series data (macro, markets) from a source listed by "
+            "list_data_sources. For blockchain/on-chain data use query_allium instead — "
+            "fetch_data does not handle Allium. Set materialize=true to also store the "
+            "fetched rows as a table in this paper's data.db, so you can join/aggregate it "
+            "later with query_data alongside the researcher's own data. At most "
+            "50 rows come back in the reply (with the total); a larger load is complete "
+            "only in data.db, so materialize it."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "provider": {"type": "string", "description": "Source name, e.g. 'fred' or 'yfinance'"},
+                "method": {
+                    "type": "string",
+                    "description": "Method on that source (see its card from list_data_sources)",
+                },
+                "params": {
+                    "type": "object",
+                    "description": "Method parameters (see the card), e.g. {'series_id': 'CPIAUCSL'}",
+                },
+                "materialize": {
+                    "type": "boolean",
+                    "description": "If true, persist the fetched rows into data.db as a queryable table.",
+                },
+                "table": {
+                    "type": "string",
+                    "description": "Optional table name for materialize (default: provider_method[_key]).",
+                },
+            },
+            "required": ["provider", "method"],
+        },
+    },
+]
+
+
+#: Rows of a fetch that go back to the model. The rest stay in data.db (materialize=true):
+#: a USGS load of 277,935 events sent in full exceeded OpenRouter's 8 MB request limit and
+#: failed the specialist (0.16.0 demo run, 2026-10-13).
+PREVIEW_ROWS = 50
+
+
+#: Characters of one text field that go back to the model. A Project Gutenberg load returns whole
+#: novels: ten of them in one reply passed OpenRouter's 8 MB request limit (2026-10-13 demo).
+PREVIEW_CHARS = 2000
+
+
+def _shorten(item: Any) -> tuple[Any, int]:
+    """An item with every text field cut to PREVIEW_CHARS, and how many fields were cut."""
+    if not isinstance(item, dict):
+        return item, 0
+    out, cut = {}, 0
+    for k, v in item.items():
+        if isinstance(v, str) and len(v) > PREVIEW_CHARS:
+            out[k] = v[:PREVIEW_CHARS] + f"… [{len(v) - PREVIEW_CHARS} more characters]"
+            cut += 1
+        else:
+            out[k] = v
+    return out, cut
+
+
+def _preview(envelope: Any, materialized: str | None) -> Any:
+    """The envelope with at most PREVIEW_ROWS of its items, each text field cut to PREVIEW_CHARS, and the total."""
+    if not isinstance(envelope, dict):
+        return envelope
+    items = envelope.get("items")
+    if not isinstance(items, list):
+        return envelope
+    shortened = [_shorten(i) for i in items[:PREVIEW_ROWS]]
+    cut = sum(n for _, n in shortened)
+    if cut:
+        where = (
+            f"the full texts are in data.db table {materialized}; read them with query_data or a script"
+            if materialized
+            else "set materialize=true to keep the full texts in data.db"
+        )
+        envelope = {
+            **envelope,
+            "items": [i for i, _ in shortened] + items[PREVIEW_ROWS:],
+            "note_texts": f"{cut} text field(s) are cut to {PREVIEW_CHARS} characters here; {where}.",
+        }
+        items = envelope["items"]
+    if len(items) <= PREVIEW_ROWS:
+        return envelope
+    where = (
+        f"all {len(items)} rows are in data.db table {materialized}; use query_data for them"
+        if materialized
+        else "set materialize=true to keep all rows in data.db and query them with query_data"
+    )
+    return {
+        **envelope,
+        "items": items[:PREVIEW_ROWS],
+        "items_total": len(items),
+        "items_returned": PREVIEW_ROWS,
+        "note": f"Only the first {PREVIEW_ROWS} of {len(items)} rows are shown here; {where}.",
+    }
+
+
+class SeriesDataToolHandler(ToolHandler):
+    """Handles list_data_sources + fetch_data. One instance per specialist run.
+
+    Budgeted like the literature tools — public APIs are rate-limited and an
+    unsteered model can over-fetch.
+    """
+
+    _MAX_FETCHES = 20
+
+    def __init__(self, workspace: Path | None = None) -> None:
+        self._fetch_calls = 0
+        self._workspace = workspace
+
+    def can_handle(self, tool_name: str) -> bool:
+        return tool_name in {"list_data_sources", "fetch_data"}
+
+    async def handle(self, tool_name: str, tool_input: dict[str, Any]) -> str:
+        if tool_name == "list_data_sources":
+            return self._list_sources()
+        if tool_name == "fetch_data":
+            if self._fetch_calls >= self._MAX_FETCHES:
+                return json.dumps(
+                    {
+                        "error": f"fetch_data budget exhausted ({self._MAX_FETCHES} calls). "
+                        "Proceed with the data you have.",
+                    }
+                )
+            self._fetch_calls += 1
+            return await self._fetch(tool_input)
+        return json.dumps({"error": f"unknown tool: {tool_name}"})
+
+    def _list_sources(self) -> str:
+        from ...config import get_settings
+        from .registry import data_catalog
+
+        sources = data_catalog(get_settings())
+        if not sources:
+            return json.dumps({"sources": [], "note": "No structured data sources are configured for this paper."})
+        return json.dumps({"sources": sources}, indent=2)
+
+    async def _fetch(self, inp: dict[str, Any]) -> str:
+        from ...config import get_settings
+        from .registry import series_fetchers
+
+        provider = (inp.get("provider") or "").strip().lower()
+        method = (inp.get("method") or "").strip()
+        params = inp.get("params") or {}
+        if not provider or not method:
+            return json.dumps({"error": "both 'provider' and 'method' are required; call list_data_sources first"})
+        if provider == "allium":
+            return json.dumps(
+                {"error": "use the query_allium tool for blockchain data — fetch_data does not handle Allium"}
+            )
+
+        fetchers = {f.name: f for f in series_fetchers(get_settings())}
+        fetcher = fetchers.get(provider)
+        if fetcher is None:
+            return json.dumps(
+                {"error": f"unknown or unavailable data source '{provider}'; call list_data_sources for the list"}
+            )
+        from .sources.runtime import KitFetcher, table_sink
+
+        try:
+            if inp.get("materialize") and self._workspace is not None and isinstance(fetcher, KitFetcher):
+                # A load that works in batches (Project Gutenberg texts) writes each batch into the
+                # table, so a call that is stopped keeps what it loaded.
+                table = self._table_name(provider, method, params, inp.get("table"))
+                envelope = await fetcher.fetch(method, params, sink=table_sink(self._workspace, table))
+            else:
+                envelope = await fetcher.fetch(method, params)
+        except KeyError as e:
+            return json.dumps({"error": f"missing required parameter {e} for {provider}.{method}"})
+        except Exception as e:
+            logger.warning("fetch_data %s.%s failed: %s", provider, method, e)
+            return json.dumps({"error": str(e)})
+
+        load = envelope.pop("_load_record", None) if isinstance(envelope, dict) else None
+        materialized = None
+        if inp.get("materialize"):
+            materialized = await self._materialize(provider, method, params, inp.get("table"), envelope)
+            if materialized:
+                envelope = {**envelope, "materialized_table": materialized}
+        await self._record(fetcher, provider, method, params, envelope, load, materialized)
+        return json.dumps(_preview(envelope, materialized), default=str)
+
+    async def _record(
+        self,
+        fetcher: Any,
+        provider: str,
+        method: str,
+        params: dict[str, Any],
+        envelope: dict[str, Any],
+        load: dict[str, Any] | None,
+        table: str | None,
+    ) -> None:
+        """Record a fetch that returned rows in the study's data_sources.json (see load_record.py)."""
+        if self._workspace is None or not isinstance(envelope, dict) or envelope.get("error"):
+            return
+        items = envelope.get("items") or []
+        if not items:
+            return
+        from .load_record import fred_load, now_utc, try_record, yfinance_load
+
+        now = now_utc()
+        entry: dict[str, Any] | None = None
+        if provider == "gmd" and method == "series" and load:
+            entry = {**load, "retrieved_at": now}
+        elif load and getattr(fetcher, "source", None) is not None:
+            # A connector-kit source: its operation wrote the record (sources/runtime.py).
+            entry = {**load, "retrieved_at": load.get("retrieved_at") or now}
+        elif provider == "fred" and method == "observations" and params.get("series_id"):
+            meta: dict[str, str] = {}
+            info = getattr(getattr(fetcher, "_provider", None), "citation_info", None)
+            if info is not None:
+                meta = await info(params["series_id"])
+            entry = fred_load(str(params["series_id"]), now, **meta)
+        elif provider == "yfinance" and method in {"history", "fundamentals", "dividends"} and params.get("ticker"):
+            what = {
+                "history": "daily prices"
+                if params.get("interval", "1d") == "1d"
+                else f"prices at interval {params.get('interval')}",
+                "fundamentals": f"annual {str(params.get('statement', 'income')).replace('_', ' ')}",
+                "dividends": "dividends",
+            }[method]
+            entry = yfinance_load(str(params["ticker"]), now, what=what)
+        if entry is None:
+            return
+        entry = {**entry, "table": table, "rows": len(items)}
+        if try_record(self._workspace, entry) is None:
+            envelope["recorded_in"] = ["data_sources.json"]
+            source = getattr(fetcher, "source", None)
+            if load and source is not None:
+                self._record_kit_source(source, load, table, envelope)
+
+    def _record_kit_source(
+        self, source: Any, load: dict[str, Any], table: str | None, envelope: dict[str, Any]
+    ) -> None:
+        """What `e2er-data` does after a connector-kit load: the dictionary entry and the citation.
+
+        fetch_data (the API backends) recorded only data_sources.json, so a study on
+        OpenRouter cited no catalogue for its USGS data (0.16.0 demo, 2026-10-13).
+        """
+        from .sources.runtime import RecordError, add_citation, record_in_dictionary
+
+        assert self._workspace is not None
+        try:
+            if table:
+                record_in_dictionary(self._workspace, table, source, load)
+                envelope["recorded_in"].append("data_dictionary.json")
+            if source.bibtex:
+                envelope["citation_added"] = add_citation(self._workspace, source)
+                envelope["cite_key"] = source.cite_key
+        except (RecordError, OSError) as e:
+            envelope["record_error"] = f"{type(e).__name__}: {e}"
+
+    @staticmethod
+    def _table_name(provider: str, method: str, params: dict[str, Any], table: str | None) -> str:
+        from ...db.paper_data_db import sanitize_table_name
+
+        if not table:
+            key = params.get("series_id") or params.get("symbol") or params.get("ticker") or ""
+            table = f"{provider}_{method}_{key}" if key else f"{provider}_{method}"
+        return sanitize_table_name(table)
+
+    async def _materialize(
+        self,
+        provider: str,
+        method: str,
+        params: dict[str, Any],
+        table: str | None,
+        envelope: dict[str, Any],
+    ) -> str | None:
+        """Persist a fetched series' rows into the paper's data.db. Returns the
+        table name on success, else None (best-effort; never raises into the loop)."""
+        if self._workspace is None:
+            return None
+        if envelope.get("error"):
+            return None
+        items = envelope.get("items") or []
+        if not items or not isinstance(items[0], dict):
+            return None
+        from ...db.paper_data_db import materialize_rows
+
+        table = self._table_name(provider, method, params, table)
+        try:
+            rows = await materialize_rows(self._workspace, table, items)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("fetch_data materialize %s.%s failed: %s", provider, method, e)
+            return None
+        logger.info("Materialized %d rows from %s.%s into data.db table %s", rows, provider, method, table)
+        return table

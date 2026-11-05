@@ -1,0 +1,562 @@
+"""The researcher step: where a run stops for the person whose research it is.
+
+At a researcher step (a `researcher` or `preregister` step in the template, or a
+stage named with `--review-at`) the run pauses. The researcher can
+
+  * approve — the run continues;
+  * edit one of the step's files — the edit is saved in the workspace and the
+    following specialists work from it;
+  * give an instruction — it is kept in ``researcher_instructions.md`` and every
+    later specialist and the strategist receive it;
+  * send a step back — a template step or a specialist runs again with the
+    researcher's remark, and the run stops at the same researcher step again.
+    At a failed check (kinds ``gate``, ``numbers``, ``deviation``) it does
+    not: the check runs again on the new output, and the run continues when
+    it passes and stops here again only when it fails.
+
+A study that finished, failed or stopped can be sent back as well:
+``apply_rerun`` reruns one template step and every step after it with the
+researcher's remark (at a stop, in place of that stop), and the run stops at the next researcher step, which needs
+approving again (``e2er rerun <id> --from STEP --remark "…"``).
+
+The run also stops here when a specialist's output still fails its contract
+after the last attempt (kind ``contract``, step ``output_contract``): approving
+takes the output as it is (recorded, and marked as failing its contract in the
+dossier); a send-back of the failed specialist, or a plain resume, gives it
+fresh attempts.
+
+And it stops here when the number check still finds numbers in the paper's
+tables that differ from the results files after the automatic correction
+(kind ``numbers``, step ``number_check``, governance ``full``): approving
+continues with those mismatches, each recorded in the dossier as the
+researcher's decision; an edit, an instruction or a send-back is followed by
+the check running again. It stops the same way when the paper has rendered
+results tables and the check traced no cell in any of them (say, the draft
+``\\input``-s none of them): approving continues without the table check, and
+the dossier records that decision.
+
+Every action is written to the event log as ``researcher_action``; the dossier
+lists them as steps of type ``researcher``, so a reader sees where the
+researcher decided and where the AI worked.
+"""
+
+from __future__ import annotations
+
+import hashlib
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+
+from .state import PipelineState
+
+INSTRUCTIONS_FILE = "researcher_instructions.md"
+#: The researcher step a run stops at when a specialist's output still fails its
+#: contract after the last attempt (kind ``contract``; see runner._stop_for_contract).
+CONTRACT_STEP = "output_contract"
+#: The researcher step a run stops at when the number check (tables against the
+#: results files) still fails after the automatic correction, under governance
+#: ``full`` (kind ``numbers``; see runner._stop_at_number_check).
+NUMBERS_STEP = "number_check"
+#: What a researcher can send back from the number check, beside the earlier steps:
+#: the drafter, the table layout (section_writer writes table_spec.json) and the
+#: work that produced the results.
+NUMBERS_SENDABLE = ("paper_drafter", "section_writer", "econometrics_specialist", "data_analyst")
+ACTIONS = ("approve", "edit", "instruction", "send_back")
+#: Stops at a failed check: a send-back there reruns the specialist, then the check, and the run
+#: continues when the check passes (stopping here again only when it fails).
+CHECK_KINDS = ("gate", "numbers", "deviation")
+_EDITABLE_SUFFIXES = (".md", ".tex", ".json", ".txt", ".bib")
+#: e2er's own record of the run, never offered for editing at a stop.
+_NOT_THE_STUDYS = frozenset({"manifest.json"})
+
+
+class ResearcherActionError(ValueError):
+    """An action that cannot be applied (no pending step, unknown file, …)."""
+
+
+def _sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _now() -> str:
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def instructions_block(workspace: Path) -> str:
+    """The researcher's instructions, as a prompt section; empty when there are none."""
+    p = workspace / INSTRUCTIONS_FILE
+    if not p.is_file():
+        return ""
+    text = p.read_text(encoding="utf-8").strip()
+    if not text:
+        return ""
+    return (
+        "## Instructions from the researcher\n"
+        "The researcher whose study this is gave these instructions during the run. "
+        "They take precedence over earlier plans; follow them.\n\n" + text
+    )
+
+
+def contract_reasons(failures: list[dict[str, Any]]) -> list[str]:
+    """One line per attempt of each specialist whose output failed its contract, for the researcher."""
+    lines: list[str] = []
+    for f in failures:
+        attempts = f.get("attempts") or []
+        for a in attempts:
+            what = "; ".join(a.get("violations") or []) or (a.get("error") or "no reason recorded")
+            lines.append(f"{f.get('specialist')}, attempt {a.get('attempt')} of {len(attempts)}: {what}")
+    return lines
+
+
+def _plain_number(value: str) -> str:
+    """``17.0`` → ``17``; anything else as it is."""
+    text = str(value)
+    try:
+        f = float(text)
+    except ValueError:
+        return text
+    return str(int(f)) if f.is_integer() and abs(f) < 1e15 else text
+
+
+def mismatch_key(m: Any) -> str:
+    """One mismatch of the number check, as a key: the cell, the table's value, the source key."""
+    get = m.get if isinstance(m, dict) else lambda k: getattr(m, k, "")
+    return f"{get('table_context')}|{get('draft_value')}|{get('source_key')}"
+
+
+def mismatch_record(m: Any) -> dict[str, Any]:
+    """A mismatch of the number check for the researcher and the dossier."""
+    source_key = str(getattr(m, "source_key", ""))
+    source_file = source_key.split(".json", 1)[0] + ".json" if ".json" in source_key else ""
+    return {
+        "cell": str(getattr(m, "table_context", "")),
+        "in_table": str(getattr(m, "draft_value", "")),
+        "in_results": _plain_number(str(getattr(m, "source_value", ""))),
+        "source_key": source_key,
+        "source_file": source_file,
+        "key": mismatch_key(m),
+    }
+
+
+def untraced_key(tables: list[str]) -> str:
+    """The number check's "no table cell traced" finding, as a key: the rendered tables it concerns."""
+    return "untraced|" + ",".join(sorted(tables))
+
+
+def untraced_record(report: Any) -> dict[str, Any]:
+    """The "no table cell traced" finding, for the researcher and the dossier."""
+    tables = list(getattr(report, "rendered_tables", []) or [])
+    return {
+        "reason": str(getattr(report, "untraced_reason", "")),
+        "rendered_tables": tables,
+        "not_in_draft": list(getattr(report, "rendered_tables_not_in_draft", []) or []),
+        "key": untraced_key(tables),
+    }
+
+
+def describe_mismatch(rec: dict[str, Any]) -> str:
+    """One line per mismatch, as the researcher reads it."""
+    return (
+        f"{rec.get('cell')}: the table says {rec.get('in_table')}, the results say {rec.get('in_results')} "
+        f"({rec.get('source_key')})"
+    )
+
+
+def _accepted_outputs(workspace: Path, state: PipelineState) -> list[dict[str, Any]]:
+    """What the researcher approves at a contract stop: per specialist, its files and the violations left now."""
+    from ..specialists.contract_check import check_specialist_artifacts
+
+    out = []
+    for f in (state.metadata.get("contract_pause") or {}).get("failed") or []:
+        name = f.get("specialist", "")
+        now = [f"{c.artifact}: {c.reason}" for c in check_specialist_artifacts(workspace, name) if not c.ok]
+        files = [
+            {"file": n, "sha256": _sha256((workspace / n).read_bytes())}
+            for n in f.get("files") or []
+            if (workspace / n).is_file()
+        ]
+        out.append(
+            {
+                "specialist": name,
+                # True: the output stands although it fails its contract (the
+                # researcher's decision). False: an edit made it pass.
+                "contract_failed": bool(now),
+                "violations": now,
+                "attempts": len(f.get("attempts") or []),
+                "files": files,
+            }
+        )
+    return out
+
+
+@dataclass(frozen=True)
+class PendingReview:
+    stage: str
+    kind: str  # researcher | preregister | review_at | gate | deviation | contract | numbers
+    files: tuple[str, ...]
+
+
+def pending_review(
+    workspace: Path, state: PipelineState, step_files: dict[str, tuple[str, ...]] | None = None
+) -> PendingReview | None:
+    """The researcher step the run is currently stopped at, if any."""
+    stage = state.pending_review_stage
+    if not stage:
+        return None
+    meta = state.metadata.get("review", {})
+    kind = meta.get("kind", "review_at")
+    files = tuple(meta.get("files") or (step_files or {}).get(stage, ()))
+    if not files:
+        # --review-at pause: offer the step's text artifacts that exist.
+        files = tuple(
+            sorted(
+                p.name
+                for p in workspace.iterdir()
+                if p.is_file()
+                and p.suffix in _EDITABLE_SUFFIXES
+                and not p.name.startswith(".")
+                and p.name not in _NOT_THE_STUDYS
+            )
+        )
+    return PendingReview(stage=stage, kind=kind, files=files)
+
+
+def _allowed(workspace: Path, pending: PendingReview, file: str) -> Path:
+    if not file or "/" in file or file.startswith(".") or file not in pending.files:
+        raise ResearcherActionError(f"{file!r} is not one of this step's files: {', '.join(pending.files) or 'none'}")
+    return workspace / file
+
+
+def apply_action(
+    workspace: Path, state: PipelineState, action: dict[str, Any], *, sendable: list[str] | None = None
+) -> dict[str, Any]:
+    """Apply one researcher action to the workspace and state; return the event payload.
+
+    The caller logs the payload as a ``researcher_action`` event, saves the
+    state, and (for approve and send_back) resumes the run.
+    """
+    pending = pending_review(workspace, state)
+    if pending is None:
+        raise ResearcherActionError("the run is not stopped at a researcher step")
+    kind = action.get("action")
+    if kind not in ACTIONS:
+        raise ResearcherActionError(f"unknown action {kind!r} (one of {', '.join(ACTIONS)})")
+    payload: dict[str, Any] = {"action": kind, "step": pending.stage, "at": _now()}
+
+    if kind == "approve":
+        state.metadata.pop("sent_back", None)
+        if pending.kind == "deviation":
+            # The researcher keeps a change to the pre-registered plan: the
+            # decision and each changed file (SHA-256 frozen and approved) go
+            # into the lock and, through this event, the dossier.
+            from .preregistration import approve_deviations
+
+            approved = approve_deviations(workspace)
+            payload.update(decision="deviation_approved", deviations=approved)
+            state.metadata.pop("preregistration_deviation", None)
+            state.metadata.pop("review", None)
+        if pending.kind == "numbers":
+            # The researcher continues with the tables as they are: each mismatch
+            # is recorded (dossier) and the check lets exactly these through.
+            check = state.metadata.get("number_check") or {}
+            mismatches = list(check.get("mismatches") or [])
+            payload.update(decision="numbers_accepted", mismatches=mismatches)
+            keys = state.metadata.setdefault("numbers_accepted", [])
+            keys.extend(m["key"] for m in mismatches if m.get("key") and m["key"] not in keys)
+            untraced = check.get("untraced")
+            if isinstance(untraced, dict) and untraced.get("key"):
+                # The tables went unchecked (no cell traced): the researcher
+                # continues without the table check, for exactly these tables.
+                payload.update(untraced=untraced)
+                if untraced["key"] not in keys:
+                    keys.append(untraced["key"])
+        if pending.kind == "contract":
+            # The researcher takes the output as it is: recorded for the dossier,
+            # each output that still fails its contract marked as such.
+            accepted = _accepted_outputs(workspace, state)
+            payload.update(decision="accepted_as_is", accepted=accepted)
+            state.metadata.setdefault("contract_accepted", []).extend({**a, "at": payload["at"]} for a in accepted)
+        state.approve(pending.stage)
+
+    elif kind == "edit":
+        path = _allowed(workspace, pending, str(action.get("file", "")))
+        content = action.get("content")
+        if not isinstance(content, str):
+            raise ResearcherActionError("an edit needs the new file content")
+        before = path.read_bytes() if path.is_file() else b""
+        after = content.encode("utf-8")
+        if before == after:
+            raise ResearcherActionError(f"{path.name} is unchanged")
+        path.write_bytes(after)
+        payload.update(file=path.name, sha256_before=_sha256(before) if before else None, sha256_after=_sha256(after))
+
+    elif kind == "instruction":
+        text = str(action.get("text", "")).strip()
+        if not text:
+            raise ResearcherActionError("an instruction needs text")
+        p = workspace / INSTRUCTIONS_FILE
+        prior = p.read_text(encoding="utf-8") if p.is_file() else ""
+        p.write_text(
+            prior + ("\n\n" if prior else "") + f"(at step {pending.stage}, {payload['at']}) {text}\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        payload.update(text=text)
+
+    elif kind == "send_back":
+        target = str(action.get("step", "")).strip()
+        remark = str(action.get("remark", "")).strip()
+        if not target or not remark:
+            raise ResearcherActionError("sending back needs the step and a remark")
+        if sendable is not None and target not in sendable:
+            raise ResearcherActionError(f"{target!r} cannot be sent back from here (one of {', '.join(sendable)})")
+        reruns = state.metadata.setdefault("rerun", [])
+        reruns.append({"target": target, "remark": remark})
+        state.metadata["sent_back"] = True
+        p = workspace / INSTRUCTIONS_FILE
+        prior = p.read_text(encoding="utf-8") if p.is_file() else ""
+        p.write_text(
+            prior
+            + ("\n\n" if prior else "")
+            + f"(for {target}, sent back at step {pending.stage}, {payload['at']}) {remark}\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        payload.update(target=target, remark=remark)
+        if pending.kind in CHECK_KINDS:
+            # At a failed check the run does not stop here again: the check runs on the new output.
+            payload.update(then="check_runs_again")
+
+    return payload
+
+
+#: Step kinds a rerun cannot start from: a researcher's own step is not work to redo.
+_NOT_RERUNNABLE = ("researcher", "preregister")
+
+
+def rerunnable_steps(spec: Any, mode: str) -> list[str]:
+    """The template steps a study can be run again from, in order (for the dashboard's choice)."""
+    return [s.name for s in spec.steps if s.kind not in _NOT_RERUNNABLE and not s.after and s.applies_to(mode)]
+
+
+def _withdraw_check_approvals(state: PipelineState, spec: Any, later: list[str]) -> None:
+    """The researcher's approvals at the checks of the steps that run again are withdrawn.
+
+    Table numbers continued with at the number check (it runs in the review
+    step, or in a check step of its own) and outputs kept as they are at a
+    contract stop: the steps produce new output, so the checks decide afresh
+    and stop again where they find something.
+    """
+    meta = state.metadata
+
+    def is_number_check(name: str) -> bool:
+        step = spec.step(name)
+        return name == "review" or (step is not None and getattr(step, "check", None) == "numbers")
+
+    if any(is_number_check(n) for n in later):
+        meta.pop("numbers_accepted", None)
+        meta.pop("numbers_patch_tried", None)
+        meta.pop("number_check", None)
+    # (Outputs kept at a contract stop in the initial phase: _reset_initial_phase.)
+    skips = [p for p in meta.get("contract_accepted_skip") or [] if p.get("phase") not in later]
+    if skips:
+        meta["contract_accepted_skip"] = skips
+    else:
+        meta.pop("contract_accepted_skip", None)
+    if "revision" in later:
+        meta.pop("deep_revision", None)  # a new revision step may run its deep revision round again
+
+
+def apply_rerun(workspace: Path, state: PipelineState, spec: Any, step: str, remark: str) -> dict[str, Any]:
+    """Send a study back to ``step``: it and every later step run again with ``remark``.
+
+    For a study that finished, failed or stopped. The step must be a template
+    step of the study's mode, and not a researcher step. A step that has not run
+    yet (the run failed or stopped before it) is accepted too: the run then
+    continues from its first unfinished step, with the remark. When the run is
+    stopped at a researcher step or a check, the rerun takes the place of that
+    stop (recorded as ``replaces``); the checks run again on the way. The
+    approvals of the step and of every later step are withdrawn, so the run
+    stops at the next researcher step again. The remark goes to
+    ``researcher_instructions.md`` for the specialists and into the event
+    returned for the dossier; the runner reruns the steps
+    (``_settle_researcher_decisions``). Nothing in the workspace is deleted.
+    """
+    step = str(step or "").strip()
+    remark = str(remark or "").strip()
+    if not step or not remark:
+        raise ResearcherActionError("a rerun needs the step to start from and a remark")
+    asked = step
+    step = step_for_rerun(spec, state.mode, step)
+    specialist = asked if asked != step else None
+    names = [s.name for s in spec.steps]
+    if step not in names:
+        raise ResearcherActionError(f"{step!r} is not a step of the template {spec.name} (one of {', '.join(names)})")
+    target = spec.step(step)
+    if target.kind in _NOT_RERUNNABLE:
+        raise ResearcherActionError(f"{step!r} is a researcher step; rerun the step before it")
+    if target.after:
+        raise ResearcherActionError(f"{step!r} runs inside another step; rerun that step")
+    if not target.applies_to(state.mode):
+        raise ResearcherActionError(f"{step!r} is not part of a {state.mode.replace('_', ' ')} run")
+    done = set(state.completed_stages) | set(state.approved_stages)
+    # Where the run picks up: the step, or an earlier one the failed or stopped run had not finished
+    # (a step that runs at every start, such as the estimation check, is never left unfinished).
+    open_ = [
+        n
+        for n in names
+        if spec.step(n).resumable
+        and spec.step(n).will_run(state.mode, done)
+        and spec.step(n).kind not in _NOT_RERUNNABLE
+    ]
+    start = min(names.index(step), names.index(open_[0])) if open_ else names.index(step)
+    later = names[names.index(step) :]
+    replaces = state.pending_review_stage
+    if replaces:
+        # The rerun takes the place of the stop the run waits at; its checks run again.
+        state.pending_review_stage = None
+        for key in ("contract_pause", "preregistration_deviation"):
+            state.metadata.pop(key, None)
+    state.approved_stages = [a for a in state.approved_stages if a not in later]
+    _withdraw_check_approvals(state, spec, later)
+    if any(spec.step(n).kind == "strategist" for n in later):
+        # The analysis runs again: so do the checks of its results that sit inside the dispatch
+        # (a gate with `after` naming the analysis, e.g. text_results, spatial_results).
+        again: set[str] | None = {"econometrics_specialist"}
+        if "initial" in later:
+            again = _reset_initial_phase(state, specialist)
+        for s in spec.steps:
+            if not s.after or (again is not None and not set(s.after) & again):
+                continue
+            # A check or stop inside the dispatch that reads work done again: it runs (stops) again.
+            if s.name in state.completed_stages:
+                state.completed_stages.remove(s.name)
+            if s.kind != "gate" and s.name in state.approved_stages:
+                state.approved_stages.remove(s.name)
+            state.metadata.pop(f"retried_{s.name}", None)
+    step_done = state.metadata.get("step_done")
+    before = list(step_done.get(step, [])) if isinstance(step_done, dict) else []
+    if isinstance(step_done, dict):
+        for name in later:  # a step run again runs all of its specialists
+            step_done.pop(name, None)
+    if specialist and target.kind == "specialists" and specialist in target.run:
+        # From a specialist of a fixed step: it and the ones after it run again, the earlier ones
+        # (that ran) keep their output. In a parallel step none runs after another.
+        earlier = (
+            [n for n in target.run if n != specialist]
+            if target.parallel
+            else target.run[: target.run.index(specialist)]
+        )
+        kept = [n for n in earlier if step in state.completed_stages or n in before]
+        if kept:
+            state.metadata.setdefault("step_done", {})[step] = kept
+    state.metadata.setdefault("rerun", []).append({"target": step, "remark": remark})
+    state.metadata.pop("sent_back", None)
+    state.metadata.pop("review", None)
+    state.last_status = "in_progress"
+    at = _now()
+    p = workspace / INSTRUCTIONS_FILE
+    prior = p.read_text(encoding="utf-8") if p.is_file() else ""
+    for_whom = f"{specialist} in step {step}" if specialist else step
+    p.write_text(
+        prior + ("\n\n" if prior else "") + f"(for {for_whom}, rerun of the study, {at}) {remark}\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    reruns = [n for n in names[start:] if spec.step(n).applies_to(state.mode) and not spec.step(n).after]
+    payload: dict[str, Any] = {
+        "action": "rerun",
+        "step": step,
+        "target": step,
+        "remark": remark,
+        "at": at,
+        "reruns": reruns,
+    }
+    if replaces:
+        payload["replaces"] = replaces
+    if specialist:
+        payload["specialist"] = specialist
+    return payload
+
+
+def _reset_initial_phase(state: PipelineState, specialist: str | None) -> set[str] | None:
+    """The initial phase runs again: from ``specialist`` on, or (None) all of it, planned afresh.
+
+    The phase skips work orders recorded as done (``initial_done``) and checks whose
+    specialists have run (``done_specialists``). Before, a rerun cleared neither: on the
+    2026-10-14 text-analysis demo ``e2er rerun --from data_analyst`` resumed only the
+    unfinished text validator, and the data analyst never ran again. Now the named
+    specialist and every work order of the plan that runs after it (by the dispatch's
+    own order, see dispatcher.order_by_dependencies) lose their completion; earlier
+    ones keep it. Returns the specialists that run again, or None for all of them.
+    """
+    from ..specialists.contracts import WorkOrder
+    from ..specialists.dispatcher import order_by_dependencies
+
+    meta = state.metadata
+    meta.pop("pending_orders", None)  # a stop inside the phase is replaced by the rerun
+    raw = meta.get("initial_plan") or meta.get("initial_orders") or []
+    plan = [WorkOrder(**{**d, "paper_id": d.get("paper_id") or state.paper_id}) for d in raw if isinstance(d, dict)]
+    if not specialist or specialist not in {w.specialist for w in plan}:
+        # The whole step: the strategist plans it again, and nothing of it counts as done.
+        for name in ("initial_orders", "initial_done", "initial_plan", "done_specialists", "contract_accepted_orders"):
+            meta.pop(name, None)
+        return None
+
+    def key(w: WorkOrder) -> str:
+        return f"{w.specialist}\n{w.focus}"
+
+    ordered, _ = order_by_dependencies(plan)
+    first = min(w.parallel_group for w in ordered if w.specialist == specialist)
+    again = [w for w in ordered if w.specialist == specialist or w.parallel_group > first]
+    names = {w.specialist for w in again}
+    keys = {key(w) for w in again}
+    finished = "initial" in state.completed_stages
+    done_before = set(meta.get("initial_done") or [])
+    done_names = set(meta.get("done_specialists") or [])
+    meta["initial_orders"] = [w.model_dump() for w in plan]
+    meta["initial_done"] = [
+        key(w) for w in plan if key(w) not in keys and (finished or key(w) in done_before or w.specialist in done_names)
+    ]
+    meta["done_specialists"] = sorted(done_names - names)
+    accepted = [k for k in meta.get("contract_accepted_orders") or [] if k not in keys]
+    if accepted:
+        meta["contract_accepted_orders"] = accepted
+    else:
+        meta.pop("contract_accepted_orders", None)
+    return names
+
+
+def step_for_rerun(spec: Any, mode: str, name: str) -> str:
+    """The template step a rerun starts from, for a step name or a specialist's name.
+
+    A send-back offers specialists; ``e2er rerun --from`` takes steps. A
+    specialist named in a step's ``run`` maps to that step; one the strategist
+    dispatches (data analyst, paper drafter, ...) maps to the strategist step.
+    A name that fits more than one step is refused with the steps to choose
+    from; a name that fits none is returned as is (and refused as a step).
+    """
+    names = [s.name for s in spec.steps]
+    if name in names:
+        return name
+    in_run = [s for s in spec.steps if name in s.run]
+    if in_run:
+        here = [s.name for s in in_run if s.applies_to(mode) and not s.after]
+        candidates = here or [in_run[0].name]  # not in this mode: the step check says so
+    else:
+        from ..specialists.registry import SPECIALIST_ARTIFACTS
+
+        if name not in SPECIALIST_ARTIFACTS:
+            return name
+        candidates = [s.name for s in spec.steps if s.kind == "strategist" and s.applies_to(mode)]
+        if not candidates:
+            raise ResearcherActionError(
+                f"{name!r} does not run in the template {spec.name}; name a step ({', '.join(names)})"
+            )
+    if len(candidates) > 1:
+        raise ResearcherActionError(
+            f"{name} runs in more than one step ({', '.join(candidates)}); "
+            f"say which with --from {candidates[0]} or --from {candidates[-1]}"
+        )
+    return candidates[0]

@@ -1,0 +1,212 @@
+<div class="status-row">
+  <span class="status status-{{ paper.shown_status }}">{{ paper.shown_status | status_words }}</span>
+  {% if paper.internal_review %}<span class="muted review-score">e2er's internal quality review: {{ "%.1f" | format(paper.internal_review.score) }} of 10</span>{% endif %}
+  <div class="cost-meter">
+    {% if subscription %}
+      <div class="cost-label">No spending limit <span class="muted">{% if uncounted_key %}(Google bills your Gemini API key; e2er does not count the cost){% else %}(your subscription){% endif %}</span></div>
+    {% else %}
+      <div class="cost-label">
+        ${{ "%.2f"|format(cost_spent) }}
+        <span class="muted">of the ${{ "%.2f"|format(cost_cap) }} spending limit</span>
+      </div>
+      <div class="cost-bar">
+        <div class="cost-fill" style="width: {{ cost_pct }}%"></div>
+      </div>
+    {% endif %}
+  </div>
+  {% if can_cancel %}
+    <button class="btn-danger"
+            hx-post="/api/papers/{{ paper.id }}/cancel"
+            hx-confirm="Cancel this run? Its files are kept."
+            hx-swap="none">Cancel</button>
+  {% endif %}
+  {% if can_cancel_attempt %}
+    <button class="btn"
+            hx-post="/api/papers/{{ paper.id }}/cancel-attempt"
+            hx-confirm="Cancel this run for good? It cannot be resumed afterwards. Its files are kept, and you can archive it."
+            hx-swap="none">Cancel run</button>
+  {% endif %}
+  {% if can_resume and not awaiting_review and not budget_paused %}
+    <button class="btn-primary" id="resume"
+            hx-post="/api/papers/{{ paper.id }}/resume"
+            hx-confirm="Resume this run? It picks up at the first step that has not finished."
+            hx-swap="none">Resume</button>
+  {% endif %}
+</div>
+<span id="live-flags" hidden data-rerun="{{ 1 if rerun_open else 0 }}" data-running="{{ 1 if running else 0 }}"
+      data-budget="{{ 1 if budget_paused and can_resume else 0 }}" data-awaiting="{{ 1 if awaiting_review else 0 }}"></span>
+
+{% if pending_queries %}
+  <div class="waiting-box" id="pending-queries">
+    <span><strong>Data queries wait for your approval.</strong> A specialist wants to run these queries on the data warehouse; they run only after you approve them.</span>
+    <ul class="small">
+      {% for q in pending_queries %}
+        <li>
+          <code class="mono">{{ (q.query_sql or "")[:400] }}</code>
+          {% if q.estimated_rows %}<span class="muted">about {{ q.estimated_rows }} rows</span>{% endif %}
+          <button class="btn btn-small" data-query="{{ q.id }}" data-approve="1">Approve</button>
+          <button class="btn btn-small" data-query="{{ q.id }}" data-approve="0">Refuse</button>
+        </li>
+      {% endfor %}
+    </ul>
+  </div>
+{% endif %}
+
+{% if elsewhere %}
+  <div class="waiting-box elsewhere">
+    <span><strong>This run is working in another e2er window.</strong> {{ elsewhere_text }}
+      {% if elsewhere.port and not elsewhere.legacy %}If that page says this tab is not signed in, run <code class="tick">e2er --port {{ elsewhere.port }}</code> in a terminal: it opens that dashboard signed in.{% endif %}</span>
+    {% if elsewhere.port and not elsewhere.legacy %}<a class="btn" href="http://127.0.0.1:{{ elsewhere.port }}/papers/{{ paper.id }}" target="_blank" rel="noopener">Open it there</a>{% endif %}
+  </div>
+{% elif awaiting_review %}
+  <div class="waiting-box">
+    <span><strong>The run stopped for you.</strong> Read what the specialists wrote, change it if you want, and let it continue.</span>
+    <a class="btn-primary" href="/papers/{{ paper.id }}/review">Review now</a>
+  </div>
+{% elif paper.shown_status == "completed" %}
+  <div class="done-box">
+    <span><strong>The study is finished.</strong> Check it and publish it.</span>
+    <a class="btn-primary" href="/papers/{{ paper.id }}/finish">Verify and publish</a>
+  </div>
+{% endif %}
+
+{% if tp and tp.steps %}
+  <h2>Steps <span class="muted">{{ tp.template_label }}{% if tp.current %} · now: {{ tp.current }}{% endif %}</span></h2>
+  <ol class="steps">
+    {% for st in tp.steps %}
+      <li class="st-{{ st.state }}{% if st.sub %} st-sub{% endif %}">
+        <span class="st-mark" aria-hidden="true"></span>
+        <span><span class="st-name">{{ st.label }}</span><span class="st-kind">{{ st.kind }}</span></span>
+        <span class="st-note">
+          {% if st.state == "waiting" or (st.state == "failed" and awaiting_review) %}<a href="/papers/{{ paper.id }}/review">{{ st.note }} →</a>
+          {% else %}{{ st.note }}{% endif %}
+        </span>
+      </li>
+    {% endfor %}
+  </ol>
+  <div class="row-2">
+    <div>
+      <h3 class="h3">Specialists done <span class="muted">{{ tp.specialists_done | length }}</span></h3>
+      {% if tp.specialists_done or tp.specialists_failed %}
+        <ul class="chips">
+          {% for s in tp.specialists_done %}<li>{{ s | specialist_label }}</li>{% endfor %}
+          {% for s in tp.specialists_failed %}<li class="bad">{{ s | specialist_label }}: failed</li>{% endfor %}
+        </ul>
+      {% else %}<p class="muted">None yet.</p>{% endif %}
+    </div>
+    <div>
+      <h3 class="h3">Checks</h3>
+      {% if tp.checks %}
+        <ul class="chips">
+          {% for g in tp.checks %}<li class="{{ '' if g.ok or g.ok is none else 'bad' }}" title="{{ g.note }}">{{ g.label }}: {{ g.note if g.ok is none else ("passed" if g.ok else "failed") }}</li>{% endfor %}
+        </ul>
+      {% else %}<p class="muted">None run yet.</p>{% endif %}
+    </div>
+  </div>
+  {% if tp.rounds %}
+    <h3 class="h3">Rounds of improvement</h3>
+    <ol class="rounds">
+      {% for r in tp.rounds %}
+        <li class="round">
+          <strong>Round {{ r.round }}</strong>{% if r.specialists %}: {{ r.specialists | join(", ") }}{% endif %}{% if r.reason %} <span class="muted quoted" title="The strategist's words">({{ r.reason }})</span>{% endif %}
+          {% if r.ceiling %}<div class="round-check">Ceiling check: {{ r.ceiling }}{% if r.ceiling_reason %} <span class="muted quoted">({{ r.ceiling_reason }})</span>{% endif %}</div>{% endif %}
+          {% if r.pivot %}<div class="round-pivot">Change of approach: {{ r.pivot | join(", ") }}</div>{% endif %}
+          {% if r.pivot_refused %}<div class="round-pivot">Not run as part of the change of approach: {{ r.pivot_refused | join(", ") }} ({{ r.pivot_refused_why }})</div>{% endif %}
+          {% if r.ended %}<div class="round-check">The strategist ended the rounds here.</div>{% endif %}
+        </li>
+      {% endfor %}
+    </ol>
+  {% endif %}
+  {% if tp.self_critique %}
+    <p class="self-critique"><strong>Self-critique:</strong> {{ tp.self_critique.note }}</p>
+  {% endif %}
+  {% if tp.polish %}
+    <p class="polish"><strong>Polish:</strong> {{ tp.polish }}</p>
+  {% endif %}
+{% endif %}
+
+{% if progress %}
+  <div class="prog">
+    {% if progress.active %}
+      <div class="prog-now">
+        {% for a in progress.active %}
+          <span class="spinner" aria-hidden="true"></span>
+          <span class="prog-who">{{ a.name | specialist_label }}</span>
+          {% if a.minutes is not none %}<span class="muted">working for {{ a.minutes }} min</span>{% endif %}
+        {% endfor %}
+      </div>
+    {% elif not progress.terminal %}
+      <div class="prog-now"><span class="muted">Between steps…</span></div>
+    {% endif %}
+
+    {% if progress.elapsed_min is not none %}
+      <div class="muted prog-elapsed">{{ progress.elapsed_min }} min since the run started</div>
+    {% endif %}
+
+    {% if progress.phases and not (tp and tp.steps) %}
+      <ol class="phases">
+        {% for p in progress.phases %}
+          <li class="ph ph-{{ p.state }}">
+            <span class="ph-dot" aria-hidden="true"></span>{{ p.name | step_label }}
+          </li>
+        {% endfor %}
+      </ol>
+    {% endif %}
+  </div>
+{% endif %}
+
+{% if failure and failure.failed and not awaiting_review %}
+  <section class="fail fail-{{ failure.status }}">
+    <h3>{{ failure.status | status_words | capitalize }}</h3>
+    <p class="fail-head">{{ failure.headline }}</p>
+
+    {% if failure.specialists %}
+      <ul class="fail-list">
+        {% for s in failure.specialists %}
+          <li>
+            <span class="fail-who">{{ s.label }}</span>
+            <span class="fail-what">{{ s.violation }}</span>
+            {% if s.attempts %}
+              <span class="muted">{{ s.attempts }} attempt{{ "s" if s.attempts != 1 }}</span>
+            {% endif %}
+          </li>
+        {% endfor %}
+      </ul>
+    {% endif %}
+
+    {% for h in failure.hints %}
+      <p class="fail-hint">{{ h }}</p>
+    {% endfor %}
+
+    {% if failure.raw and failure.raw != failure.headline %}
+      <details class="tech" id="live-failure-details">
+        <summary>Technical details</summary>
+        <pre>{{ failure.raw }}</pre>
+      </details>
+    {% endif %}
+  </section>
+{% elif paper.last_error and not awaiting_review and not failure.failed %}
+  <details class="tech" id="live-error-details">
+    <summary>Technical details</summary>
+    <pre>{{ paper.last_error }}</pre>
+  </details>
+{% endif %}
+
+{# Stable ids: e2er.js keeps a panel the researcher opened open when the poll swaps this in again. #}
+<details class="events" id="live-events">
+<summary>What happened ({{ events | length }} most recent entries)</summary>
+{% if not events %}
+  <p class="muted">Nothing yet.</p>
+{% else %}
+<ol class="event-log">
+  {% for e in events %}
+    <li class="event">
+      <time>{{ e.created_at_short }}</time>
+      <span class="event-type">{{ e.event_type | event_label }}</span>
+      {% if e.specialist %}<span class="event-specialist">{{ e.specialist | specialist_label }}</span>
+      {% elif e.stage %}<span class="event-stage">{{ e.stage | step_label }}</span>{% endif %}
+    </li>
+  {% endfor %}
+</ol>
+{% endif %}
+</details>

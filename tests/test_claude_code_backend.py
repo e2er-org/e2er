@@ -1,0 +1,340 @@
+"""Tests for the Claude Code CLI backend.
+
+This is the v1/v2-style backend that lets users run the pipeline at $0/token
+under a Max plan. We mock the subprocess so the tests run offline ($0).
+"""
+
+from __future__ import annotations
+
+import json
+from unittest.mock import AsyncMock, MagicMock, patch
+
+
+def _settings_for_cli(monkeypatch, tmp_path):
+    """Force LLM_BACKEND=claude_code and clear settings cache."""
+    monkeypatch.setenv("LLM_BACKEND", "claude_code")
+    monkeypatch.setenv("CLAUDE_CODE_PATH", "/usr/local/bin/claude")
+    monkeypatch.setenv("CLAUDE_CODE_CWD", str(tmp_path))
+    monkeypatch.setenv("CLAUDE_CODE_TIMEOUT", "60")
+    from src.config import get_settings
+
+    get_settings.cache_clear()
+
+
+def _mock_proc(*, returncode: int = 0, stdout: bytes = b"", stderr: bytes = b""):
+    """Build a minimal asyncio subprocess mock."""
+    proc = MagicMock()
+    proc.returncode = returncode
+    proc.communicate = AsyncMock(return_value=(stdout, stderr))
+    proc.kill = MagicMock()
+    proc.wait = AsyncMock()
+    return proc
+
+
+# ---------------------------------------------------------------------------
+# Registry — config switch picks the right backend
+# ---------------------------------------------------------------------------
+
+
+def test_registry_returns_claude_code_when_configured(monkeypatch, tmp_path):
+    _settings_for_cli(monkeypatch, tmp_path)
+    from src.config import get_settings
+    from src.modules.llm.claude_code import ClaudeCodeBackend
+    from src.modules.llm.registry import get_backend
+
+    backend = get_backend(get_settings())
+    assert isinstance(backend, ClaudeCodeBackend)
+
+
+def test_allowed_tools_do_not_include_bare_bash():
+    """Security invariant: the CLI backend must NOT grant the unrestricted
+    `Bash` tool. Only narrow gatekeeper patterns (`Bash(e2er-data:*)` and
+    its back-compat shim `Bash(e2er-allium-query:*)`) are permitted. Bare
+    `Bash` would let the model run curl, ssh, sudo, etc. — defeating the
+    Allium guardrails and the broader security model.
+
+    Regression for the May 2026 NFT-paper run #10 review."""
+    from src.modules.llm.claude_code import _DEFAULT_ALLOWED_TOOLS
+
+    assert "Bash" not in _DEFAULT_ALLOWED_TOOLS, (
+        "Bare `Bash` allows unrestricted shell execution; this re-opens the "
+        "arbitrary-command surface that the wrapper pattern was added to close. "
+        f"Allowed tools: {_DEFAULT_ALLOWED_TOOLS}"
+    )
+    # The unified data gatekeeper must be present. We accept either
+    # `e2er-data` (new, v0.4+) or `e2er-allium-query` (legacy shim) so
+    # this test stays green across the v0.4 transition. v0.5 will remove
+    # the back-compat shim and tighten this to require `e2er-data`.
+    assert any("e2er-data" in t or "e2er-allium-query" in t for t in _DEFAULT_ALLOWED_TOOLS), (
+        "Data gatekeeper pattern missing — specialists will have no path to data "
+        f"sources in CLI mode. Allowed tools: {_DEFAULT_ALLOWED_TOOLS}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Happy path — CLI returns success → ToolLoopResult(success=True)
+# ---------------------------------------------------------------------------
+
+
+async def test_tool_loop_parses_successful_cli_output(monkeypatch, tmp_path):
+    _settings_for_cli(monkeypatch, tmp_path)
+
+    from src.modules.llm.claude_code import ClaudeCodeBackend
+
+    backend = ClaudeCodeBackend()
+    # Claude Code 2.x summary JSON has no `messages` array — only top-level
+    # metadata. `num_turns` is the only signal for tool calls (1 turn = no
+    # tools, N turns = N-1 tool uses). Verified against the real CLI on
+    # May 2026.
+    summary = {
+        "type": "result",
+        "subtype": "success",
+        "result": "I have written paper_plan.md.",
+        "is_error": False,
+        "num_turns": 3,  # 2 tool uses + 1 final assistant turn
+        "usage": {"input_tokens": 1234, "output_tokens": 567, "cache_read_input_tokens": 0},
+    }
+    stdout = (json.dumps({"type": "system"}) + "\n" + json.dumps(summary) + "\n").encode()
+    proc = _mock_proc(stdout=stdout)
+
+    with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
+        result = await backend.tool_loop(
+            system="System prompt",
+            messages=[{"role": "user", "content": "Do the thing."}],
+            tools=[],
+            tool_handler=None,
+            max_turns=20,
+        )
+
+    assert result.success
+    assert "paper_plan.md" in result.output
+    assert result.usage.input_tokens == 1234
+    assert result.usage.output_tokens == 567
+    assert result.tool_calls_made == 2
+    assert result.stop_reason == "end_turn"
+
+
+# ---------------------------------------------------------------------------
+# error_max_turns — CLI exits 0 but flags it didn't finish
+# ---------------------------------------------------------------------------
+
+
+async def test_tool_loop_detects_error_max_turns(monkeypatch, tmp_path):
+    _settings_for_cli(monkeypatch, tmp_path)
+    from src.modules.llm.claude_code import ClaudeCodeBackend
+
+    summary = {"subtype": "error_max_turns", "is_error": True, "result": "partial output"}
+    stdout = (json.dumps(summary) + "\n").encode()
+    proc = _mock_proc(stdout=stdout)
+
+    with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
+        backend = ClaudeCodeBackend()
+        result = await backend.tool_loop(
+            system="x",
+            messages=[{"role": "user", "content": "x"}],
+            tools=[],
+            tool_handler=None,
+            max_turns=5,
+        )
+
+    assert not result.success
+    assert "max_turns" in (result.error or "").lower()
+    assert result.stop_reason == "max_turns"
+
+
+# ---------------------------------------------------------------------------
+# Subprocess failure — non-zero exit code
+# ---------------------------------------------------------------------------
+
+
+async def test_tool_loop_handles_nonzero_exit(monkeypatch, tmp_path):
+    _settings_for_cli(monkeypatch, tmp_path)
+    from src.modules.llm.claude_code import ClaudeCodeBackend
+
+    proc = _mock_proc(returncode=1, stdout=b"", stderr=b"Authentication failed: not logged in")
+
+    with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
+        backend = ClaudeCodeBackend()
+        result = await backend.tool_loop(
+            system="x",
+            messages=[{"role": "user", "content": "x"}],
+            tools=[],
+            tool_handler=None,
+            max_turns=5,
+        )
+
+    assert not result.success
+    assert "Authentication" in (result.error or "")
+
+
+# ---------------------------------------------------------------------------
+# CLI not installed — clean error message
+# ---------------------------------------------------------------------------
+
+
+async def test_tool_loop_handles_cli_not_found(monkeypatch, tmp_path):
+    _settings_for_cli(monkeypatch, tmp_path)
+    from src.modules.llm.claude_code import ClaudeCodeBackend
+
+    with patch("asyncio.create_subprocess_exec", AsyncMock(side_effect=FileNotFoundError())):
+        backend = ClaudeCodeBackend()
+        result = await backend.tool_loop(
+            system="x",
+            messages=[{"role": "user", "content": "x"}],
+            tools=[],
+            tool_handler=None,
+            max_turns=5,
+        )
+
+    assert not result.success
+    assert "not found" in (result.error or "").lower() or "claude" in (result.error or "").lower()
+
+
+# ---------------------------------------------------------------------------
+# Timeout — subprocess killed
+# ---------------------------------------------------------------------------
+
+
+async def _timeout_result(monkeypatch, tmp_path, *, timeout: float):
+    """Drive tool_loop into its TimeoutError branch with a given deadline."""
+    _settings_for_cli(monkeypatch, tmp_path)
+    from src.modules.llm.claude_code import ClaudeCodeBackend
+
+    proc = MagicMock()
+    proc.communicate = AsyncMock(side_effect=TimeoutError())
+    proc.kill = MagicMock()
+    proc.wait = AsyncMock()
+
+    with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
+        backend = ClaudeCodeBackend()
+        backend._timeout = timeout
+        result = await backend.tool_loop(
+            system="x",
+            messages=[{"role": "user", "content": "x"}],
+            tools=[],
+            tool_handler=None,
+            max_turns=5,
+        )
+    return result, proc
+
+
+async def test_tool_loop_timeout_kills_subprocess(monkeypatch, tmp_path):
+    """A deadline that really did elapse reports as the wall-clock timeout."""
+    result, proc = await _timeout_result(monkeypatch, tmp_path, timeout=0)
+
+    assert not result.success
+    assert "timed out" in (result.error or "").lower()
+    proc.kill.assert_called_once()
+
+
+async def test_inner_timeout_is_not_reported_as_the_deadline(monkeypatch, tmp_path):
+    """B-6: since 3.11 `TimeoutError` is also an `OSError`, so a pipe/socket
+    timeout inside `communicate()` reaches the same handler. Reporting it as
+    the wall-clock deadline produced impossible messages during the 2026-08-03
+    pilot ("timed out after 69s (limit 1800s)") and sent the diagnosis after a
+    hang that never happened."""
+    result, proc = await _timeout_result(monkeypatch, tmp_path, timeout=1800)
+
+    assert not result.success
+    error = (result.error or "").lower()
+    assert "i/o timeout" in error
+    assert "not the wall-clock deadline" in error
+    proc.kill.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Prompt structure — system + user are flattened correctly
+# ---------------------------------------------------------------------------
+
+
+async def test_tool_loop_flattens_messages_into_prompt(monkeypatch, tmp_path):
+    _settings_for_cli(monkeypatch, tmp_path)
+    from src.modules.llm.claude_code import ClaudeCodeBackend
+
+    summary = {"result": "ok", "usage": {}}
+    proc = _mock_proc(stdout=(json.dumps(summary) + "\n").encode())
+
+    captured_input: dict = {}
+
+    async def _capture(input):
+        captured_input["data"] = input
+        return (json.dumps(summary).encode(), b"")
+
+    proc.communicate = _capture
+
+    with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
+        backend = ClaudeCodeBackend()
+        await backend.tool_loop(
+            system="You are a research specialist.",
+            messages=[{"role": "user", "content": "Write paper_plan.md for an NFT paper."}],
+            tools=[],
+            tool_handler=None,
+            max_turns=10,
+        )
+
+    sent = captured_input["data"].decode()
+    assert "You are a research specialist." in sent
+    assert "Write paper_plan.md for an NFT paper." in sent
+
+
+# ── CLAUDE_CODE_MODEL pins the subprocess model ──────────────────────────────
+# Without --model the CLI uses the user's interactive /model default; a July
+# 2026 validation run died mid-pipeline on a Fable 5 usage-credit ceiling
+# because the interactive default leaked into every specialist subprocess.
+
+
+async def _invoke_and_capture_argv(monkeypatch, tmp_path) -> list[str]:
+    from src.modules.llm.claude_code import ClaudeCodeBackend
+
+    backend = ClaudeCodeBackend()
+    summary = {
+        "type": "result",
+        "subtype": "success",
+        "result": "ok",
+        "is_error": False,
+        "num_turns": 1,
+        "usage": {"input_tokens": 1, "output_tokens": 1, "cache_read_input_tokens": 0},
+    }
+    proc = _mock_proc(stdout=(json.dumps(summary) + "\n").encode())
+    with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)) as spawn:
+        await backend.tool_loop(
+            system="System prompt",
+            messages=[{"role": "user", "content": "Do the thing."}],
+            tools=[],
+            tool_handler=None,
+        )
+    return list(spawn.await_args.args)
+
+
+async def test_model_flag_passed_when_configured(monkeypatch, tmp_path):
+    _settings_for_cli(monkeypatch, tmp_path)
+    monkeypatch.setenv("CLAUDE_CODE_MODEL", "claude-sonnet-4-6")
+    from src.config import get_settings
+
+    get_settings.cache_clear()
+    argv = await _invoke_and_capture_argv(monkeypatch, tmp_path)
+    assert "--model" in argv
+    assert argv[argv.index("--model") + 1] == "claude-sonnet-4-6"
+
+
+async def test_no_model_flag_by_default(monkeypatch, tmp_path):
+    _settings_for_cli(monkeypatch, tmp_path)
+    # setenv("") not delenv: a developer's .env may set CLAUDE_CODE_MODEL,
+    # and pydantic-settings falls back to .env when the process env lacks
+    # the key — an explicit empty value pins the "unset" behaviour.
+    monkeypatch.setenv("CLAUDE_CODE_MODEL", "")
+    from src.config import get_settings
+
+    get_settings.cache_clear()
+    argv = await _invoke_and_capture_argv(monkeypatch, tmp_path)
+    assert "--model" not in argv
+
+
+def test_default_model_reflects_claude_code_model(monkeypatch, tmp_path):
+    _settings_for_cli(monkeypatch, tmp_path)
+    monkeypatch.setenv("CLAUDE_CODE_MODEL", "claude-sonnet-4-6")
+    from src.config import get_settings
+
+    get_settings.cache_clear()
+    assert get_settings().default_model == "claude-sonnet-4-6"
+    get_settings.cache_clear()

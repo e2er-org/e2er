@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{% block title %}e2er{% endblock %}</title>
+  <link rel="stylesheet" href="{{ static_url('style.css') }}" />
+  <script src="{{ static_url('htmx.min.js') }}" integrity="sha384-ujb1lZYygJmzgSwoxRggbCHcjc0rB2XoQrxeTUQyRjrOnlCoYta87iKBWq3EsdM2" defer></script>
+  <script src="{{ static_url('e2er.js') }}"></script>
+</head>
+<body>
+  <header class="topbar">
+    <a href="/" class="brand">e2er</a>
+    <nav>
+      <a href="/">Studies</a>
+      <a href="/library">Library</a>
+      <a href="/skills">Skills</a>
+      <a href="/workflow">Workflow</a>
+      <a href="/preflight">Preflight</a>
+      <a href="/setup">Settings</a>
+      <a href="/papers/new" class="btn-primary">New study</a>
+    </nav>
+  </header>
+  <main>
+    {% block content %}{% endblock %}
+  </main>
+  {% set af = active_folder() %}
+  <footer class="foot">
+    {% if af.kind == "studies" %}Your studies folder: <code class="path">{{ af.path }}</code>
+    {% elif af.kind == "project" %}Settings and studies of this folder: <code class="path">{{ af.path }}</code> (it has its own settings)
+    {% else %}No studies folder yet: <a href="/setup">choose one</a>{% endif %}
+  </footer>
+</body>
+</html>

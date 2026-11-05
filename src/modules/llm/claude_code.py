@@ -1,0 +1,707 @@
+"""LLM backend that delegates to the Claude Code CLI subprocess.
+
+This is the v1/v2 architecture — adapted to v3's `LLMBackend` interface so
+users on a Claude Max plan can run the pipeline at $0 per token. The CLI
+runs its own internal tool loop (Read, Write, Edit, Bash, etc.); we just
+hand it a fully-built prompt and read the result.
+
+Trade-offs vs the SDK-based backends:
+  + Free under Max plan (no per-token cost)
+  + Battle-tested in v1/v2
+  - JSON-tool boundary lost: AlliumToolHandler can't intercept calls. Run
+    with DATA_MODULE_ENABLED=false (literature-only / BYOD) or expose a
+    bash wrapper script that enforces guardrails before hitting Allium.
+  - Tool names differ: prompts using "write_file" must work with the CLI's
+    "Write" tool. Most specialists describe artifacts by filename rather
+    than by tool name, so this is mostly transparent.
+
+Lifted from `E2ER/src/claude_code.py` and adapted to async + the v3
+LLMBackend contract. The original is ~660 lines; this is leaner because
+v3 doesn't need the per-stage helper logic (the runner does that).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import re
+import time
+from pathlib import Path
+from typing import Any
+
+from ...config import get_settings
+from ...logging_config import get_logger
+from .base import LLMBackend, TokenUsage, ToolHandler, ToolLoopResult
+from .cli_support import (
+    audit_journal,
+    cli_name,
+    cli_path_or_setting,
+    cli_version,
+    effective_timeout,
+    kill_process_group,
+    run_env,
+    stop_on_cancel,
+)
+from .plan_limit import detect as detect_plan_limit
+
+logger = get_logger(__name__)
+
+#: The CLI's own sign-in, the only credentials besides the wrappers' that reach its shell (run_env).
+CLI_KEYS = ("ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_AUTH_TOKEN")
+
+
+# Default CLI tool allowlist for an empirical research specialist.
+# These are Claude Code's *native* tool names. The pipeline's specialists
+# describe their artifacts by filename ("write paper_plan.md") rather than
+# tool name ("call write_file"), so the CLI naturally maps to its built-in
+# Write/Read/Edit.
+#
+# Note on Bash: we DO NOT grant the unrestricted Bash tool. The only
+# permitted shell invocation is `e2er-allium-query`, our Allium gatekeeper
+# (see scripts/e2er-allium-query). The pattern syntax
+# `Bash(e2er-allium-query:*)` tells Claude Code to allow `bash -c
+# "e2er-allium-query <anything>"` but reject any other command. Without
+# this restriction, the model could run arbitrary shell (curl, ssh, sudo,
+# git push, ...), defeating both the Allium guardrails and the broader
+# security model. Specialists that need execution (replication_packager,
+# LaTeX compile) get their tools wired through Python at the runner
+# level, not via Bash from the model.
+_DEFAULT_ALLOWED_TOOLS = [
+    "Read",
+    "Write",
+    "Edit",
+    "Glob",
+    "Grep",
+    # Unified data gatekeeper covering Allium + public sources (yfinance,
+    # FRED, …). Allium-specific guardrails still fire inside the wrapper
+    # for `e2er-data allium ...` invocations.
+    "Bash(e2er-data:*)",
+    # Back-compat: e2er-allium-query is a thin shim around `e2er-data
+    # allium`. Keep it allow-listed through v0.5.0 so existing skill files
+    # / external scripts still work during the deprecation window.
+    "Bash(e2er-allium-query:*)",
+]
+
+# Specialists that write an execution script (see EXECUTION_CONVENTIONS in
+# core/specialists/post_execution.py) additionally get `e2er-run`, so they can
+# run what they just wrote, read the traceback, and fix it — v1's write→run→fix
+# loop, which v3 dropped when it took code execution away from specialists.
+#
+# `e2er-run` is a gatekeeper like `e2er-data`: one workspace-relative .py file,
+# no arguments, no traversal, hard timeout. It is NOT `Bash(python3:*)` — that
+# would be arbitrary shell, and unlike v1 we have no container around it.
+#
+# The orchestrator still re-runs the final script through post_execution, so
+# provenance comes from that run, not from whatever the model did while
+# iterating.
+_SCRIPT_WRITING_SPECIALISTS = frozenset({"econometrics_specialist", "data_analyst"})
+_RUN_TOOL = "Bash(e2er-run:*)"
+
+# Specialists that author or repair table_spec.json. paper_drafter writes it as a
+# sidecar; section_writer repairs it when the render halt fires. Neither can
+# render, so both write blind — the same defect e2er-run fixed for scripts, one
+# artifact over. `e2er-check-tables` renders the spec and reports the unresolved
+# references plus the keys each column's object actually has.
+#
+# It takes no arguments and its subject is always cwd (the paper's workspace),
+# so there is nothing to smuggle. It is a report, not a gate: the runner
+# re-renders deterministically before the verify gate and compile, so provenance
+# still comes from that render.
+_SPEC_WRITING_SPECIALISTS = frozenset({"paper_drafter", "section_writer"})
+_CHECK_TABLES_TOOL = "Bash(e2er-check-tables:*)"
+
+# Specialists that discover literature or cite it. `tool_loop` below ignores the
+# `tools` argument entirely — the CLI only has its native set plus what is
+# allow-listed here — so LITERATURE_TOOLS (search_papers, save_bibtex, …) are
+# unreachable on every CLI backend. `e2er-lit` is their bridge, exactly as
+# `e2er-data` is the data module's.
+#
+# literature_scanner discovers and records; paper_drafter and section_writer
+# need `e2er-lit list` to know which keys are actually citable. In the
+# 2026-09-01 repeats cell none of them could reach any of it: no run wrote a
+# bibliography, and both reviewed drafts cited from memory.
+_LITERATURE_SPECIALISTS = frozenset(
+    {
+        "literature_scanner",
+        "paper_drafter",
+        "section_writer",
+        "field_boundary_designer",
+        "field_review_writer",
+        "protocol_designer",
+        "meta_review_writer",
+        # The planners source what the data cannot give: a policy's adoption dates, a corpus's
+        # publication years. The 2026-10-13 school-fee demo: the researcher asked the data architect
+        # to find a source for each abolition year, and every `e2er-lit search` was refused.
+        "idea_developer",
+        "identification_strategist",
+        "data_architect",
+    }
+)
+_LIT_TOOL = "Bash(e2er-lit:*)"
+
+# The field-map template's specialists (pipelines/field-map.toml): the boundary
+# designer counts candidate boundaries and finds journals' OpenAlex ids, the
+# lane mapper reads the mapped papers' titles and abstracts, the review writer
+# reads the results. `e2er-fieldmap` sends at most two OpenAlex requests per
+# count/sources call; the retrieval itself runs as a step of the template.
+_FIELDMAP_SPECIALISTS = frozenset(
+    # The systematic-review template's protocol designer sizes its searches with `e2er-fieldmap count`.
+    {"field_boundary_designer", "field_lane_mapper", "field_review_writer", "protocol_designer"}
+)
+_FIELDMAP_TOOL = "Bash(e2er-fieldmap:*)"
+
+#: How much of a backend error to keep. 500 chars was too little: the
+#: 2026-08-03 pilot lost eight cells to an unexplained CLI failure because
+#: every copy of the message was clipped before the informative part. A
+#: traceback's payload is at the END, so keep both ends.
+_MAX_ERROR_CHARS = 4000
+
+
+def _clip(text: str, limit: int = _MAX_ERROR_CHARS) -> str:
+    """Trim to `limit`, keeping the head AND tail — errors bury the cause last."""
+    if len(text) <= limit:
+        return text
+    head = limit // 2
+    tail = limit - head
+    return f"{text[:head]}\n… [{len(text) - limit} chars omitted] …\n{text[-tail:]}"
+
+
+#: Tools a specialist never gets, whatever the user's settings allow: the web outside e2er's wrappers,
+#: notebooks, sub-agents, and the files of this computer that hold logins and keys.
+#:
+#: Since 0.19.1 also every other tool of Claude Code that reaches beyond the study's folder or outlives the
+#: call (names as Claude Code 2.1.310 defines them): scheduling and remote triggers, workflows, messages
+#: and notifications, background tasks and their shells, worktrees, skills, plan mode and questions to a
+#: user who is not there, code runners besides e2er's (PowerShell, REPL, Monitor), claude.ai artifacts,
+#: tool search, and every MCP tool (``mcp__*``) and resource. A specialist needs Read, Write, Edit, Glob,
+#: Grep and e2er's commands.
+_SENSITIVE_PATHS = (
+    "~/.ssh/**", "~/.e2er/**", "~/.aws/**", "~/.gnupg/**", "~/.config/gh/**", "~/.config/gcloud/**",
+    "~/.codex/**", "~/.docker/**", "~/.kube/**", "~/.netrc", "~/.pgpass", "~/.git-credentials",
+    "**/.env", "**/.env.*",
+)  # fmt: skip
+_BEYOND_THE_CALL = (
+    "CronCreate", "CronDelete", "CronList", "RemoteTrigger", "ScheduleWakeup", "Workflow",
+    "SendMessage", "SendUserMessage", "SendUserFile", "PushNotification",
+    "TaskCreate", "TaskGet", "TaskList", "TaskUpdate", "TaskStop", "TaskOutput", "KillShell",
+    "TeamCreate", "TeamDelete", "EnterWorktree", "ExitWorktree", "Skill",
+    "EnterPlanMode", "ExitPlanMode", "AskUserQuestion", "PowerShell", "REPL", "Monitor",
+    "Artifact", "ArtifactComments", "ArtifactData", "ToolSearch",
+    "ListMcpResourcesTool", "ReadMcpResourceTool", "mcp__*",
+)  # fmt: skip
+DISALLOWED_TOOLS = (
+    "WebFetch", "WebSearch", "NotebookEdit", "Task", "Agent", *_BEYOND_THE_CALL,
+    *(f"{tool}({path})" for tool in ("Read", "Edit", "Write") for path in _SENSITIVE_PATHS),
+)  # fmt: skip
+
+
+def isolation_flags() -> list[str]:
+    """What keeps a `claude -p` call to e2er's own instructions and tools (security review 2026-10-23).
+
+    ``--setting-sources ""``: none of the user's, the project's or a folder's settings (their
+    permission rules, hooks, CLAUDE.md files); ``--strict-mcp-config`` with an empty MCP config:
+    no MCP server of the user's; ``--disallowedTools``: the tools and paths above, refused even
+    when a setting would allow them.
+    """
+    return [
+        "--setting-sources",
+        "",
+        "--strict-mcp-config",
+        "--mcp-config",
+        '{"mcpServers": {}}',
+        "--disallowedTools",
+        ",".join(DISALLOWED_TOOLS),
+    ]
+
+
+def allowed_tools_for(specialist: str | None) -> list[str]:
+    """CLI tool allowlist for a specialist.
+
+    Script writers get `e2er-run`; table_spec authors get `e2er-check-tables`;
+    literature discoverers and citers get `e2er-lit`. All three are the same
+    idea: reach the thing the SDK backends reach, and see what you wrote before
+    the orchestrator does.
+    """
+    tools = list(_DEFAULT_ALLOWED_TOOLS)
+    if specialist in _LITERATURE_SPECIALISTS:
+        tools.append(_LIT_TOOL)
+    if specialist in _SCRIPT_WRITING_SPECIALISTS:
+        tools.append(_RUN_TOOL)
+    if specialist in _SPEC_WRITING_SPECIALISTS:
+        tools.append(_CHECK_TABLES_TOOL)
+    if specialist in _FIELDMAP_SPECIALISTS:
+        tools.append(_FIELDMAP_TOOL)
+    return tools
+
+
+# `scripts/` (containing the wrappers) is inserted at the front of PATH
+# for the subprocess so the model can invoke them by bare name.
+_SCRIPTS_DIR = Path(__file__).resolve().parent.parent.parent.parent / "scripts"
+
+
+class ClaudeCodeBackend(LLMBackend):
+    """Claude Code CLI subprocess backend. Free under a Max plan.
+
+    `tool_loop` flattens the system prompt + user messages into a single
+    prompt, invokes the CLI, parses its `--output-format json` result, and
+    returns a `ToolLoopResult`. The CLI handles its own tool dispatch
+    internally, so the `tool_handler` argument is ignored — see module
+    docstring for why and the implications for Allium guardrails.
+    """
+
+    def __init__(self, model: str | None = None) -> None:
+        settings = get_settings()
+        self._cli_path = cli_path_or_setting("claude_code", settings)
+        self._timeout = settings.claude_code_timeout
+        self._max_turns_default = settings.claude_code_max_turns
+        self._cwd = settings.claude_code_cwd or os.getcwd()
+        # A per-paper model (`e2er run --model`, `run-matrix --models`) wins
+        # over CLAUDE_CODE_MODEL.
+        self._model = model or settings.claude_code_model
+
+    @property
+    def model(self) -> str:
+        return self._model
+
+    def identity(self) -> dict[str, Any]:
+        """What ran: model and CLI version, for the run record."""
+        return {
+            "backend": "claude_code",
+            "model": self._model or None,
+            "cli": cli_name(self._cli_path),
+            "cli_version": cli_version(self._cli_path),
+        }
+
+    async def tool_loop(
+        self,
+        system: str,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        tool_handler: ToolHandler | None,
+        max_turns: int = 30,
+        *,
+        paper_id: str | None = None,
+        specialist: str | None = None,
+    ) -> ToolLoopResult:
+        """Invoke the CLI once with system + last user message as the prompt.
+
+        The CLI runs its own internal tool loop (file ops, bash, etc.) until
+        end-turn or max-turns. `tool_handler` and `tools` are ignored — the
+        CLI uses its native tool set, allowed via `--allowedTools`.
+
+        ``paper_id`` and ``specialist`` are propagated to the subprocess as
+        ``E2ER_PAPER_ID`` and ``E2ER_SPECIALIST`` env vars. The
+        ``e2er-allium-query`` wrapper picks them up automatically — the
+        specialist doesn't have to remember its own paper_id.
+        """
+        # Flatten messages to a single prompt. Most v3 callers pass a
+        # 1-element list with the user instruction; if there are more, we
+        # join them with explicit role markers so the CLI sees them.
+        prompt_parts = [system, ""]
+        for m in messages:
+            role = m.get("role", "user").upper()
+            content = m.get("content", "")
+            if isinstance(content, list):
+                # Anthropic-style content blocks — extract text parts only.
+                content = "\n".join(
+                    block.get("text", "")
+                    for block in content
+                    if isinstance(block, dict) and block.get("type") == "text"
+                )
+            prompt_parts.append(f"# {role}\n{content}")
+        prompt = "\n\n".join(prompt_parts)
+
+        # Hint the CLI at allowed tools. Caller-supplied `tools` list is
+        # ignored (different naming scheme) — we just allow the standard set,
+        # plus `e2er-run` for the specialists that write execution scripts.
+        allowed_tools = allowed_tools_for(specialist)
+
+        # Per-specialist working directory: the CLI's `Write` tool resolves
+        # relative paths against cwd. If we run the CLI from the project
+        # root, files like "paper_plan.md" land in the repo root instead of
+        # the paper's workspace — discovered May 2026 NFT-paper run #4. Use
+        # the paper's workspace as cwd when paper_id is supplied; fall back
+        # to the configured backend cwd for tool-less invocations
+        # (strategist decisions don't write files anyway).
+        # Resolve workspace_root to an ABSOLUTE path. The default
+        # `workspace_root="workspaces"` (relative) plus the subprocess having
+        # cwd inside a workspace combine to nest `workspaces/<id>` inside
+        # itself when `e2er-data --save-to` resolves its target path. See
+        # live test eea5379b (v0.4.4) — analyze.py wrote
+        # `workspaces/<id>/data/...` from cwd already at `workspaces/<id>/`,
+        # so the CSV landed at `workspaces/<id>/workspaces/<id>/data/...`.
+        cwd = self._cwd
+        workspace_root_abs: Path | None = None
+        if paper_id:
+            settings = get_settings()
+            from ...home import find_workspace
+
+            workspace_root_abs = Path(settings.workspace_root).resolve()
+            cwd = str(find_workspace(paper_id, workspace_root_abs).resolve())
+
+        # The wrappers' audit rows go to a journal in the workspace (cli_support.audit_journal).
+        async with audit_journal(paper_id, cwd if paper_id else None):
+            return await self._invoke_with_retries(
+                prompt, allowed_tools, cwd, max_turns, paper_id, specialist, workspace_root_abs
+            )
+
+    async def _invoke_with_retries(
+        self,
+        prompt: str,
+        allowed_tools: list[str],
+        cwd: str,
+        max_turns: int,
+        paper_id: str | None,
+        specialist: str | None,
+        workspace_root_abs: Path | None,
+    ) -> ToolLoopResult:
+        # Retry transient Anthropic API errors. The CLI surfaces these in
+        # its JSON output as is_error=true + api_error_status set (e.g.
+        # 429, 500, 502, 503, 504, 529). They're not bugs in our code or
+        # the prompt — they're Anthropic infrastructure hiccups, and they
+        # bubble all the way up to the cascade detector unless retried
+        # here. Two retries with 5s + 15s backoff is enough for the
+        # vast majority of transients without burning much wall time.
+        retry_delays = [5.0, 15.0]
+        last_result: ToolLoopResult | None = None
+        for attempt in range(len(retry_delays) + 1):
+            result = await _invoke_cli(
+                cli_path=self._cli_path,
+                prompt=prompt,
+                allowed_tools=allowed_tools,
+                timeout=effective_timeout(self._timeout),
+                cwd=cwd,
+                max_turns=max_turns or self._max_turns_default,
+                start=time.monotonic(),
+                paper_id=paper_id,
+                specialist=specialist,
+                workspace_root_abs=workspace_root_abs,
+                model=self._model,
+            )
+            last_result = result
+            if result.success or not _is_transient_api_error(result.error or ""):
+                return result
+            if attempt >= len(retry_delays):
+                break
+            delay = retry_delays[attempt]
+            logger.warning(
+                "Claude Code transient API error (attempt %d/%d, sleeping %.0fs): %s",
+                attempt + 1,
+                len(retry_delays) + 1,
+                delay,
+                (result.error or "")[:200],
+            )
+            await asyncio.sleep(delay)
+        assert last_result is not None  # the loop runs at least once
+        return last_result
+
+
+def _is_transient_api_error(error: str) -> bool:
+    """Detect transient Anthropic API errors worth retrying.
+
+    The CLI's failure JSON includes ``api_error_status`` set to the HTTP
+    code Anthropic returned (e.g. 429, 500, 502, 503, 504, 529) plus
+    ``is_error: true``. These are infrastructure issues, not prompt bugs
+    — retrying with a short backoff resolves >90% of them. We also
+    accept the literal string ``overloaded_error`` Anthropic sometimes
+    returns at the SDK layer.
+
+    Hard failures (auth, malformed request, max_turns) are NOT matched
+    here — those should propagate so the human sees them.
+    """
+    if not error:
+        return False
+    e = error.lower()
+    # CLI exit-code-1 path leaves a JSON blob in the error message with
+    # api_error_status set; the actual status code is what matters.
+    transient_codes = ("429", "500", "502", "503", "504", "529")
+    for code in transient_codes:
+        if f'api_error_status":{code}' in e or f'api_error_status": {code}' in e:
+            return True
+    return "overloaded_error" in e or "overloaded" in e and "anthropic" in e
+
+
+async def _invoke_cli(
+    *,
+    cli_path: str,
+    prompt: str,
+    allowed_tools: list[str],
+    timeout: int,
+    cwd: str,
+    max_turns: int,
+    start: float,
+    paper_id: str | None = None,
+    specialist: str | None = None,
+    workspace_root_abs: Path | None = None,
+    model: str = "",
+) -> ToolLoopResult:
+    """Run `claude -p` as a subprocess. Async-native version of v1's wrapper."""
+    # Sanitize null bytes — upstream artifacts can embed \x00 which the
+    # subprocess pipe cannot transport.
+    prompt = prompt.replace("\x00", "")
+
+    cmd = [
+        cli_path,
+        "-p",
+        "--output-format",
+        "json",
+        "--max-turns",
+        str(max_turns),
+    ]
+    # Pin the subprocess model when configured — without --model the CLI
+    # uses the user's interactive /model default, which can silently burn
+    # the priciest tier's usage credits (see claude_code_model in config).
+    if model:
+        cmd.extend(["--model", model])
+    if allowed_tools:
+        cmd.extend(["--allowedTools", ",".join(allowed_tools)])
+    cmd.extend(isolation_flags())
+
+    logger.info("ClaudeCode: invoking %s (max_turns=%d, prompt=%d chars)", cli_path, max_turns, len(prompt))
+
+    # The wrappers' PATH (dev-checkout scripts/, then the venv's entry-point
+    # shims via sysconfig — not sys.executable's dir, which on macOS framework
+    # venvs is the framework's bin/), E2ER_PYTHON (run #10), the paper id and
+    # specialist, the ABSOLUTE workspace root (eea5379b: a relative root nests
+    # workspaces/<id> inside itself), the run database, and whatever the
+    # study's .env sets. One copy for all three CLI backends: cli_support.run_env.
+    env = run_env(
+        get_settings(),
+        paper_id=paper_id,
+        specialist=specialist,
+        workspace_root_abs=workspace_root_abs,
+        cli_keys=CLI_KEYS,
+        cli_prefixes=("CLAUDE_", "ANTHROPIC_", "NODE_", "NVM_"),
+    )
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=cwd,
+            env=env,
+            # Its own session: a timeout or a cancel kills the CLI with every
+            # command it started (kill_process_group), not the CLI alone.
+            start_new_session=True,
+        )
+    except FileNotFoundError:
+        return ToolLoopResult(
+            success=False,
+            output="",
+            error=(
+                f"Claude Code CLI not found at: {cli_path}. "
+                "Set CLAUDE_CODE_PATH or install via `npm i -g @anthropic-ai/claude-code`."
+            ),
+            duration_seconds=time.monotonic() - start,
+        )
+    except OSError as e:
+        return ToolLoopResult(
+            success=False,
+            output="",
+            error=f"Failed to start Claude Code CLI: {e}",
+            duration_seconds=time.monotonic() - start,
+        )
+
+    try:
+        stdout_bytes, stderr_bytes = await asyncio.wait_for(
+            proc.communicate(input=prompt.encode("utf-8")),
+            timeout=timeout,
+        )
+    except asyncio.CancelledError:
+        await stop_on_cancel(proc)
+        raise
+    except TimeoutError:
+        # B-6. Since Python 3.11 `asyncio.TimeoutError` IS the builtin
+        # `TimeoutError`, which is also an `OSError` subclass — so a socket or
+        # pipe timeout raised from inside `communicate()` lands here too and
+        # used to be reported as the wall-clock deadline. That produced
+        # impossible messages during the 2026-08-03 pilot diagnosis ("timed
+        # out after 69s (limit 1800s)") and sent us looking for a hung CLI
+        # that was never hung. Distinguish by elapsed time: only the outer
+        # `wait_for` can fire at (or after) the limit.
+        kill_process_group(proc)
+        await proc.wait()
+        elapsed = time.monotonic() - start
+        # 50 ms of slack: Windows' clock and asyncio's timers tick every ~16 ms, so a deadline that fired can
+        # read a few milliseconds short of the limit.
+        deadline_fired = elapsed >= timeout * 0.95 - 0.05
+        if deadline_fired:
+            error = f"Claude Code timed out after {elapsed:.0f}s (limit {timeout}s)"
+        else:
+            error = (
+                f"Claude Code I/O timeout after {elapsed:.0f}s, well inside the {timeout}s limit — "
+                "this is a pipe/socket timeout from the subprocess, not the wall-clock deadline"
+            )
+        return ToolLoopResult(
+            success=False,
+            output="",
+            error=error,
+            duration_seconds=elapsed,
+            stop_reason="timeout" if deadline_fired else "io_timeout",
+        )
+
+    duration = time.monotonic() - start
+    stdout = stdout_bytes.decode("utf-8", errors="replace")
+    stderr = stderr_bytes.decode("utf-8", errors="replace")
+
+    # The Claude plan's limit ("Claude AI usage limit reached|<time>", "5-hour
+    # limit reached ∙ resets 3pm"): every call fails until it resets, so the run
+    # pauses (runner: paused_plan_limit) instead of failing. The CLI prints it in
+    # its JSON result, on stderr, or as the whole answer of an exit-0 call.
+    said = _limit_text(stdout)
+    if proc.returncode != 0 or _parse_output(stdout).get("is_error") or _LIMIT_ONLY.match(said.strip()):
+        limit = detect_plan_limit("claude_code", f"{said}\n{stderr}")
+        if limit is not None:
+            raise limit
+
+    if proc.returncode != 0:
+        error_msg = stderr.strip() or f"Exit code {proc.returncode}: {_clip(stdout.strip())}"
+        return ToolLoopResult(
+            success=False,
+            output="",
+            error=error_msg,
+            duration_seconds=duration,
+        )
+
+    raw = _parse_output(stdout)
+    output_text = _extract_text(raw, stdout)
+    usage = _extract_usage(raw)
+    tool_calls_made = _count_tool_calls(raw)
+    _warn_on_refusals(raw, specialist)
+
+    # error_max_turns: process exits 0 but the agent didn't finish. The
+    # CLI returns subtype="error_max_turns" or is_error=True.
+    if raw.get("subtype") == "error_max_turns" or raw.get("is_error"):
+        # Include the CLI's OWN message. Without it this read "hit
+        # max_turns=80" for every is_error, including the eight pilot cells
+        # that failed after 0-4 output tokens with stop_reason="stop_sequence"
+        # — nothing like a turn-limit exhaustion, and we could not tell,
+        # because the one string that would have said so was dropped here and
+        # clipped to 500 chars everywhere else.
+        detail = _clip(str(raw.get("result") or raw.get("error") or "").strip())
+        subtype = raw.get("subtype", "is_error")
+        error = f"Claude Code returned {subtype} (max_turns={max_turns}, tool_calls={tool_calls_made})"
+        if detail:
+            error = f"{error}: {detail}"
+        return ToolLoopResult(
+            success=False,
+            output=output_text,
+            error=error,
+            tool_calls_made=tool_calls_made,
+            usage=usage,
+            duration_seconds=duration,
+            stop_reason="max_turns",
+        )
+
+    return ToolLoopResult(
+        success=True,
+        output=output_text,
+        tool_calls_made=tool_calls_made,
+        usage=usage,
+        duration_seconds=duration,
+        stop_reason="end_turn",
+    )
+
+
+def refused_commands(raw: dict[str, Any]) -> list[str]:
+    """The tool calls Claude Code refused in this call (its result's ``permission_denials``), each in short."""
+    out: list[str] = []
+    for d in raw.get("permission_denials") or []:
+        if not isinstance(d, dict):
+            continue
+        given = d["tool_input"] if isinstance(d.get("tool_input"), dict) else {}
+        what = given.get("command") or given.get("file_path") or given.get("pattern") or ""
+        out.append(f"{d.get('tool_name') or '?'}: {_clip(' '.join(str(what).split()), 200)}")
+    return out
+
+
+def _warn_on_refusals(raw: dict[str, Any], specialist: str | None) -> None:
+    """Say in the log which of a specialist's tool calls Claude Code refused: the 2026-10-25 literature scanner's
+    searches were refused, and nothing outside the CLI's own session said so."""
+    refused = refused_commands(raw)
+    if refused:
+        logger.warning(
+            "Claude Code refused %d tool call(s) of %s: %s", len(refused), specialist or "a call", "; ".join(refused)
+        )
+
+
+#: An exit-0 answer that is nothing but the plan-limit notice (older Claude Code versions).
+_LIMIT_ONLY = re.compile(r"^claude(?: ai)? usage limit reached\b", re.I)
+
+
+def _limit_text(stdout: str) -> str:
+    """The CLI's own words in its output: the JSON ``result``/``error`` when there is one, else the text."""
+    raw = _parse_output(stdout)
+    return str(raw.get("result") or raw.get("error") or "") or stdout
+
+
+def _parse_output(stdout: str) -> dict[str, Any]:
+    """Parse CLI JSON output. Falls back to {} on parse failure."""
+    if not stdout.strip():
+        return {}
+    # The CLI emits one JSON object per line in --output-format json mode;
+    # the last line is the summary. We want the object that has 'result' or
+    # 'subtype' keys (the final assistant turn / completion summary).
+    summary: dict[str, Any] = {}
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict):
+            summary = obj  # keep updating; the last valid line is the summary
+    return summary
+
+
+def _extract_text(raw: dict[str, Any], stdout: str) -> str:
+    """Pull the final assistant message text out of the CLI's JSON output."""
+    if not raw:
+        return stdout.strip()[:4000]
+    # Common shapes: {"result": "..."} or {"messages": [...]}
+    if isinstance(raw.get("result"), str):
+        return raw["result"]
+    msgs = raw.get("messages") or []
+    if isinstance(msgs, list) and msgs:
+        last = msgs[-1]
+        if isinstance(last, dict):
+            content = last.get("content")
+            if isinstance(content, str):
+                return content
+            if isinstance(content, list):
+                return "\n".join(b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text")
+    return raw.get("output", "") or stdout.strip()[:4000]
+
+
+def _extract_usage(raw: dict[str, Any]) -> TokenUsage:
+    """Pull token counts from the CLI summary. Zero if missing."""
+    usage = raw.get("usage") or {}
+    if not isinstance(usage, dict):
+        return TokenUsage()
+    return TokenUsage(
+        input_tokens=int(usage.get("input_tokens", 0) or 0),
+        output_tokens=int(usage.get("output_tokens", 0) or 0),
+        cache_read_tokens=int(usage.get("cache_read_input_tokens", 0) or 0),
+        cache_write_tokens=int(usage.get("cache_creation_input_tokens", 0) or 0),
+    )
+
+
+def _count_tool_calls(raw: dict[str, Any]) -> int:
+    """Approximate tool-call count from the CLI summary.
+
+    Claude Code 2.x doesn't include a `messages` array in
+    `--output-format json`; only top-level metadata. The closest signal is
+    `num_turns`: a tool-less completion = 1 turn, each tool use adds at
+    least one more turn. So `num_turns - 1` is a lower bound on tool calls.
+    Approximate is fine — this metric is informational, the cascade-
+    detection logic uses file existence, not tool count.
+    """
+    n = raw.get("num_turns", 0)
+    if isinstance(n, int) and n > 0:
+        return max(0, n - 1)
+    return 0

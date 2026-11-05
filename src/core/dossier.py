@@ -1,0 +1,1317 @@
+"""Study dossiers: what a study was produced with and how, addressed by a hash.
+
+A dossier lists the E2ER version and commit of every part of the run
+(``e2er.segments``: one per process that ran steps), the run settings
+(template, mode, governance, backend, models), every template, specialist,
+skill and connector the run used, pinned at each commit it ran on by the git
+blob of the file that defines it, the SHA-256 of the input data files, the
+release and file hashes of each versioned external-source load (the GMD), and
+the workflow: every step of the run in order (each specialist with its model,
+each check, each of the researcher's actions), the file each step wrote with
+its SHA-256 where the run recorded it, the run's other events and its
+outcome. It deliberately leaves out the paper: the paper carries the
+dossier's address in a footnote, so the dossier cannot depend on the paper.
+
+The dossier's id is ``sha256:`` plus the SHA-256 of its canonical JSON (RFC
+8785: object keys sorted by UTF-16 code units, no whitespace, numbers as
+ECMAScript writes them, UTF-8). The E2ER site computes and checks ids the same
+way, so ``https://e2er.org/d/<first 16 hex characters>`` resolves to exactly
+this document.
+
+Files are pinned by their git blob SHA (sha1 of ``blob <size>\\0`` + content),
+which equals ``git rev-parse <commit>:<path>`` for the same file, so anyone can
+compare a pin with the repository. A blob this checkout cannot resolve is
+recorded as unresolved, never replaced by the file as it is today.
+"""
+
+from __future__ import annotations
+
+import copy
+import hashlib
+import json
+import math
+import re
+import sqlite3
+import subprocess
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from functools import lru_cache
+from pathlib import Path
+from typing import Any
+
+from ..skills.loader import skill_component
+from . import labels as _labels
+from .availability import any_public
+from .demonstration import DEMONSTRATION, disclaimer
+from .run_outcome import effective_status, internal_review, read_aggregation
+from .secret_scan import strip_local_paths
+
+SCHEMA = "e2er-dossier/0.3"
+#: Used only when a dossier records researcher steps or a pre-registration, so a
+#: study without them keeps exactly the 0.3 document (and its address).
+SCHEMA_RESEARCHER = "e2er-dossier/0.4"
+#: A dossier that states public data or code (``availability``). Studies whose data
+#: and code are private keep the 0.3/0.4 document, and their addresses.
+SCHEMA_AVAILABILITY = "e2er-dossier/0.5"
+#: A dossier built from the run database: segments (one per process that ran
+#: part of the run), pins per commit, per-step outputs, events and outcome.
+SCHEMA_RUN = "e2er-dossier/0.6"
+SITE = "https://e2er.org"
+ROOT = Path(__file__).resolve().parents[2]  # the E2ER checkout or installed package root
+BACKEND_CONNECTOR = {
+    "anthropic": "anthropic",
+    "openrouter": "openrouter",
+    "claude_code": "claude-code",
+    "codex": "codex",
+    "gemini": "gemini",
+}
+
+
+class CanonicalError(ValueError):
+    """A value has no canonical form: NaN, Infinity, an integer beyond ±(2^53 − 1), a non-JSON type."""
+
+
+#: The largest integer every JSON reader (JavaScript included) reads back exactly.
+MAX_SAFE_INTEGER = 2**53 - 1
+
+
+def _es_number(x: float) -> str:
+    """ECMAScript's Number::toString for a finite float (what ``JSON.stringify`` writes).
+
+    Python's ``repr`` gives the same shortest round-tripping digits as JavaScript;
+    only the layout differs (``1.0`` vs ``1``, ``1e-05`` vs ``0.00001``,
+    ``1e+16`` vs ``10000000000000000``), so the digits are laid out by the rules
+    of ECMA-262 §6.1.6.1.20.
+    """
+    if x == 0:
+        return "0"  # -0 included
+    sign = "-" if x < 0 else ""
+    r = repr(abs(x))
+    mant, _, exp = r.partition("e")
+    whole, _, frac = mant.partition(".")
+    digits = (whole + frac).lstrip("0")
+    # n: position of the decimal point relative to the first significant digit
+    n = len(whole.lstrip("0")) if whole.strip("0") else -(len(frac) - len(frac.lstrip("0")))
+    n += int(exp or 0)
+    digits = digits.rstrip("0") or "0"
+    k = len(digits)
+    if k <= n <= 21:
+        out = digits + "0" * (n - k)
+    elif 0 < n <= 21:
+        out = digits[:n] + "." + digits[n:]
+    elif -6 < n <= 0:
+        out = "0." + "0" * (-n) + digits
+    else:
+        e = n - 1
+        es = ("+" if e >= 0 else "-") + str(abs(e))
+        out = digits[0] + ("." + digits[1:] if k > 1 else "") + "e" + es
+    return sign + out
+
+
+def _string(s: str, at: str) -> str:
+    try:
+        s.encode("utf-8")
+    except UnicodeEncodeError as e:
+        raise CanonicalError(f"{at} contains a lone surrogate, which has no UTF-8 form") from e
+    return json.dumps(s, ensure_ascii=False)
+
+
+def _canon(obj: Any, at: str) -> str:
+    if obj is None:
+        return "null"
+    if obj is True:
+        return "true"
+    if obj is False:
+        return "false"
+    if isinstance(obj, int):
+        if abs(obj) > MAX_SAFE_INTEGER:
+            raise CanonicalError(
+                f"{at} is {obj}, beyond ±(2^53 − 1). Such a number is not read back exactly everywhere "
+                "(RFC 8785), so its hash would differ; write it as a string."
+            )
+        return str(int(obj))
+    if isinstance(obj, float):
+        if math.isnan(obj) or math.isinf(obj):
+            raise CanonicalError(
+                f"{at} is {obj}. NaN and Infinity are not JSON, so the document has no canonical form; "
+                "write the value as a string or leave it out."
+            )
+        if obj.is_integer() and abs(obj) > MAX_SAFE_INTEGER:
+            raise CanonicalError(
+                f"{at} is {obj!r}, beyond ±(2^53 − 1). Such a number is not read back exactly everywhere "
+                "(RFC 8785), so its hash would differ; write it as a string."
+            )
+        return _es_number(obj)
+    if isinstance(obj, str):
+        return _string(obj, at)
+    if isinstance(obj, list | tuple):
+        return "[" + ",".join(_canon(v, f"{at}[{i}]") for i, v in enumerate(obj)) + "]"
+    if isinstance(obj, dict):
+        for k in obj:
+            if not isinstance(k, str):
+                raise CanonicalError(f"{at} has the key {k!r}, which is not a string")
+        # RFC 8785: keys in the order of their UTF-16 code units (JavaScript's Array#sort).
+        keys = sorted(obj, key=lambda k: k.encode("utf-16-be", "surrogatepass"))
+        return "{" + ",".join(_string(k, at) + ":" + _canon(obj[k], f"{at}.{k}") for k in keys) + "}"
+    raise CanonicalError(f"{at} is a {type(obj).__name__}, which has no JSON form")
+
+
+def canonical(obj: Any) -> str:
+    """The canonical JSON of ``obj``, exactly as e2er.org writes it (RFC 8785, JCS).
+
+    Object keys sorted by their UTF-16 code units at every level, no
+    whitespace, numbers as ECMAScript writes them, strings as ``JSON.stringify``
+    writes them. NaN, Infinity and integers beyond ±(2^53 − 1) have no canonical
+    form and raise :class:`CanonicalError`. The site's function is
+    ``canonical`` in e2er-site ``src/lib/integrity-core.mjs``;
+    tests/test_canonical_json.py runs both on the same documents.
+    """
+    return _canon(obj, "$")
+
+
+def dossier_id(doc: dict[str, Any]) -> str:
+    return "sha256:" + hashlib.sha256(canonical(doc).encode("utf-8")).hexdigest()
+
+
+def short_id(did: str) -> str:
+    return did.removeprefix("sha256:")[:16]
+
+
+def dossier_url(did: str, site: str | None = None) -> str:
+    """The dossier's address on the platform it is published to (``site``; e2er.org by default)."""
+    return f"{(site or SITE).rstrip('/')}/d/{short_id(did)}"
+
+
+def git_blob_sha(path: Path) -> str:
+    data = path.read_bytes()
+    return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
+
+
+def _git(*args: str) -> str | None:
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(ROOT), *args], capture_output=True, encoding="utf-8", errors="replace", timeout=10
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out.stdout if out.returncode == 0 else None
+
+
+@lru_cache(maxsize=4096)
+def _blob_at(commit: str, rel: str) -> str | None:
+    """git blob SHA of ``rel`` at ``commit`` in the E2ER checkout, if both exist."""
+    out = _git("rev-parse", f"{commit}:{rel}")
+    return out.strip() if out else None
+
+
+@lru_cache(maxsize=256)
+def _registry_skills_at(commit: str) -> dict[str, list[str]] | None:
+    """``SPECIALIST_SKILLS`` as the registry defined it at ``commit``, read from git (never today's)."""
+    import ast
+
+    text = _git("show", f"{commit}:src/core/specialists/registry.py")
+    if text is None:
+        return None
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return None
+    for node in tree.body:
+        if isinstance(node, ast.AnnAssign):
+            target: ast.expr | None = node.target
+        elif isinstance(node, ast.Assign):
+            target = node.targets[0]
+        else:
+            continue
+        if isinstance(target, ast.Name) and target.id == "SPECIALIST_SKILLS" and node.value is not None:
+            try:
+                value = ast.literal_eval(node.value)
+            except ValueError:
+                return None
+            return {str(k): [str(s) for s in v] for k, v in value.items()} if isinstance(value, dict) else None
+    return None
+
+
+def _path_for(component: str) -> str | None:
+    kind, _, rest = component.partition(":")
+    if kind == "template":
+        return f"pipelines/{rest}.toml"
+    if kind == "agent" and "/" not in rest:
+        return "src/core/specialists/registry.py"
+    if kind == "skill" and rest.startswith("e2er/"):
+        return f"skills/files/{rest.removeprefix('e2er/')}.md"
+    if kind == "skill":
+        return None  # an installed pack's skill: not a file of E2ER (see _pin)
+    if kind == "connector":
+        backend = {v: k for k, v in BACKEND_CONNECTOR.items()}.get(rest)
+        return f"src/modules/llm/{backend}.py" if backend else None
+    return None
+
+
+def _pin(component: str, repository: str | None, commit: str | None) -> dict[str, Any]:
+    """Where ``component`` is defined at ``commit``: its path and git blob there.
+
+    A blob that cannot be resolved (no recorded commit, or a commit or path
+    this checkout does not have) is recorded as unresolved. It is never
+    replaced by the file as it is today.
+    """
+    rel = _path_for(component)
+    if rel is None and component.startswith("skill:"):
+        return {"note": "from an installed skill pack, not part of E2ER; listed on e2er.org under this id"}
+    if rel is None:
+        return {"note": "built into E2ER; no separate file"}
+    if not commit:
+        return {"path": rel, "note": "unresolved: the run recorded no E2ER commit"}
+    pin: dict[str, Any] = {"path": rel}
+    if repository:
+        pin["repository"] = repository
+    pin["commit"] = commit
+    blob = _blob_at(commit, rel)
+    if blob:
+        pin["git_blob"] = blob
+    else:
+        pin["note"] = f"unresolved: {rel} at {commit[:12]} is not in the E2ER checkout this dossier was built from"
+    return pin
+
+
+def _tables(con: sqlite3.Connection) -> set[str]:
+    return {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+
+
+def _utc(value: Any) -> str | None:
+    """A timestamp as UTC ISO 8601 ending in Z (``2026-09-28T14:56:39Z``); None stays None.
+
+    SQLite's ``datetime('now')`` (``2026-09-28 14:56:39``) is UTC without a
+    zone; e2er's own stamps end in Z or carry an offset; folder stamps are
+    compact (``20260929T091500Z``). A value that is no timestamp is kept as is.
+    """
+    if value is None or value == "":
+        return None
+    s = str(value).strip()
+    m = re.fullmatch(r"(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z", s)
+    if m:
+        s = f"{m[1]}-{m[2]}-{m[3]}T{m[4]}:{m[5]}:{m[6]}Z"
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00").replace(" ", "T", 1))
+    except ValueError:
+        return s
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+#: Workspace files export renames (structured.EXPORT_MAP); the others keep their name.
+_EXPORT_RENAMES = {
+    "paper_draft.tex": "paper/paper.tex",
+    "literature.bib": "paper/refs.bib",
+    "paper_draft.pdf": "paper/paper.pdf",
+}
+
+
+def _workspace_name(path: str, paper_id: str | None) -> str:
+    """A file a step wrote, relative to the run's workspace; never a path of this machine.
+
+    The runner records absolute paths (``/Users/…/workspaces/<paper id>/x``).
+    The part after the paper's workspace folder is kept; without one, only
+    the file name.
+    """
+    p = path.replace("\\", "/")
+    if paper_id and f"/{paper_id}/" in p:
+        return p.split(f"/{paper_id}/", 1)[1]
+    if not p.startswith("/") and ".." not in p.split("/") and not re.match(r"^[A-Za-z]:", p):
+        return p
+    return p.rsplit("/", 1)[-1]
+
+
+def _bundle_file(name: str, files: dict[str, Any]) -> str | None:
+    """Where a workspace file ended up in the exported folder: export's renames, else by its path tail."""
+    if name in _EXPORT_RENAMES and _EXPORT_RENAMES[name] in files:
+        return _EXPORT_RENAMES[name]
+    parts = Path(name).parts
+    for n in range(len(parts), 0, -1):
+        tail = "/".join(parts[-n:])
+        hits = sorted(f for f in files if f == tail or f.endswith("/" + tail))
+        if hits:
+            return hits[0]
+    return None
+
+
+def _utf16_len(s: str) -> int:
+    return len(s.encode("utf-16-le", "surrogatepass")) // 2
+
+
+def _clip(value: Any, limit: int = 20000) -> Any:
+    """Strings within the site's limit (counted as JavaScript counts: UTF-16 code units); lists and objects inside."""
+    if isinstance(value, str):
+        if _utf16_len(value) <= limit:
+            return value
+        out, n = [], 0
+        for ch in value:
+            w = 2 if ord(ch) > 0xFFFF else 1
+            if n + w > limit - 1:
+                break
+            out.append(ch)
+            n += w
+        return "".join(out) + "…"
+    if isinstance(value, list):
+        return [_clip(v, limit) for v in value]
+    if isinstance(value, dict):
+        return {k: _clip(v, limit) for k, v in value.items()}
+    return value
+
+
+@dataclass
+class RunRecord:
+    """What the run database recorded about one paper's run, read once for the dossier and e2er.json."""
+
+    segments: list[dict[str, Any]] = field(default_factory=list)
+    workflow: list[dict[str, Any]] = field(default_factory=list)
+    events: list[dict[str, Any]] = field(default_factory=list)
+    outcome: dict[str, Any] = field(default_factory=dict)
+    #: e2er's internal quality review score (run_outcome.internal_review), when the run had one
+    internal_review: dict[str, Any] | None = None
+    #: specialists that ran, in order of first appearance; skill per agent; segments per component
+    agents: list[str] = field(default_factory=list)
+    skills: dict[str, list[str]] = field(default_factory=dict)
+    component_segments: dict[str, list[int]] = field(default_factory=dict)
+    recorded: bool = False  # the database has this run's events
+    #: The template's ``[[credit]]`` entries as the run recorded them (``template_components``), if any.
+    credit: dict[str, Any] | None = None
+    #: The rounds of the iterative mode (``improvement_round``, ``ceiling_check``, ``pivot``), in order.
+    rounds: list[dict[str, Any]] = field(default_factory=list)
+
+
+#: The iterative mode's record of its rounds: kept as ``run.rounds`` of the dossier, not as events.
+_ROUND_EVENTS = {"improvement_round", "ceiling_check", "pivot", "improvement_stopped"}
+
+#: Events that are part of the run's history but not one of the dossier's step types.
+_RUN_EVENTS = {
+    "awaiting_review",
+    "paper_paused",
+    "failed",
+    "cancelled",
+    "circuit_breaker_tripped",
+    "paused_budget",
+    "paused_plan_limit",
+    "paused_billing_limit",
+    "estimation_set_aside",
+    "preregistration",
+}
+
+
+def read_run(db: Path, paper_id: str, files: dict[str, Any] | None = None, bundle: Path | None = None) -> RunRecord:
+    """The run as its database recorded it: steps, system events, segments and outcome.
+
+    * **Outcome** is whether the run finished (``completed``, ``failed``,
+      ``cancelled``, ``paused``, ``stopped`` by a check, or the phase it is in),
+      never a review result: a stored review word (``rejected`` from runs
+      up to 0.13.1) becomes ``completed`` when the run reached its internal
+      quality review (see run_outcome.py). The review's score is
+      ``internal_review``, read from ``review_aggregation.json`` in the bundle
+      (``reviews/``) or else in the run's workspace.
+
+    * **Segments.** Each ``run_identity`` event starts a segment: the E2ER
+      commit, version and tree state of the process that ran the steps after
+      it. A step names its segment, and so the commit it ran on.
+    * **Steps** (``workflow``) are of the three kinds the dossier format has:
+      ``specialist`` (one dispatch: model and backend from the ``llm_usage``
+      rows inside its start and end, the ``contributions`` row likewise),
+      ``check`` (gate verdicts, halts, the pre-registration check) and
+      ``researcher`` (one per ``researcher_action`` row, all its fields kept,
+      plus files the researcher supplied). A stop for output that failed its
+      contract in every attempt is a ``check`` step (``output_contract``) with
+      each attempt's violations; when the researcher keeps that output as it
+      is, the specialist step that wrote it carries ``approved_by_researcher``
+      (with ``contract_failed`` and the violations left). A send-back's rerun of a specialist
+      (``researcher_rerun``, written by the runner) is noted on the specialist
+      step it caused, not counted as a researcher action again.
+    * **Events** keep the rest of the run's history: stops for review, pauses,
+      failures, cancellations, set-asides, the pre-registration's freezing,
+      reruns of whole steps.
+    * **Outputs.** A step records the SHA-256 of each file it wrote
+      (``specialist_end`` → ``outputs``, recorded by runs started after e2er 0.12.1). For steps
+      of older runs only the exported file's hash is known: it is given as
+      ``sha256_at_export`` on the last accepted step that wrote the file, with
+      ``recorded: false``; earlier steps that wrote it carry no hash.
+    """
+    files = files or {}
+    rec = RunRecord()
+    workspace: str | None = None
+    con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    try:
+        tables = _tables(con)
+        if "pipeline_events" not in tables:
+            return rec
+        events = con.execute(
+            "SELECT event_type, stage, specialist, payload, created_at FROM pipeline_events "
+            "WHERE paper_id = ? ORDER BY created_at, rowid",
+            (paper_id,),
+        ).fetchall()
+        contribs = (
+            con.execute(
+                "SELECT specialist, output_file, success, error_msg, created_at FROM contributions "
+                "WHERE paper_id = ? ORDER BY created_at, rowid",
+                (paper_id,),
+            ).fetchall()
+            if "contributions" in tables
+            else []
+        )
+        calls = (
+            con.execute(
+                "SELECT specialist, backend, model, created_at FROM llm_usage WHERE paper_id = ? "
+                "ORDER BY created_at, rowid",
+                (paper_id,),
+            ).fetchall()
+            if "llm_usage" in tables
+            else []
+        )
+        paper: tuple[Any, ...] | None = None
+        if "papers" in tables:
+            cols = {r[1] for r in con.execute("PRAGMA table_info(papers)")}
+            want = [c for c in ("status", "last_error", "updated_at", "workspace") if c in cols]
+            if want:
+                paper = con.execute(f"SELECT {', '.join(want)} FROM papers WHERE id = ?", (paper_id,)).fetchone()
+                if paper is not None:
+                    rec.outcome = {
+                        k: v
+                        for k, v in zip(want, paper, strict=True)
+                        if v not in (None, "") and k not in ("updated_at", "workspace")
+                    }
+                    if "workspace" in want:
+                        workspace = paper[want.index("workspace")]
+                    if "updated_at" in want and paper[want.index("updated_at")]:
+                        rec.outcome["at"] = _utc(paper[want.index("updated_at")])
+    finally:
+        con.close()
+    rec.recorded = bool(events)
+    if "last_error" in rec.outcome:
+        rec.outcome["error"] = _clip(str(rec.outcome.pop("last_error")), 2000)
+    agg = read_aggregation(bundle, workspace)
+    if "status" in rec.outcome:
+        stored = str(rec.outcome["status"])
+        rec.outcome["status"] = effective_status(stored, reviewed=agg is not None)
+        if rec.outcome["status"] == "completed" and stored != "completed":
+            # The error of an old review-word status is the review's own text.
+            rec.outcome.pop("error", None)
+    reviews = sum(1 for e in events if e[0] == "phase_end" and e[1] == "review")
+    rec.internal_review = internal_review(agg, rounds=reviews or None)
+
+    used_contribs: set[int] = set()
+    used_calls: set[int] = set()
+
+    def in_window(at: str | None, start: str | None, end: str | None) -> bool:
+        return at is not None and (start is None or at >= start) and (end is None or at <= end)
+
+    phase: str | None = None
+    current_round: int | None = None
+    pivoting = False
+    rounds: dict[int, dict[str, Any]] = {}
+    seg = -1
+    started: dict[str, tuple[str | None, dict[str, Any]]] = {}
+    pending_rerun: dict[str, dict[str, Any]] = {}
+    template_skills: dict[int, dict[str, list[str]]] = {}
+    step_skills: dict[int, dict[str, list[str]]] = {}  # recorded at dispatch (runs after e2er 0.12.1)
+
+    for etype, stage, sp, payload, created in events:
+        data = json.loads(payload) if payload else {}
+        data = data if isinstance(data, dict) else {"value": data}
+        at = _utc(created)
+        where = {"segment": seg} if seg >= 0 else {}
+        if etype == "run_identity":
+            seg += 1
+            rec.segments.append(
+                {
+                    "commit": data.get("git_sha"),
+                    "version": data.get("package_version"),
+                    **({"uncommitted_changes": bool(data["git_dirty"])} if data.get("git_dirty") is not None else {}),
+                    "from": at,
+                }
+            )
+        elif etype == "template_components":
+            if seg >= 0:
+                rec.segments[seg]["template"] = data.get("template")
+            template_skills[seg] = {k: list(v) for k, v in (data.get("skills") or {}).items()}
+            entries = data.get("credit")
+            if isinstance(entries, list) and entries:
+                rec.credit = {"template": data.get("template"), "entries": [e for e in entries if isinstance(e, dict)]}
+        elif etype == "phase_start":
+            phase = stage
+            current_round, pivoting = None, False
+        elif etype == "specialist_start":
+            started[sp] = (at, data)
+        elif etype in ("specialist_end", "specialist_failed"):
+            start_at, start_data = started.pop(sp, (None, {}))
+            c = next(
+                (
+                    (i, r)
+                    for i, r in enumerate(contribs)
+                    if i not in used_contribs and r[0] == sp and in_window(_utc(r[4]), start_at, at)
+                ),
+                None,
+            )
+            if c is not None:
+                used_contribs.add(c[0])
+            mine = [
+                i
+                for i, r in enumerate(calls)
+                if i not in used_calls and r[0] == sp and in_window(_utc(r[3]), start_at, at)
+            ]
+            used_calls.update(mine)
+            models = list(dict.fromkeys((calls[i][1], calls[i][2]) for i in mine))
+            ok = etype == "specialist_end" and bool(data.get("success", c[1][2] if c else True))
+            step: dict[str, Any] = {
+                "type": "specialist",
+                "phase": phase,
+                "specialist": sp,
+                **where,
+                "backend": models[0][0] if models else None,
+                "model": models[0][1] if models else None,
+                "started": start_at,
+                "ended": at,
+                "accepted": ok,
+            }
+            if phase == "iterative" and current_round is not None:
+                # The iterative mode: the round this step belongs to, and whether it was the change of approach.
+                step["round"] = current_round
+                if pivoting:
+                    step["pivot"] = True
+            if len(models) > 1:
+                step["models"] = [{"backend": b, "model": m} for b, m in models]
+            why = (c[1][3] if c else None) or (data.get("error") if etype == "specialist_failed" else None)
+            if why:
+                step["stopped_by"] = _clip(str(why), 2000)
+            if sp in pending_rerun:
+                step["sent_back"] = pending_rerun.pop(sp)
+            outputs = data.get("outputs")
+            if isinstance(outputs, list):  # recorded by the runner at the time
+                shown = []
+                for o in outputs:
+                    if not isinstance(o, dict) or not o.get("file"):
+                        continue
+                    name = _workspace_name(str(o["file"]), paper_id)
+                    where_now = _bundle_file(name, files)
+                    shown.append(
+                        {
+                            "file": where_now or name,
+                            "sha256": o.get("sha256"),
+                            **({} if where_now else {"exported": False}),
+                            **({"unchanged": True} if o.get("changed") is False else {}),
+                        }
+                    )
+                if shown:
+                    step["output"] = shown[0]
+                    if len(shown) > 1:
+                        step["outputs"] = shown
+            elif c and c[1][1]:
+                name = _workspace_name(str(c[1][1]), paper_id)
+                where_now = _bundle_file(name, files)
+                step["output"] = {"file": where_now or name, "recorded": False, "exported": bool(where_now)}
+            if isinstance(start_data.get("skills"), list) and seg >= 0:
+                step_skills.setdefault(seg, {})[sp] = [str(s) for s in start_data["skills"]]
+            if sp not in rec.agents and not str(sp).startswith("strategist"):
+                rec.agents.append(sp)
+            rec.workflow.append(step)
+        elif etype == "gate_enforced":
+            rec.workflow.append(
+                {
+                    "type": "check",
+                    "phase": phase,
+                    "check": data.get("gate") or stage,
+                    **where,
+                    "passed": bool(data.get("passed")),
+                    "enforced": bool(data.get("enforced")),
+                    "at": at,
+                    **(
+                        {"detail": _clip(str(data["detail"]), 2000)}
+                        if data.get("detail") and not data.get("passed")
+                        else {}
+                    ),
+                }
+            )
+        elif etype == "gate_halted":
+            reasons = data.get("reasons") or []
+            rec.workflow.append(
+                {
+                    "type": "check",
+                    "phase": phase,
+                    "check": stage,
+                    **where,
+                    "passed": False,
+                    "enforced": True,
+                    "halted": True,
+                    "at": at,
+                    "detail": _clip("; ".join(str(r) for r in reasons), 2000),
+                }
+            )
+        elif etype == "preregistration_check":
+            rec.workflow.append(
+                {
+                    "type": "check",
+                    "phase": phase,
+                    "check": "preregistration",
+                    **where,
+                    "passed": bool(data.get("passed")),
+                    "enforced": True,
+                    "at": at,
+                    "deviations": _clip(list(data.get("deviations") or [])),
+                    **({"approved": _clip(list(data["approved"]))} if data.get("approved") else {}),
+                    **({"frozen_at": _utc(data["frozen_at"])} if data.get("frozen_at") else {}),
+                }
+            )
+        elif etype == "contract_halted":
+            # Output that failed its contract in every attempt: the run stopped for the researcher.
+            rec.workflow.append(
+                {
+                    "type": "check",
+                    "phase": phase,
+                    "check": "output_contract",
+                    **where,
+                    "passed": False,
+                    "enforced": True,
+                    "halted": True,
+                    "at": at,
+                    "specialists": _clip(list(data.get("specialists") or [])),
+                }
+            )
+        elif etype == "researcher_action":
+            rec.workflow.append({**researcher_step(data, created, phase), **where})
+            if data.get("decision") == "numbers_accepted":
+                # The run went on past the number check by the researcher's
+                # decision: the halted check says so, with each mismatch.
+                halted = [s for s in rec.workflow if s.get("type") == "check" and s.get("check") == "number_check"]
+                if halted:
+                    halted[-1]["approved_by_researcher"] = {
+                        "at": _utc(data.get("at") or created),
+                        "mismatches": _clip(list(data.get("mismatches") or [])),
+                        # Continued although no table cell was traced at all.
+                        **({"untraced": data["untraced"]} if isinstance(data.get("untraced"), dict) else {}),
+                    }
+            if data.get("decision") == "accepted_as_is":
+                # The output stands by the researcher's decision; one that still
+                # fails its contract is marked as such on the step that wrote it.
+                for acc in data.get("accepted") or []:
+                    prior = [
+                        s
+                        for s in rec.workflow
+                        if s.get("type") == "specialist" and s.get("specialist") == acc.get("specialist")
+                    ]
+                    if prior:
+                        prior[-1]["approved_by_researcher"] = {
+                            "at": _utc(data.get("at") or created),
+                            "contract_failed": bool(acc.get("contract_failed")),
+                            **({"violations": _clip(list(acc["violations"]))} if acc.get("violations") else {}),
+                        }
+        elif etype == "researcher_input":
+            rec.workflow.append(
+                {
+                    "type": "researcher",
+                    "action": "supplied_input",
+                    "phase": phase,
+                    "step": stage,
+                    **where,
+                    "at": at,
+                    "file": data.get("file"),
+                    "sha256": data.get("sha256"),
+                    "supplied_by": data.get("supplied_by", "researcher"),
+                    **({"replaces_sha256": data["replaces_sha256"]} if data.get("replaces_sha256") else {}),
+                }
+            )
+        elif etype == "researcher_rerun":
+            # The runner carrying out a send-back or a rerun (the researcher's own
+            # action is the researcher_action row before it).
+            pending_rerun[stage] = {"at": at, "remark": _clip(data.get("remark"))}
+        elif etype in ("phase_end", "specialist_skipped"):
+            continue
+        elif etype in _ROUND_EVENTS and isinstance(data.get("round"), int):
+            n = data["round"]
+            r = rounds.setdefault(n, {"round": n, "label": f"Round {n}", **where})
+            if etype == "improvement_round":
+                current_round, pivoting = n, False
+                r["started"] = at
+                r["specialists"] = _clip(list(data.get("specialists") or []))
+                r["specialist_labels"] = [_labels.specialist(str(x)) for x in data.get("specialists") or []]
+                if data.get("reason"):
+                    r["reason"] = _clip(str(data["reason"]), 2000)
+            elif etype == "ceiling_check":
+                verdict = str(data.get("verdict") or "")
+                r["ceiling_check"] = {
+                    "verdict": verdict,
+                    "decision": _labels.ceiling_verdict(verdict),
+                    "at": at,
+                    **({"reason": _clip(str(data["reason"]), 2000)} if data.get("reason") else {}),
+                    **({"pivot_refused": str(data["pivot_refused"])} if data.get("pivot_refused") else {}),
+                }
+            elif etype == "pivot":
+                current_round, pivoting = n, True
+                r["pivot"] = {
+                    "label": _labels.event("pivot"),
+                    "specialists": _clip(list(data.get("specialists") or [])),
+                    "specialist_labels": [_labels.specialist(str(x)) for x in data.get("specialists") or []],
+                    "at": at,
+                    **({"focus": _clip(list(data["focus"]))} if data.get("focus") else {}),
+                    **({"refused": _clip(list(data["refused"]))} if data.get("refused") else {}),
+                }
+            else:  # improvement_stopped: the strategist ended the rounds before this one
+                r["label"] = f"Rounds ended before round {n}"
+                r["ended"] = True
+                r["at"] = at
+                if data.get("reason"):
+                    r["reason"] = _clip(str(data["reason"]), 2000)
+        else:
+            name = {"preregistration": "preregistration_frozen"}.get(etype, etype)
+            ev: dict[str, Any] = {"event": name, **({"step": stage} if stage else {}), **where, "at": at}
+            for k, v in data.items():
+                if k in ev:
+                    continue
+                ev[k] = _utc(v) if k.endswith(("_at", "at")) and isinstance(v, str) else _clip(v)
+            rec.events.append(ev)
+    for target, info in pending_rerun.items():
+        rec.events.append({"event": "rerun", "step": target, **info})
+    rec.rounds = [rounds[k] for k in sorted(rounds)]
+    for ev in rec.events:
+        if ev.get("event") in ("self_critique", "polish_applied"):
+            ev["label"] = _labels.event(str(ev["event"]))
+    rec.events.sort(key=lambda e: e.get("at") or "")
+
+    if rec.workflow and not any(isinstance(s.get("output"), dict) and "sha256" in s["output"] for s in rec.workflow):
+        # An older run: the export's hash goes to the last accepted step that wrote each file.
+        last: dict[str, dict[str, Any]] = {}
+        for s in rec.workflow:
+            out = s.get("output")
+            if isinstance(out, dict) and out.get("recorded") is False and s.get("accepted"):
+                last[out["file"]] = s
+        for s in rec.workflow:
+            out = s.get("output")
+            if not (isinstance(out, dict) and out.get("recorded") is False):
+                continue
+            if last.get(out["file"]) is s and out.get("exported"):
+                out["sha256_at_export"] = files[out["file"]]["sha256"]
+            elif out.get("exported") and s.get("accepted"):
+                out["superseded"] = True
+
+    # Skills per agent and segment: recorded at dispatch, else the registry at the
+    # segment's commit plus the template's additions recorded in that segment.
+    for i, segment in enumerate(rec.segments):
+        registry = _registry_skills_at(segment["commit"]) if segment.get("commit") else None
+        ran = {s["specialist"] for s in rec.workflow if s.get("type") == "specialist" and s.get("segment") == i}
+        recorded = step_skills.get(i, {})
+        if ran - set(recorded) and registry is None:
+            segment["skills"] = "unresolved: the registry at this commit could not be read"
+        elif ran - set(recorded):
+            segment["skills"] = "the registry at this commit and the template's additions"
+        elif ran:
+            segment["skills"] = "recorded at dispatch"
+        for agent in sorted(ran):
+            got = recorded.get(agent)
+            if got is None:
+                base = (registry or {}).get(agent, [])
+                got = list(dict.fromkeys([*base, *template_skills.get(i, {}).get(agent, [])]))
+            merged = rec.skills.setdefault(agent, [])
+            merged += [x for x in got if x not in merged]
+            for comp in [f"agent:{agent}", *(skill_component(x) for x in got)]:
+                segs = rec.component_segments.setdefault(comp, [])
+                if i not in segs:
+                    segs.append(i)
+        if segment.get("template"):
+            segs = rec.component_segments.setdefault(f"template:{segment['template']}", [])
+            if i not in segs:
+                segs.append(i)
+        for s in rec.workflow:
+            if s.get("type") == "specialist" and s.get("segment") == i and s.get("backend"):
+                conn = BACKEND_CONNECTOR.get(s["backend"])
+                if conn:
+                    segs = rec.component_segments.setdefault(f"connector:{conn}", [])
+                    if i not in segs:
+                        segs.append(i)
+        segment["steps"] = sum(1 for s in rec.workflow if s.get("segment") == i)
+    # What the run recorded may name paths on the machine that ran it: the CLI
+    # (backend_identity), a file an error message quotes, the workspace. They are
+    # cut to their last part here, for runs recorded before e2er 0.13.8 too;
+    # a record without such a path stays exactly as it was.
+    rec.segments = strip_local_paths(rec.segments)
+    rec.workflow = strip_local_paths(rec.workflow)
+    rec.events = strip_local_paths(rec.events)
+    rec.rounds = strip_local_paths(rec.rounds)
+    rec.outcome = strip_local_paths(rec.outcome)
+    return rec
+
+
+def recorded_workflow(db: Path, paper_id: str, bundle: Path | None = None) -> list[dict[str, Any]]:
+    """The run's steps in order (see :func:`read_run`)."""
+    return read_run(db, paper_id, _bundle_files(bundle)).workflow
+
+
+def _bundle_files(bundle: Path | None) -> dict[str, Any]:
+    """The bundle's files as exported (publish's later changes rolled back): what "at export" means."""
+    if bundle is not None and (bundle / "provenance.json").is_file():
+        from .export.provenance import files_at_export
+
+        prov = json.loads((bundle / "provenance.json").read_text(encoding="utf-8"))
+        return files_at_export(prov) if isinstance(prov, dict) else {}
+    return {}
+
+
+def researcher_step(data: dict[str, Any], at: str, phase: str | None = None) -> dict[str, Any]:
+    """A dossier workflow step for one researcher action (see core/pipeline/researcher.py).
+
+    Every field of the action is kept (a cancellation's ``by``, ``via`` and
+    ``previous_status``, a rerun's ``reruns``), times in UTC.
+    """
+    step: dict[str, Any] = {
+        "type": "researcher",
+        "action": data.get("action"),
+        "phase": phase,
+        "step": data.get("step"),
+        "at": _utc(data.get("at") or at),
+    }
+    for key, value in data.items():
+        if key == "accepted" and isinstance(value, list):
+            # The outputs kept at a contract stop. On a step, `accepted` is the
+            # specialist's yes/no in the dossier format; the list goes under `kept`
+            # (a dossier with an array there was refused by e2er.org).
+            key = "kept"
+        if key == "deviations" and isinstance(value, list) and any(isinstance(d, dict) for d in value):
+            # The changes to the pre-registered plan the researcher approved. In the
+            # dossier format `deviations` lists text (as on the pre-registration
+            # check); the records (file, SHA-256 frozen and approved) go under
+            # `approved_deviations` (e2er.org refused a dossier with objects there).
+            step["deviations"] = _clip(
+                [str(d.get("deviation") or d.get("file")) if isinstance(d, dict) else str(d) for d in value if d]
+            )
+            key = "approved_deviations"
+        if key not in step and value is not None:
+            step[key] = _clip(value)
+    return step
+
+
+def _component_entry(cid: str, repository: str | None, commits: list[str | None]) -> dict[str, Any]:
+    pins = [_pin(cid, repository, c) for c in commits] or [_pin(cid, repository, None)]
+    entry: dict[str, Any] = {"id": cid, "kind": cid.split(":", 1)[0], "name": cid.split(":", 1)[1].split("/")[-1]}
+    entry["pin"] = pins[-1]
+    if len(pins) > 1:
+        entry["pins"] = pins
+    return entry
+
+
+def build_dossier(
+    manifest: dict[str, Any],
+    repository: str | None = "https://github.com/e2er-org/e2er",
+    db: Path | None = None,
+    bundle: Path | None = None,
+    availability: dict[str, dict[str, Any]] | None = None,
+    run: RunRecord | None = None,
+) -> dict[str, Any]:
+    """The dossier document for a research-object manifest (see research_object.py).
+
+    With the run database (or its ``run`` record), the dossier says what the
+    run recorded: every step, the E2ER commit of each part of the run
+    (``e2er.segments``), every template, specialist, skill and connector
+    pinned at each commit it ran on, the run's events and its outcome.
+    Without it (``e2er publish --no-db``) the workflow is absent and the
+    dossier says so; nothing is filled in from the machine that publishes.
+
+    A manifest with ``purpose`` (and ``kind``) passes them into the dossier.
+    ``availability`` is deep-copied: the caller's later changes never reach
+    a dossier whose id was already computed.
+    """
+    paper_id = (manifest.get("process") or {}).get("paper_id") or (manifest.get("run") or {}).get("paper_id")
+    if paper_id is None and bundle is not None and (bundle / "provenance.json").is_file():
+        paper_id = json.loads((bundle / "provenance.json").read_text(encoding="utf-8")).get("run", {}).get("paper_id")
+    if run is None and db is not None and paper_id:
+        run = read_run(db, paper_id, _bundle_files(bundle), bundle)
+    ai, proc = manifest["ai"], manifest["process"]
+    models = sorted({(u["backend"], u["model"]) for u in ai.get("usage", [])})
+    prereg = _preregistration(bundle)
+    recorded = run is not None and run.recorded
+    doc: dict[str, Any] = {"study": {"title": manifest["title"]}}
+    if recorded:
+        assert run is not None
+        segments = run.segments
+        last = segments[-1] if segments else {}
+        commit = last.get("commit")
+        doc["schema"] = SCHEMA_RUN
+        doc["e2er"] = {
+            "version": last.get("version"),
+            "repository": repository if commit else None,
+            "commit": commit,
+            **({"uncommitted_changes": any(s.get("uncommitted_changes") for s in segments)} if segments else {}),
+            "segments": segments,
+            "exported_with": proc.get("e2er_version"),
+        }
+        commits_of = {cid: [segments[i].get("commit") for i in segs] for cid, segs in run.component_segments.items()}
+        uses = list(manifest["dependencies"]["uses"])
+        backend_conn = BACKEND_CONNECTOR.get(ai.get("backend") or "")
+        if backend_conn:
+            uses.append(f"connector:{backend_conn}")
+        components = []
+        for cid in sorted(set(uses) | set(commits_of)):
+            commits = list(dict.fromkeys(commits_of.get(cid) or [c.get("commit") for c in segments[-1:]]))
+            components.append(_component_entry(cid, repository, commits))
+        workflow = run.workflow
+    else:
+        doc["schema"] = SCHEMA
+        doc["e2er"] = {"version": proc.get("e2er_version"), "repository": None, "commit": None}
+        uses = list(manifest["dependencies"]["uses"])
+        backend_conn = BACKEND_CONNECTOR.get(ai.get("backend") or "")
+        if backend_conn:
+            uses.append(f"connector:{backend_conn}")
+        components = [_component_entry(c, repository, []) for c in sorted(set(uses))]
+        workflow = []
+    doc["run"] = {
+        "template": proc.get("template"),
+        "mode": proc.get("mode"),
+        "governance": proc.get("governance"),
+        "backend": ai.get("backend"),
+        "models": [{"backend": b, "model": m} for b, m in models]
+        or ([{"backend": ai.get("backend"), "model": ai.get("model")}] if ai.get("model") else []),
+        "exported": proc.get("exported"),
+    }
+    if recorded:
+        assert run is not None
+        doc["run"]["outcome"] = run.outcome
+        if run.internal_review:
+            doc["run"]["internal_review"] = run.internal_review
+        doc["run"]["events"] = run.events
+        if run.rounds:
+            # The iterative mode's rounds, ceiling checks and change of approach. A run without
+            # rounds (one pass) adds nothing, so those dossiers (and their ids) are unchanged.
+            doc["run"]["rounds"] = run.rounds
+        if run.credit:
+            # The work the template is based on, cites or relates to, as the run recorded it. A
+            # template without `[[credit]]` adds nothing, so those dossiers (and their ids) are unchanged.
+            doc["credit"] = copy.deepcopy(run.credit)
+    else:
+        doc["run"]["workflow_recorded"] = False
+        doc["run"]["note"] = (
+            "Published without the run database: the steps of the run, the commit it ran on and the "
+            "researcher's actions are not recorded in this dossier."
+        )
+    doc["components"] = components
+    doc["data"] = [{"path": d["path"], "sha256": d["sha256"]} for d in manifest.get("data", [])]
+    sources = _data_sources(bundle)
+    if sources:
+        doc["data_sources"] = sources
+    references = _references(bundle)
+    if references:
+        doc["references"] = references
+    doc["workflow"] = workflow
+    if not recorded and (prereg is not None or any(w.get("type") == "researcher" for w in workflow)):
+        doc["schema"] = SCHEMA_RESEARCHER
+    if prereg is not None:
+        doc["preregistration"] = prereg
+    if any_public(availability):
+        if not recorded:
+            doc["schema"] = SCHEMA_AVAILABILITY
+        doc["availability"] = copy.deepcopy(availability)
+    if manifest.get("purpose"):
+        doc["purpose"] = manifest["purpose"]
+        if manifest.get("kind"):
+            doc["kind"] = manifest["kind"]
+    if manifest.get("amendments"):
+        doc["amendments"] = copy.deepcopy(manifest["amendments"])
+    if recorded:
+        prov = _bundle_provenance(bundle)
+        amendments = prov.get("amendments") if prov else manifest.get("amendments")
+        current = (prov or {}).get("files") or {
+            f["path"]: {"sha256": f["sha256"]}
+            for f in [*manifest.get("data", []), *manifest.get("outputs", [])]
+            if isinstance(f, dict) and f.get("path")
+        }
+        withhold_earlier_fingerprints(doc, amendments or [], current)
+    return doc
+
+
+#: Amendments after which a file's earlier fingerprints are withheld from the dossier, with the words it gives.
+#: The run recorded the SHA-256 of each file a step wrote; for a file whose text was later taken out (``e2er
+#: redact``, the anonymisation for double-blind review) such a fingerprint confirms a guess of the text taken
+#: out: put the guess back where the replacement sits and hash. The abstract's amendments are listed too, so a
+#: paper whose text changed after its steps shows every earlier version the same way.
+WITHHELD_AFTER = {
+    "redacted": "redacted after the step",
+    "anonymised": "anonymised after the step",
+    "abstract_rewritten": "abstract rewritten after the step",
+    "abstract_edited_by_researcher": "abstract edited after the step",
+}
+
+_HEX64 = re.compile(r"^(?:sha256:)?([0-9a-f]{64})$")
+
+
+def _bundle_provenance(bundle: Path | None) -> dict[str, Any] | None:
+    if bundle is None or not (bundle / "provenance.json").is_file():
+        return None
+    try:
+        prov = json.loads((bundle / "provenance.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return prov if isinstance(prov, dict) else None
+
+
+def withhold_earlier_fingerprints(
+    doc: dict[str, Any], amendments: list[dict[str, Any]], files: dict[str, Any]
+) -> dict[str, Any]:
+    """Withhold, in place, the step fingerprints of file versions that a later redaction, anonymisation or
+    abstract change replaced (:data:`WITHHELD_AFTER`); returns ``doc``.
+
+    For each such file every fingerprint the workflow gives it (a step's output, ``sha256_at_export``, a file
+    the researcher supplied) becomes ``"sha256": null`` with ``"withheld": "<why>"``, and the same value
+    anywhere else in the workflow, the events or the rounds goes too. Kept: the file as it is published
+    (``files``, provenance.json's listing), the pre-registration's frozen fingerprints (public in its lock
+    file: anyone checks the deposited plan with them) and the fingerprints the amendments give in plain (a
+    folder published before, a pre-registered plan file). Nothing else changes, so a study without such an
+    amendment keeps exactly its dossier and its address. verify does not use the step fingerprints: it checks
+    the folder against provenance.json and the amendments' own (salted) records.
+    """
+    why: dict[str, str] = {}
+    for a in amendments:
+        if isinstance(a, dict) and isinstance(a.get("path"), str) and a.get("kind") in WITHHELD_AFTER:
+            why.setdefault(a["path"], WITHHELD_AFTER[str(a["kind"])])
+    if not why:
+        return doc
+
+    def bare(v: Any) -> str | None:
+        m = _HEX64.match(v) if isinstance(v, str) else None
+        return m.group(1) if m else None
+
+    public: set[str] = set()
+    for f in files.values():
+        if isinstance(f, dict) and bare(f.get("sha256")):
+            public.add(str(bare(f.get("sha256"))))
+    prereg = doc.get("preregistration") or {}
+    for v in [prereg.get("sha256"), *(prereg.get("plan_files") or {}).values()]:
+        if bare(v):
+            public.add(str(bare(v)))
+    for a in doc.get("amendments") or []:
+        for k in ("sha256_before", "sha256_after"):
+            if isinstance(a, dict) and bare(a.get(k)):
+                public.add(str(bare(a.get(k))))
+
+    withheld: dict[str, str] = {}  # fingerprint → why
+
+    def take(value: Any, reason: str) -> None:
+        h = bare(value)
+        if h and h not in public:
+            withheld.setdefault(h, reason)
+
+    for step in doc.get("workflow") or []:
+        if not isinstance(step, dict):
+            continue
+        outs = [o for o in [step.get("output"), *(step.get("outputs") or [])] if isinstance(o, dict)]
+        for o in outs:
+            if o.get("exported") is False or o.get("file") not in why:
+                continue
+            take(o.get("sha256"), why[o["file"]])
+            take(o.get("sha256_at_export"), why[o["file"]])
+        if step.get("type") == "researcher" and isinstance(step.get("file"), str):
+            rel = _bundle_file(_workspace_name(step["file"], None), files) or step["file"]
+            if rel in why:
+                for k in ("sha256", "replaces_sha256", "sha256_before", "sha256_after"):
+                    take(step.get(k), why[rel])
+    if not withheld:
+        return doc
+
+    def sweep(node: Any) -> None:
+        if isinstance(node, list):
+            for v in node:
+                sweep(v)
+            return
+        if not isinstance(node, dict):
+            return
+        for k in list(node):
+            h = bare(node[k])
+            if h in withheld:
+                if k == "sha256_at_export":
+                    del node[k]  # a hash or absent, in the dossier format
+                else:
+                    node[k] = None
+                node.setdefault("withheld", withheld[h])
+            else:
+                sweep(node[k])
+
+    sweep(doc.get("workflow"))
+    run = doc.get("run") or {}
+    sweep(run.get("events"))
+    sweep(run.get("rounds"))
+    return doc
+
+
+#: The keys of a load the dossier keeps (data/data_sources.json, see modules/data/load_record.py).
+#: A load recorded before a key existed simply lacks it.
+_SOURCE_KEYS = (
+    "dataset",
+    "version",
+    "table",
+    "saved_to",
+    "licence",
+    "terms",
+    "citation",
+    "cite_key",
+    # Since every connector records its loads: what a study page shows.
+    "series",
+    "retrieved_at",
+    "terms_summary",
+    "citation_by",
+    "link",
+    "doi",
+)
+
+
+def _data_sources(bundle: Path | None) -> list[dict[str, Any]]:
+    """The external-source loads ``data/data_sources.json`` records: source, release, files with SHA-256.
+
+    Written by every data connector (FRED, yfinance, GMD, Allium, a Zenodo
+    record, the researcher's data folder) when it loads data. A study without the file has no ``data_sources``
+    in its dossier, so its dossier (and address) is unchanged.
+    """
+    if bundle is None:
+        return []
+    path = Path(bundle) / "data" / "data_sources.json"
+    try:
+        loads = json.loads(path.read_text(encoding="utf-8")).get("loads") if path.is_file() else None
+    except (OSError, ValueError, AttributeError):
+        return []
+    out: list[dict[str, Any]] = []
+    for load in loads if isinstance(loads, list) else []:
+        if not isinstance(load, dict) or not load.get("connector"):
+            continue
+        entry: dict[str, Any] = {"connector": str(load["connector"])}
+        for key in _SOURCE_KEYS:
+            if isinstance(load.get(key), str) and load[key]:
+                entry[key] = load[key]
+        # A file read from the source (url) or from the researcher's data folder (path).
+        entry["files"] = [
+            {("url" if f.get("url") else "path"): str(f.get("url") or f["path"]), "sha256": str(f["sha256"])}
+            for f in load.get("files") or []
+            if isinstance(f, dict) and (f.get("url") or f.get("path")) and f.get("sha256")
+        ]
+        out.append(entry)
+    return out
+
+
+def _preregistration(bundle: Path | None) -> dict[str, Any] | None:
+    """The frozen pre-registration of an exported study: file, fingerprint, time, plan files, deposit."""
+    if bundle is None:
+        return None
+    from .pipeline.preregistration import load_lock
+
+    lock = load_lock(bundle / "design")
+    if lock is None:
+        return None
+    out = {
+        "file": f"design/{lock.get('file', 'preregistration.md')}",
+        "sha256": lock.get("sha256"),
+        "frozen_at": _utc(lock.get("frozen_at")),
+    }
+    if isinstance(lock.get("plan_files"), dict) and lock["plan_files"]:
+        out["plan_files"] = dict(lock["plan_files"])
+    if lock.get("deposit"):
+        out["deposit"] = lock["deposit"]
+    if lock.get("approved_deviations"):
+        # Changes to the plan after the freeze that the researcher approved at the estimation check.
+        out["approved_deviations"] = list(lock["approved_deviations"])
+    return out
+
+
+_AUTHOR = re.compile(r"\\author\{((?:[^{}]|\{(?:[^{}]|\{[^{}]*\})*\})*)\}")
+_E2ER_THANKS = re.compile(r"\\thanks\{(?:This paper was produced with e2er|Demonstration\.)(?:[^{}]|\{[^{}]*\})*\}")
+_WITH_E2ER = re.compile(r"\s*with e2er\s*$")
+
+
+def footnote(doc: dict[str, Any] | None, did: str, site: str | None = None, address: str | None = None) -> str:
+    """The first-page footnote: what the dossier at ``did`` lists, and only what it lists (its address on ``site``,
+    or ``address``: an anonymous version's e2er.org/r/<code>)."""
+    url = f"\\url{{{address or dossier_url(did, site)}}}"
+    if doc is not None and doc.get("run", {}).get("workflow_recorded") is False:
+        return (
+            "This paper was produced with e2er. Its dossier records the template, specialists, skills, connectors "
+            "and AI models used and the fingerprints of the data; it was published without the run's database, so "
+            f"the steps of the run are not recorded: {url}."
+        )
+    unresolved = doc is not None and any(
+        "unresolved" in str(p.get("note", "")) for c in doc.get("components", []) for p in c.get("pins", [c["pin"]])
+    )
+    pinned = (
+        "pinned to the versions the run used where E2ER's repository holds them"
+        if unresolved
+        else "each pinned to the version the run used"
+    )
+    return (
+        "This paper was produced with e2er. Its dossier lists every step of the run (the specialists, the checks "
+        "and the researcher's actions), the files the steps produced, and the template, specialists, skills, "
+        f"connectors and AI models used, {pinned}: {url}."
+    )
+
+
+def stamp_paper(
+    tex: str,
+    author: str | None,
+    did: str,
+    *,
+    purpose: str | None = None,
+    kind: str | None = None,
+    doc: dict[str, Any] | None = None,
+    site: str | None = None,
+    address: str | None = None,
+) -> str:
+    """Write the dossier footnote (and the disclaimer) into a paper's first page; the author line with ``author``.
+
+    With ``author``: ``\\author{<author> with e2er\\thanks{...}}``. Without: the
+    paper's own author line is kept and the footnote added to it (a paper
+    without one gets ``\\author{e2er\\thanks{...}}``). An existing stamp is
+    replaced, so stamping twice gives the same text. A demonstration study
+    (``purpose="demonstration"``) gets the disclaimer as a second footnote,
+    the replication wording when ``kind="replication"``; without a purpose an
+    earlier disclaimer is removed.
+    """
+    notes = f"\\thanks{{{footnote(doc, did, site, address)}}}"
+    if purpose == DEMONSTRATION:
+        notes += f"\\thanks{{{disclaimer(kind)}}}"
+    m = _AUTHOR.search(tex)
+    if author:
+        block = f"\\author{{{author} with e2er{notes}}}"
+    else:
+        own = _E2ER_THANKS.sub("", m.group(1)).strip() if m else ""
+        block = f"\\author{{{own or 'e2er'}{notes}}}"
+    if m:
+        return tex[: m.start()] + block + tex[m.end() :]
+    return tex.replace("\\begin{document}", block + "\n\\begin{document}", 1)
+
+
+def _references(bundle: Path | None) -> list[dict[str, Any]]:
+    """The references the paper cites, each with where it came from: the researcher's papers, the template's
+    method sources, or a web search.
+
+    Read from the exported ``paper/refs.bib`` (its ``e2er_source`` tags, written
+    since 0.15.0 by study_inputs.prepare_papers and the literature search) and
+    the keys ``paper/paper.tex`` cites. A study whose bibliography carries no
+    tags (exported before 0.15.0) has no ``references``, so its dossier and its
+    address are unchanged.
+    """
+    if bundle is None:
+        return []
+    from ..modules.literature.models import SOURCE_FIELD
+    from .pipeline.verify_citations import load_bib, parse_cite_keys
+
+    entries = load_bib(Path(bundle) / "paper" / "refs.bib")
+    if not any(f.get(SOURCE_FIELD) for f in entries.values()):
+        return []
+    try:
+        tex = (Path(bundle) / "paper" / "paper.tex").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    out: list[dict[str, Any]] = []
+    for key in parse_cite_keys(tex):
+        f = entries.get(key)
+        if f is None:
+            continue
+        entry: dict[str, Any] = {
+            "key": key,
+            "title": " ".join(str(f.get("title") or "").replace("{", "").replace("}", "").split()),
+            # The template's method sources are tagged "template" (shown as "method source").
+            "source": tag if (tag := str(f.get(SOURCE_FIELD) or "")) in ("researcher", "template") else "web",
+        }
+        if str(f.get("year") or "").strip():
+            entry["year"] = str(f["year"]).strip()
+        if str(f.get("doi") or "").strip():
+            entry["doi"] = str(f["doi"]).strip()
+        out.append(entry)
+    return out

@@ -1,0 +1,337 @@
+"""Tiered context builders — deliver proportional context to each specialist."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+
+def build_tier0_context(workspace: Path, paper_id: str) -> str:
+    """Tier 0 — minimal orientation: paper title, research question, data available.
+
+    The research question is wrapped via sanitize_for_prompt because it's
+    untrusted user input that flows into every strategist and specialist call.
+    """
+    from ...modules.security import sanitize_for_prompt
+
+    manifest = _read_artifact(workspace, "manifest.json")
+    if not manifest:
+        return f"Paper ID: {paper_id}\nWorkspace: {workspace}"
+    import json
+
+    data = json.loads(manifest)
+    lines = [
+        f"Paper: {data.get('title', 'Untitled')}",
+        f"ID: {paper_id}",
+        f"Methodology: {data.get('methodology', 'empirical')}",
+        f"Data Available: {', '.join(data.get('datasets') or [])}",
+        f"Current Stage: {data.get('current_stage', 'unknown')}",
+        "",
+        "Research Question:",
+        sanitize_for_prompt(data.get("research_question") or "TBD", max_chars=2000),
+    ]
+    template = template_context()
+    if template:
+        lines += ["", template]
+    return "\n".join(lines)
+
+
+def template_context() -> str:
+    """What the running template changes about e2er's defaults, for every specialist and the strategist.
+
+    Empty for a template that keeps the defaults (a regression with a causal
+    claim, the economist persona), so those runs see exactly what they saw before.
+    """
+    from ..pipeline.components import active
+    from ..pipeline.result_kinds import RESULTS_FILE, get
+
+    spec = active()
+    if spec is None or spec.is_default_core():
+        return ""
+    k = get(spec.results)
+    lines = [f"Template: {spec.title or spec.name}"]
+    if spec.results != "regression":
+        lines.append(
+            f"- Results: {k.label}. The analysis step (econometrics_specialist) writes {RESULTS_FILE} in the "
+            f"{spec.results} results schema; nobody estimates a regression unless the plan asks for one."
+        )
+    if not spec.causal:
+        lines.append(
+            "- No causal claim: no identification strategy is needed (do not dispatch identification_strategist "
+            "or theory_specialist); describe patterns and associations, not effects."
+        )
+    from ..labels import step as step_label
+    from ..specialists.registry import SPECIALIST_ARTIFACTS
+
+    for s in spec.steps:
+        if s.kind != "gate" or not s.after:
+            continue
+        # A check inside the dispatch runs once these specialists are done and before the analysis:
+        # the strategist must dispatch them (a template's own specialists are not in its default plan).
+        own = [a for a in s.after if a in SPECIALIST_ARTIFACTS]
+        held = (
+            f" {', '.join(s.before)} is not dispatched until this check has passed: a specialist it reads that "
+            "your plan leaves out is sent out first, so plan them yourself."
+            if s.before
+            else ""
+        )
+        if "econometrics_specialist" in s.after:
+            # A check of the results: it runs once the analysis (and the specialists named with it) are done.
+            others = [a for a in own if a != "econometrics_specialist"]
+            lines.append(
+                f"- Check after the analysis: {step_label(s.name, spec)} ({s.check}). "
+                + (
+                    f"Dispatch {', '.join(others)} after econometrics_specialist and before paper_drafter; "
+                    if others
+                    else ""
+                )
+                + "the check runs once they are done, before the draft, and stops the run when it fails."
+                + held
+            )
+            continue
+        lines.append(
+            f"- Check before the analysis: {step_label(s.name, spec)} ({s.check}). Dispatch "
+            f"{', '.join(own)} before econometrics_specialist; the check runs right after them and stops the "
+            "run when it fails."
+            + (
+                " Once it passes, the forecast setup and its hold-out are frozen: do not dispatch "
+                "forecast_designer again (a changed setup stops the run at the forecast check)."
+                if s.check == "forecast_design"
+                else ""
+            )
+            + held
+        )
+    from ..pipeline.spec import DEFAULT_BASE_SKILL
+
+    if spec.base_skill != DEFAULT_BASE_SKILL:
+        lines.append(
+            "- Not an economics paper: no JEL codes and no JEL line anywhere (abstract, title page, keywords); "
+            "give keywords only."
+        )
+    panel = spec.panel()
+    lines.append(f"- Review panel: {', '.join(panel)}.")
+    return "\n".join(lines)
+
+
+def build_tier1_context(workspace: Path, paper_id: str) -> str:
+    """Tier 1 — standard context: paper plan + latest draft + key findings."""
+    tier0 = build_tier0_context(workspace, paper_id)
+    sections = [tier0, ""]
+
+    data_tables = _list_data_tables(workspace)
+    if data_tables:
+        sections.append(
+            "## Local Data Warehouse (data.db)\n"
+            "The researcher's data files (and any external series you materialize) are imported "
+            "as SQL tables in this paper's data.db. Query them with the `query_data` tool using "
+            "real SQL — aggregate, join, filter. Do NOT query Allium for these.\n\n" + data_tables
+        )
+    else:
+        user_data = _list_user_data(workspace)
+        if user_data:
+            sections.append(
+                "## Researcher-Provided Data Files (workspace/data/)\n"
+                "Use the read_file tool to load any of these. Do NOT try to query Allium "
+                "for these — they are supplied directly by the researcher.\n\n" + user_data
+            )
+
+    paper_plan = _read_artifact(workspace, "paper_plan.md")
+    if paper_plan:
+        sections.append("## Paper Plan\n" + _truncate(paper_plan, 3000))
+
+    key_findings = _read_artifact(workspace, "key_findings.md")
+    if key_findings:
+        sections.append("## Key Findings\n" + _truncate(key_findings, 2000))
+
+    draft = _read_artifact(workspace, "paper_draft.tex") or _read_artifact(workspace, "paper_draft.md")
+    if draft:
+        sections.append("## Current Draft (excerpt)\n" + _truncate(draft, 4000))
+
+    return "\n\n".join(s for s in sections if s)
+
+
+def build_tier2_context(workspace: Path, paper_id: str) -> str:
+    """Tier 2 — deep context: everything from Tier 1 + lit review + data summary + contributions."""
+    tier1 = build_tier1_context(workspace, paper_id)
+    sections = [tier1, ""]
+
+    # Corpus evidence first, and with the largest budget of anything here: it is
+    # the only input that says what prior work *found* rather than that it
+    # exists, and every quote in it has been checked against its source. Absent
+    # unless a corpus has been built, in which case this costs nothing.
+    evidence = _read_artifact(workspace, "literature/corpus_evidence.md")
+    if evidence:
+        sections.append("## Evidence From The Corpus\n" + _truncate(evidence, 6000))
+
+    for fname in [
+        "literature_review.md",
+        "data_summary.md",
+        "identification_strategy.md",
+        # Machine-readable declared spec — the econometrics specialist's
+        # `main` entry is contract-gated against it, so it must be visible
+        # in the dispatch context, not just discoverable via read_file.
+        "identification_spec.json",
+        "contributions.json",
+        "econometric_spec.md",
+    ]:
+        content = _read_artifact(workspace, fname)
+        if content:
+            label = fname.replace("_", " ").replace(".md", "").replace(".json", "").title()
+            sections.append(f"## {label}\n" + _truncate(content, 2000))
+
+    return "\n\n".join(s for s in sections if s)
+
+
+def build_review_context(workspace: Path, paper_id: str) -> str:
+    """Full paper context for the review stage.
+
+    Pre-loads the paper draft + key supporting artifacts at FULL size so the
+    reviewer doesn't need to make any read_file tool calls. Each tool call
+    re-sends the result on every subsequent turn, so eliminating those reads
+    cuts review-phase token usage by ~5x in practice.
+
+    Returns the assembled context block. The caller (dispatcher._inject_context)
+    routes pure-text reviewer specialists here.
+    """
+    draft = _read_artifact(workspace, "paper_draft.tex") or _read_artifact(workspace, "paper_draft.md")
+    if not draft:
+        # No draft yet — fall back so reviewers can at least see whatever
+        # design artifacts exist.
+        return build_tier2_context(workspace, paper_id)
+
+    header = build_tier0_context(workspace, paper_id)
+    sections = [header, f"## Full Paper Draft\n{draft}"]
+
+    # Supporting documents loaded at full size so the reviewer doesn't need to
+    # re-read them via read_file. Keep this list in sync with the docs that
+    # reviewer skill files actually reference.
+    for fname, label in [
+        ("identification_strategy.md", "Identification Strategy"),
+        ("econometric_spec.md", "Econometric Specification"),
+        ("literature_review.md", "Literature Review"),
+        ("data_dictionary.json", "Data Dictionary"),
+        ("data_summary.md", "Data Summary"),
+        ("paper_plan.md", "Paper Plan"),
+    ]:
+        content = _read_artifact(workspace, fname)
+        if content:
+            sections.append(f"## {label}\n{content}")
+
+    return "\n\n".join(sections)
+
+
+def build_self_attack_context(workspace: Path, paper_id: str) -> str:
+    """Context for the self-attack adversarial phase."""
+    draft = _read_artifact(workspace, "paper_draft.tex") or _read_artifact(workspace, "paper_draft.md")
+    identification = _read_artifact(workspace, "identification_strategy.md")
+    econometrics = _read_artifact(workspace, "econometric_spec.md")
+
+    sections = []
+    if draft:
+        sections.append(f"## Paper Draft\n{_truncate(draft, 6000)}")
+    if identification:
+        sections.append(f"## Identification Strategy\n{_truncate(identification, 2000)}")
+    if econometrics:
+        sections.append(f"## Econometric Specification\n{_truncate(econometrics, 2000)}")
+    return "\n\n".join(sections)
+
+
+#: How much of a text cell a sample row shows. A text study's corpus table holds whole books in one
+#: column; printed in full, the sample rows of 20 novels made a 5.4-million-character prompt that the
+#: model could not take (live run, 2026-10-11).
+_SAMPLE_TEXT_CHARS = 200
+
+
+def _sample_value(value: object) -> str:
+    """A cell of a sample row, with long text cut and its length given."""
+    if isinstance(value, str) and len(value) > _SAMPLE_TEXT_CHARS:
+        return f"{value[:_SAMPLE_TEXT_CHARS]!r}… ({len(value):,} characters)"
+    if isinstance(value, bytes) and len(value) > _SAMPLE_TEXT_CHARS:
+        return f"<{len(value):,} bytes>"
+    return repr(value)
+
+
+def _list_data_tables(workspace: Path) -> str:
+    """Describe the paper's data.db tables (name, columns+types, row count,
+    sample rows) so specialists know what they can `query_data`. Empty string
+    when there's no data.db."""
+    from ...db.paper_data_db import list_tables_catalog_sync
+
+    try:
+        catalog = list_tables_catalog_sync(workspace)
+    except Exception as e:
+        from ...logging_config import get_logger
+
+        get_logger(__name__).debug("data.db catalog read failed for %s: %s", workspace, e)
+        return ""
+    if not catalog:
+        return ""
+
+    lines: list[str] = []
+    for tbl in catalog:
+        cols = ", ".join(f"{c['name']} {c['type']}".strip() for c in tbl["columns"])
+        rc = tbl.get("row_count")
+        rc_str = f"{rc:,}" if isinstance(rc, int) else "?"
+        lines.append(f"### `{tbl['table']}` ({rc_str} rows)")
+        lines.append(f"Columns: {cols}")
+        samples = tbl.get("samples") or []
+        if samples:
+            col_names = [c["name"] for c in tbl["columns"]]
+            lines.append("Sample rows:")
+            for row in samples:
+                pairs = ", ".join(f"{n}={_sample_value(v)}" for n, v in zip(col_names, row, strict=False))
+                lines.append(f"  - {pairs}")
+        lines.append("")
+    return "\n".join(lines).rstrip()
+
+
+def _list_user_data(workspace: Path) -> str:
+    """List files under workspace/data/ with a short preview for csv/jsonl files."""
+    data_dir = workspace / "data"
+    if not data_dir.exists():
+        return ""
+    files = sorted(p for p in data_dir.iterdir() if p.is_file())
+    if not files:
+        return ""
+
+    lines: list[str] = []
+    for path in files:
+        size_kb = path.stat().st_size / 1024
+        line = f"- `data/{path.name}` ({size_kb:.1f} KB)"
+        # First 5 non-empty lines for readable text formats.
+        if path.suffix.lower() in {".csv", ".tsv", ".jsonl", ".txt"}:
+            try:
+                with path.open("r", encoding="utf-8", errors="replace") as f:
+                    head = []
+                    for raw in f:
+                        s = raw.rstrip("\n")
+                        if s.strip():
+                            head.append(s)
+                        if len(head) >= 5:
+                            break
+                if head:
+                    preview = "\n    ".join(h[:200] for h in head)
+                    line += f"\n    {preview}"
+            except Exception as e:
+                from ...logging_config import get_logger
+
+                get_logger(__name__).debug("preview read failed for %s: %s", path, e)
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _read_artifact(workspace: Path, filename: str) -> str | None:
+    path = workspace / filename
+    if path.exists():
+        try:
+            return path.read_text(encoding="utf-8")
+        except Exception as e:
+            from ...logging_config import get_logger
+
+            get_logger(__name__).warning("Failed to read artifact %s: %s", path, e)
+    return None
+
+
+def _truncate(text: str, max_chars: int) -> str:
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars] + f"\n\n[...truncated at {max_chars} chars]"

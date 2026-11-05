@@ -1,0 +1,285 @@
+"""Data module — Allium tool definitions and tool handler."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Any
+
+from ...logging_config import get_logger
+from ..llm.base import ToolHandler
+
+logger = get_logger(__name__)
+
+ALLIUM_TOOLS: list[dict[str, Any]] = [
+    {
+        "name": "query_allium",
+        "description": (
+            "Submit a SQL query to Allium blockchain data. "
+            "FEASIBILITY queries (query_type='feasibility') run against a 1000-row sample "
+            "and are auto-approved. "
+            "PRODUCTION queries require human approval and will return a query_id to poll. "
+            "All queries must: (1) list explicit fields — no SELECT *, "
+            "(2) use only fields from data_dictionary.json, "
+            "(3) include a time-bound WHERE clause, "
+            "(4) justify transaction-level granularity if applicable."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "sql": {"type": "string", "description": "The SQL query to execute"},
+                "query_type": {
+                    "type": "string",
+                    "enum": ["feasibility", "production"],
+                    "description": (
+                        "feasibility=sample run (auto-approved), production=full run (human approval required)"
+                    ),
+                },
+                "fields_requested": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Explicit list of column names selected — must match data_dictionary.json",
+                },
+                "estimated_rows": {
+                    "type": "integer",
+                    "description": "Your estimate of the result set size",
+                },
+                "aggregation_level": {
+                    "type": "string",
+                    "enum": ["transaction", "event", "daily", "weekly", "custom"],
+                },
+                "rationale": {
+                    "type": "string",
+                    "description": "Why this query is needed and what it tests",
+                },
+                "primary_table": {
+                    "type": "string",
+                    "description": "Main table being queried (for feasibility-first check)",
+                },
+            },
+            "required": ["sql", "query_type", "fields_requested", "aggregation_level"],
+        },
+    },
+    {
+        "name": "check_approval",
+        "description": "Check whether a production query has been approved by the researcher.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query_id": {
+                    "type": "string",
+                    "description": "The query_id returned by query_allium",
+                },
+            },
+            "required": ["query_id"],
+        },
+    },
+    {
+        "name": "list_allium_tables",
+        "description": "List available Allium dataset schemas and tables.",
+        "input_schema": {"type": "object", "properties": {}},
+    },
+]
+
+
+class AlliumToolHandler(ToolHandler):
+    """Intercepts Allium tool calls and routes through the guardrail layer."""
+
+    def __init__(self, paper_id: str, specialist: str, dictionary: Any, workspace: Path | None = None) -> None:
+        self._paper_id = paper_id
+        self._specialist = specialist
+        self._dictionary = dictionary  # DataDictionary | None
+        #: Where the load is recorded (data_sources.json); None records nothing.
+        self._workspace: Path | None = workspace
+
+    def can_handle(self, tool_name: str) -> bool:
+        return tool_name in {"query_allium", "check_approval", "list_allium_tables"}
+
+    async def handle(self, tool_name: str, tool_input: dict[str, Any]) -> str:
+        if tool_name == "list_allium_tables":
+            return await self._list_tables()
+        elif tool_name == "check_approval":
+            return await self._check_approval(tool_input["query_id"])
+        elif tool_name == "query_allium":
+            return await self._query_allium(tool_input)
+        return f"Unknown tool: {tool_name}"
+
+    async def _list_tables(self) -> str:
+        from ...config import get_settings
+        from .allium import AlliumProvider
+
+        settings = get_settings()
+        if not settings.allium_api_key:
+            return "Allium not configured. Set ALLIUM_API_KEY in .env."
+        provider = AlliumProvider(settings.allium_api_key, settings.allium_api_base)
+        tables = await provider.list_tables()
+        return json.dumps([t.__dict__ for t in tables], indent=2, default=str)
+
+    async def _check_approval(self, query_id: str) -> str:
+        from .audit import get_approval_status_with_note
+
+        status, note = await get_approval_status_with_note(query_id)
+        if status == "approved":
+            tail = f" Note from researcher: {note}" if note else ""
+            return f"Query {query_id} has been APPROVED. You may now run it via query_allium.{tail}"
+        elif status == "rejected":
+            note_block = (
+                (
+                    f"\n\nResearcher's rejection reason:\n  {note}\n\n"
+                    "Read the reason carefully and submit a NEW production query that addresses it. "
+                    "Do NOT keep polling this rejected query — submit a corrected one with query_allium "
+                    "(query_type='production')."
+                )
+                if note
+                else (
+                    "\n\nThe researcher did not leave a note. Submit a fresh production query that "
+                    "more closely matches the data_dictionary specification."
+                )
+            )
+            return f"Query {query_id} was REJECTED by the researcher.{note_block}"
+        return (
+            f"Query {query_id} is pending approval. Wait — do NOT submit duplicate queries. "
+            "Call check_approval again on this same query_id after a short interval."
+        )
+
+    async def _query_allium(self, tool_input: dict[str, Any]) -> str:
+        from ...config import get_settings
+        from .allium import AlliumProvider
+        from .audit import create_approval_request, log_query, mark_approved, mark_executed
+        from .guardrails import QueryValidator
+
+        settings = get_settings()
+        if not settings.allium_api_key:
+            return "Allium not configured. Set ALLIUM_API_KEY in .env."
+
+        sql = tool_input["sql"]
+        query_type = tool_input["query_type"]
+        fields = tool_input.get("fields_requested", [])
+        agg_level = tool_input["aggregation_level"]
+        rationale = tool_input.get("rationale", "")
+        primary_table = tool_input.get("primary_table", "")
+        estimated_rows = tool_input.get("estimated_rows")
+
+        # Validate against the guardrails. ALWAYS runs — the structural rules
+        # (no SELECT *, time-bound) and feasibility-first/approval gate do not
+        # need a data dictionary; only the field-whitelist (Rule 2) is gated on
+        # one (skipped with a warning when absent). A missing dictionary must
+        # NOT bypass validation wholesale.
+        result = await QueryValidator.validate_all(
+            sql=sql,
+            query_type=query_type,
+            fields_requested=fields,
+            aggregation_level=agg_level,
+            granularity_justification=rationale,
+            dictionary=self._dictionary,  # may be None
+            paper_id=self._paper_id,
+            primary_table=primary_table,
+        )
+        if not result.valid:
+            return f"Query rejected by guardrails:\n{result.rejection_reason}"
+
+        # Log the query
+        query_id = await log_query(
+            paper_id=self._paper_id,
+            specialist=self._specialist,
+            query_sql=sql,
+            query_type=query_type,
+            fields_requested=fields,
+            aggregation_level=agg_level,
+            estimated_rows=estimated_rows,
+        )
+
+        # Feasibility: enforce LIMIT 1000 and auto-approve
+        if query_type == "feasibility":
+            exec_sql = _enforce_limit(sql, 1000)
+            await mark_approved(query_id, approved_by="auto_feasibility")
+        else:
+            # Production: create approval request, return pending
+            await create_approval_request(query_id, self._paper_id)
+            return (
+                f"Production query submitted for researcher approval.\n"
+                f"query_id: {query_id}\n"
+                f"Use check_approval(query_id='{query_id}') to check status. "
+                f"The researcher will review the query in the dashboard."
+            )
+
+        # Execute feasibility query
+        provider = AlliumProvider(settings.allium_api_key, settings.allium_api_base)
+        try:
+            # Renamed from `result` to avoid shadowing the ValidationResult above —
+            # mypy locks the variable's inferred type at first assignment.
+            query_result = await provider.execute_raw(exec_sql)
+            err = query_result.get("error")
+            if err:
+                # execute_raw returned an error envelope (HTTP 4xx/5xx,
+                # rate limit, malformed response). Surface this to the
+                # model AND skip mark_executed — otherwise the audit log
+                # records "executed, 0 rows" which falsely implies the
+                # query ran successfully against empty data.
+                logger.warning("Allium feasibility query %s failed: %s", query_id, err)
+                return (
+                    f"Feasibility query failed at the Allium API: {err}\n"
+                    f"query_id: {query_id}\n"
+                    "The query was guardrail-validated, sent to Allium, and Allium "
+                    "returned an error response. Investigate the error message above "
+                    "(typical causes: table name mismatch, rate limit, tier access). "
+                    "Do NOT proceed to production with this query as-is."
+                )
+            rows = query_result.get("rows", [])
+            row_count = len(rows)
+            await mark_executed(query_id, row_count)
+            if rows and self._workspace is not None:
+                from .load_record import allium_load, now_utc, try_record
+
+                entry = allium_load(primary_table or "query", now_utc(), query=exec_sql)
+                try_record(self._workspace, {**entry, "rows": row_count, "specialist": self._specialist})
+            return (
+                f"Feasibility query executed. {row_count} rows returned.\n"
+                f"query_id: {query_id}\n"
+                f"Sample result (first 3 rows):\n"
+                f"{json.dumps(rows[:3], indent=2, default=str)}\n\n"
+                f"Columns: {query_result.get('columns', [])}"
+            )
+        except Exception as e:
+            logger.error("Allium execution error: %s", e)
+            return f"Query execution failed: {e}"
+
+
+class DeferredAlliumToolHandler(AlliumToolHandler):
+    """AlliumToolHandler that reads data_dictionary.json from workspace on each call.
+
+    Unlike AlliumToolHandler (which takes a static dictionary at construction),
+    this variant re-reads the file before every tool call so guardrail rule 2
+    stays current as data_architect evolves the dictionary during the pipeline run.
+    """
+
+    def __init__(self, paper_id: str, specialist: str, workspace: Path) -> None:
+        from pathlib import Path as _Path
+
+        super().__init__(paper_id, specialist, dictionary=None)
+        self._workspace = _Path(workspace)
+
+    async def handle(self, tool_name: str, tool_input: dict[str, Any]) -> str:
+        self._dictionary = self._read_dictionary()
+        return await super().handle(tool_name, tool_input)
+
+    def _read_dictionary(self):
+        path = self._workspace / "data_dictionary.json"
+        if not path.exists():
+            return None
+        try:
+            from .dictionary import DataDictionary
+
+            return DataDictionary.model_validate_json(path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+
+
+def _enforce_limit(sql: str, limit: int) -> str:
+    """Add or replace LIMIT clause in SQL."""
+    import re
+
+    sql = sql.rstrip().rstrip(";")
+    if re.search(r"\bLIMIT\s+\d+", sql, re.IGNORECASE):
+        return re.sub(r"\bLIMIT\s+\d+", f"LIMIT {limit}", sql, flags=re.IGNORECASE)
+    return f"{sql}\nLIMIT {limit}"

@@ -1,0 +1,80 @@
+{% extends "base.html" %}
+{% block title %}Skills · e2er{% endblock %}
+
+{% block content %}
+<h1>Skills</h1>
+<p class="sub">
+  Instructions for the specialists, published by other research projects and listed by
+  <a href="https://github.com/e2er-org/RISE">RISE</a>. e2er installs each pack from its own repository, so the
+  authors keep their attribution. Most packs are not e2er's to hand on.
+</p>
+
+{% if message %}
+  <section class="warn-box"><strong>{{ message }}</strong></section>
+{% endif %}
+
+{% if error %}
+  <section class="empty">
+    <h2>No catalogue found</h2>
+    <p class="muted">{{ error }}</p>
+    <pre><code>git clone https://github.com/e2er-org/RISE
+export RISE_PATH=/path/to/RISE</code></pre>
+    {% if error_detail and error_detail != error %}
+      <details class="tech"><summary>Technical details</summary><p class="small mono">{{ error_detail }}</p></details>
+    {% endif %}
+  </section>
+
+{% else %}
+
+  <section class="wf-summary">
+    <div class="wf-stat"><span class="n">{{ totals.packs }}</span><span class="l">packs</span></div>
+    <div class="wf-stat"><span class="n">{{ totals.skills }}</span><span class="l">skills available</span></div>
+    <div class="wf-stat"><span class="n">{{ installed | length }}</span><span class="l">installed here</span></div>
+  </section>
+
+  <table class="wf-table">
+    <thead>
+      <tr><th>Pack</th><th class="num">Skills</th><th>Licence</th><th>May be passed on</th><th></th></tr>
+    </thead>
+    <tbody>
+      {% for p in packs %}
+        <tr>
+          <td>
+            <span class="quoted"><strong>{{ p.name }}</strong><br>
+            <span class="muted">{{ p.maintainers | join(', ') }}</span></span>
+            {% if p.notes %}<br><span class="muted quoted">{{ p.notes[:160] }}</span>{% endif %}
+          </td>
+          <td class="num">{{ p.count }}</td>
+          <td>{{ p.license or 'not stated' }}</td>
+          <td>
+            {# Never blocks installing: fetching a public file onto your own
+               computer is not passing it on. #}
+            {% if p.redistributable %}yes{% else %}<span class="muted">no</span>{% endif %}
+          </td>
+          <td>
+            {% if p.slug in installed %}
+              <span class="muted">{{ installed[p.slug].files }} files installed</span>
+            {% elif p.private %}
+              <span class="muted private-pack">Private: ask <span class="quoted">{{ p.owner }}</span> for access</span>
+            {% else %}
+              <form method="post" action="/skills/install" class="inline">
+                <input type="hidden" name="pack" value="{{ p.slug }}">
+                <button type="submit" class="btn btn-small">Install</button>
+              </form>
+            {% endif %}
+          </td>
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+
+  <p class="muted">
+    Installed packs are kept in <code class="path">{{ install_root }}</code>. e2er's own instructions come first;
+    an installed pack adds to them. Each pack records its source, licence and maintainers.
+  </p>
+  <details class="tech">
+    <summary>Technical details</summary>
+    <p class="small mono">Catalogue: {{ catalogue_path }}</p>
+  </details>
+{% endif %}
+{% endblock %}

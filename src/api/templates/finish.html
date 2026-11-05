@@ -1,0 +1,397 @@
+{% extends "base.html" %}
+{% block title %}Finish: {{ paper.title[:60] }} · e2er{% endblock %}
+
+{% block content %}
+<p class="crumb"><a href="/papers/{{ paper.id }}">← Back to the run</a></p>
+<h1>Finish: verify and publish</h1>
+<p class="sub">{{ paper.title }}</p>
+
+{% if not session_ok %}
+  <div class="pf-banner bad">{{ session_problem | ticks }}</div>
+{% endif %}
+{% if paper.shown_status != "completed" %}
+  <div class="pf-banner bad">This study has not finished (status: {{ paper.shown_status | status_words }}). You can still check what it has produced.</div>
+{% endif %}
+
+{% if inputs %}
+<section class="card" id="card-used">
+  <div class="card-h"><h2>What the study used</h2></div>
+  <h3>Data used</h3>
+  {% if inputs.loads %}
+    <table class="wf-table compact">
+      <thead><tr><th>Source</th><th>What</th><th>Fingerprint</th></tr></thead>
+      <tbody>
+        {% for d in inputs.loads %}
+          <tr><td>{{ "added for this study" if d.uploaded else d.source }}</td><td class="mono quoted">{{ d.what }}</td>
+            <td class="mono muted">{% if d.sha256 %}{{ d.sha256[:12] }}…{% endif %}</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    <p class="small muted">The study page on e2er.org lists the same, with the terms and citation of each source.</p>
+  {% else %}
+    <p class="muted">No data loads were recorded.</p>
+  {% endif %}
+  <h3>References in the paper ({{ inputs.references | length }})</h3>
+  {% if inputs.references %}
+    <ul class="inputs-list">
+      {% for r in inputs.references %}
+        <li><span class="quoted">{{ r.authors }}</span>{% if r.year %} ({{ r.year }}){% endif %}. <span class="quoted">{{ r.title }}</span>
+          <span class="src-tag{% if not r.mine %} web{% endif %}">{{ r.source }}</span></li>
+      {% endfor %}
+    </ul>
+  {% elif inputs.cited is none %}
+    <p class="muted">There is no draft yet.</p>
+  {% else %}
+    <p class="muted">The paper cites nothing from its bibliography.</p>
+  {% endif %}
+</section>
+{% endif %}
+
+<section class="card" id="card-folder" data-state="{{ 'ok' if export else 'none' }}">
+  <header class="card-h">
+    <span class="dot" aria-hidden="true"></span>
+    <h2>Study folder</h2>
+    <span class="card-status">{{ "Ready" if export else "Not prepared yet" }}</span>
+  </header>
+  <p class="card-note">The paper, code, data, results and the record of how they were made, in one folder.
+    Verifying and publishing work on this folder.</p>
+  <div class="picked">
+    <code class="path" id="export-path">{{ export or ("will be written to " ~ output_root) }}</code>
+    <button type="button" class="btn" id="do-export" {% if not session_ok %}disabled{% endif %}>{{ "Prepare again" if export else "Prepare the folder" }}</button>
+  </div>
+  <p class="found" id="export-msg"></p>
+  <p class="small muted" id="export-current" {% if not export %}hidden{% endif %}>This is the current folder: verifying and publishing use it.</p>
+  <p class="small" id="package-box" {% if not export %}hidden{% endif %}>
+    <button type="button" class="btn btn-small" id="do-package" {% if not session_ok %}disabled{% endif %}>Download package (.e2er)</button>
+    <span class="muted">The whole study in one file: paper, code, data, results and the exact package versions. Anyone with e2er can check it (<code>e2er verify</code>) and run it again (<code>e2er reproduce</code>).</span>
+  </p>
+  <p class="found" id="package-msg"></p>
+  <p class="small" id="older-box" {% if not older_copies %}hidden{% endif %}>
+    <span id="older-text">{{ older_copies }} older cop{{ "y" if older_copies == 1 else "ies" }} of this folder, from earlier stops or exports.</span>
+    <button type="button" class="btn btn-small" id="do-remove-older" {% if not session_ok %}disabled{% endif %}>Remove older copies</button>
+    <span class="muted">The current folder and the published one are never removed.</span>
+  </p>
+</section>
+
+<section class="card" id="card-verify" data-state="none">
+  <header class="card-h">
+    <span class="dot" aria-hidden="true"></span>
+    <h2>Verify</h2>
+    <span class="card-status" id="verify-status">Not run</span>
+  </header>
+  <p class="card-note">{{ n_checks }} checks run on this computer (one more for a pre-registered study or a
+    replication): every file matches its fingerprint, every table number traces to its source, the estimation
+    follows the declared design, and every citation is in the bibliography.</p>
+  <label class="check"><input type="checkbox" id="verify-online"> <span>Also check every citation against the registries online (OpenAlex, Semantic Scholar, Crossref).</span></label>
+  <button type="button" class="btn-primary" id="do-verify" {% if not session_ok %}disabled{% endif %}>Verify</button>
+  <div id="verify-out"></div>
+</section>
+
+<section class="card" id="card-publish" data-state="{{ 'ok' if published else 'none' }}">
+  <header class="card-h">
+    <span class="dot" aria-hidden="true"></span>
+    <h2>Publish to e2er.org</h2>
+    <span class="card-status" id="publish-status">{% if published %}Published, version {{ published.version }}{% else %}Not published{% endif %}</span>
+  </header>
+  <p class="card-note">Publishing sends the study's description, its record and the fingerprints of its files to
+    <code>{{ platform }}</code>. The files themselves stay on this computer. You see the exact request first.</p>
+  <p class="done-box" id="published-box" {% if not published %}hidden{% endif %}>
+    <span>Published as <a id="published-link" href="{{ (published.study_url if published else '') | http_url }}" target="_blank" rel="noopener">{{ published.owner_project if published else '' }}</a>, version <span id="published-version">{{ published.version if published else '' }}</span>.</span>
+    <a class="btn" id="published-dossier" href="{{ (published.dossier_url if published else '') | http_url }}" target="_blank" rel="noopener">Open its dossier</a>
+  </p>
+
+  <div class="field-grid">
+    <label class="field">
+      <span>Owner (your GitHub login{% if not owner %}; save it under <a href="/setup#card-publish">Settings</a> to fill this in{% endif %})</span>
+      <input name="owner" id="pub-owner" value="{{ owner }}" autocomplete="off" spellcheck="false">
+    </label>
+    <label class="field">
+      <span>Project name</span>
+      <input name="project" id="pub-project" value="{{ project }}" autocomplete="off" spellcheck="false">
+    </label>
+  </div>
+  <div class="field">
+    <span>Paper (PDF)</span>
+    <div class="radio-row">
+      <label><input type="radio" name="paper" value="private" checked> private</label>
+      <label><input type="radio" name="paper" value="public"> public</label>
+    </div>
+    <p class="small muted reader-note" id="paper-note">Private: readers on e2er.org see a button to ask you for the paper.</p>
+    {# Data whose terms allow research use only with an open-access paper (GitHub): publishing needs the paper public. #}
+    <div id="paper-open-access">{% for t in data_terms if t.open_access_why %}<p class="small error">The study uses {{ t.the_label }} data. {{ t.open_access_why }}</p>{% endfor %}</div>
+  </div>
+  <label class="field" id="paper-url-field" hidden>
+    <span>Address of the public PDF (https; empty: paper/paper.pdf in the repository at the commit below)</span>
+    <input id="pub-paper-url" autocomplete="off" spellcheck="false">
+  </label>
+  <div class="field">
+    <span>Data</span>
+    <div class="radio-row">
+      <label><input type="radio" name="data" value="private" checked> private</label>
+      <label><input type="radio" name="data" value="public"> public</label>
+    </div>
+    <p class="small muted reader-note" id="data-note">{% if data_terms %}{{ data_terms | map(attribute='reader_note') | join(' ') }}{% else %}Private: readers on e2er.org see a button to ask you for the data.{% endif %}</p>
+  </div>
+  <div class="field">
+    <span>Code</span>
+    <div class="radio-row">
+      <label><input type="radio" name="code" value="private" checked> private</label>
+      <label><input type="radio" name="code" value="public"> public</label>
+    </div>
+    <p class="small muted reader-note" id="code-note">Private: readers on e2er.org see a button to ask you for the code.</p>
+  </div>
+  <div class="field-grid">
+    <label class="field" id="data-url-field" hidden>
+      <span>Where the public data live (repository or DOI, optional)</span>
+      <input id="pub-data-url" autocomplete="off" spellcheck="false">
+    </label>
+    <label class="field" id="code-url-field" hidden>
+      <span>Where the public code lives (optional)</span>
+      <input id="pub-code-url" autocomplete="off" spellcheck="false">
+    </label>
+  </div>
+  <label class="check" id="zenodo-field" hidden>
+    <input type="checkbox" id="pub-zenodo">
+    <span>Deposit the public data and code on Zenodo with your own account and record the DOIs (uses the Zenodo key saved under <a href="/setup#card-keys">Settings</a>).</span>
+  </label>
+
+  <div id="terms-box">
+    {% for t in data_terms %}
+      <div class="pf-banner terms" data-connector="{{ t.connector }}">
+        <p>The study uses data from {{ t.the_label }}. Its terms {{ t.reason }}:</p>
+        <ul>{% for line in t.plain %}<li>{{ line }}</li>{% endfor %}</ul>
+        <p class="small">{% if t.citation %}Citation: {{ t.citation }} · {% endif %}<a href="{{ t.terms_url | http_url }}" target="_blank" rel="noopener">Full terms</a></p>
+        <label class="check">
+          <input type="checkbox" class="confirm-terms" value="{{ t.connector }}">
+          <span>Publish the {{ t.short }} data with the study {{ t.confirm }} (needed when the data are public).</span>
+        </label>
+        <p class="terms-missing error" hidden>Tick this box to publish the data as public, or keep the data private.</p>
+      </div>
+    {% endfor %}
+  </div>
+
+  <details class="more">
+    <summary>More: your name, ORCID iD, roles, licence, repository, what the study builds on</summary>
+    <p class="card-note">Repository, commit and path are for a study folder you keep in a public repository: readers
+      then find the exact version there. Leave them empty otherwise.</p>
+    <div class="field-grid">
+      <label class="field"><span>Your name as it should appear in citations</span><input id="pub-name" autocomplete="name"></label>
+      <label class="field"><span>ORCID iD</span><input id="pub-orcid" placeholder="0000-0002-1825-0097" autocomplete="off" spellcheck="false"></label>
+      <label class="field"><span>Your roles (CRediT, separated by commas)</span><input id="pub-roles" placeholder="Conceptualization, Software" autocomplete="off"></label>
+      <label class="field"><span>Licence (e.g. CC-BY-4.0)</span><input id="pub-license" autocomplete="off" spellcheck="false"></label>
+      <label class="field"><span>Repository that holds the folder (URL)</span><input id="pub-repo" autocomplete="off" spellcheck="false"></label>
+      <label class="field"><span>Commit that pins it</span><input id="pub-commit" autocomplete="off" spellcheck="false"></label>
+      <label class="field"><span>Path of the folder in the repository</span><input id="pub-path" autocomplete="off" spellcheck="false"></label>
+      <label class="field"><span>Builds on (owner/project, separated by commas)</span><input id="pub-derived" autocomplete="off" spellcheck="false"></label>
+    </div>
+  </details>
+
+  <label class="check">
+    <input type="checkbox" id="pub-demo" {% if demonstration %}checked{% endif %}>
+    <span>Demonstration or test run: the study is published as is and marked as not a research contribution.</span>
+  </label>
+
+  <div class="save-row">
+    <button type="button" class="btn" id="do-preview" {% if not session_ok %}disabled{% endif %}>Preview the request</button>
+    <button type="button" class="btn-primary" id="do-publish" disabled>{{ "Publish a new version" if published and not current_published else "Publish" }}</button>
+    <span class="form-note" id="pub-msg" role="status"></span>
+  </div>
+  <p class="small muted" id="publish-why" {% if not current_published %}hidden{% endif %}>Nothing changed since this folder was published. To publish a new version, change the study (for instance run a step again), then prepare the folder again.</p>
+
+  <div id="signin" {% if signed_in %}hidden{% endif %}>
+    <p class="card-note">Publishing needs you signed in to {{ platform }}. You approve a code in the browser; no password goes through e2er.</p>
+    <button type="button" class="btn" id="do-login" {% if not session_ok %}disabled{% endif %}>Sign in to e2er.org</button>
+    <div id="login-out"></div>
+  </div>
+  <p class="muted" id="signed-in-note" {% if not signed_in %}hidden{% endif %}>Signed in to {{ platform }}.</p>
+
+  <div id="pub-out"></div>
+</section>
+
+<script>
+(function () {
+  const pid = '{{ paper.id }}';
+  const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  // A link from a platform's or a source's answer: http(s) only, so a javascript: URL never runs here.
+  const httpUrl = (s) => { try { const u = new URL(String(s || '')); return (u.protocol === 'https:' || u.protocol === 'http:') ? u.href : ''; } catch (e) { return ''; } };
+  const call = (method, url, body) => e2er.call(method, url, body);
+  const card = (id, state, status) => { const c = document.getElementById(id); c.dataset.state = state; if (status) c.querySelector('.card-status').textContent = status; };
+
+  document.getElementById('do-export').addEventListener('click', async () => {
+    const m = document.getElementById('export-msg'); m.textContent = 'Preparing…';
+    try {
+      const d = await call('POST', '/api/papers/' + pid + '/export');
+      document.getElementById('export-path').textContent = d.path; showTerms(d.data_terms);
+      m.textContent = 'Ready.'; card('card-folder', 'ok', 'Ready');
+      document.getElementById('export-current').hidden = false;
+      document.getElementById('export-current').textContent = d.note + ' Verifying and publishing use it.';
+      document.getElementById('package-box').hidden = false;
+      showFolders(d);
+    }
+    catch (e) { m.textContent = e.message; card('card-folder', 'bad', 'Could not prepare'); }
+  });
+  // The run's folders: older copies (with the button that removes them) and the published state.
+  let currentPublished = {{ "true" if current_published else "false" }};
+  function showFolders(d) {
+    const n = d.older_copies || 0;
+    document.getElementById('older-box').hidden = !n;
+    document.getElementById('older-text').textContent = n + ' older cop' + (n === 1 ? 'y' : 'ies') + ' of this folder, from earlier stops or exports.';
+    currentPublished = !!d.current_published;
+    const p = d.published;
+    document.getElementById('published-box').hidden = !p;
+    if (p) {
+      const a = document.getElementById('published-link'); a.href = httpUrl(p.study_url); a.textContent = p.owner_project;
+      document.getElementById('published-version').textContent = p.version;
+      document.getElementById('published-dossier').href = httpUrl(p.dossier_url);
+      document.getElementById('publish-status').textContent = 'Published, version ' + p.version;
+    }
+    document.getElementById('publish-why').hidden = !currentPublished;
+    const btn = document.getElementById('do-publish');
+    btn.textContent = p && !currentPublished ? 'Publish a new version' : 'Publish';
+    if (currentPublished) btn.disabled = true;
+  }
+  document.getElementById('do-package').addEventListener('click', async () => {
+    const m = document.getElementById('package-msg'); m.textContent = 'Writing the package… (pinning the package versions can take a minute)';
+    try {
+      const d = await call('POST', '/api/papers/' + pid + '/package');
+      m.textContent = d.name + ', ' + d.size + '. ' + (d.notes || []).join(' ');
+      window.location.href = d.download;
+    } catch (e) { m.textContent = e.message; }
+  });
+  document.getElementById('do-remove-older').addEventListener('click', async () => {
+    const m = document.getElementById('export-msg');
+    try { const d = await call('POST', '/api/papers/' + pid + '/exports/remove-older'); m.textContent = d.note; showFolders(d); }
+    catch (e) { m.textContent = e.message; }
+  });
+
+  document.getElementById('do-verify').addEventListener('click', async () => {
+    const out = document.getElementById('verify-out'); out.innerHTML = '<p class="muted">Checking…</p>';
+    try {
+      const d = await call('POST', '/api/papers/' + pid + '/verify', { online: document.getElementById('verify-online').checked });
+      const mark = { PASS: '✓', FAIL: '✗', SKIP: '·' };
+      out.innerHTML = '<div class="vf-list pf-list">' + d.checks.map((c) =>
+        '<div class="pf pf-' + c.status.toLowerCase() + '"><span class="pf-mark">' + mark[c.status] + '</span><span class="pf-name">' + esc(c.label || c.name) + '</span><span class="pf-detail">' + esc(c.detail) + '</span></div>').join('') +
+        '</div><p><strong>' + esc(d.verdict_plain || d.verdict) + '</strong></p>';
+      card('card-verify', d.verified ? 'ok' : 'bad', d.verified ? 'Verified' : 'Not verified');
+    } catch (e) { out.innerHTML = '<p class="error">' + esc(e.message) + '</p>'; card('card-verify', 'bad', 'Could not run'); }
+  });
+
+  const form = () => ({
+    owner: document.getElementById('pub-owner').value, project: document.getElementById('pub-project').value,
+    data: document.querySelector('input[name=data]:checked').value, code: document.querySelector('input[name=code]:checked').value,
+    data_url: document.getElementById('pub-data-url').value, code_url: document.getElementById('pub-code-url').value,
+    paper: document.querySelector('input[name=paper]:checked').value, paper_url: document.getElementById('pub-paper-url').value,
+    zenodo: document.getElementById('pub-zenodo').checked,
+    accept_data_terms: [...document.querySelectorAll('.confirm-terms:checked')].map((c) => c.value),
+    name: document.getElementById('pub-name').value, orcid: document.getElementById('pub-orcid').value,
+    license_id: document.getElementById('pub-license').value,
+    roles: document.getElementById('pub-roles').value.split(',').map((x) => x.trim()).filter(Boolean),
+    repo: document.getElementById('pub-repo').value, commit: document.getElementById('pub-commit').value,
+    path: document.getElementById('pub-path').value,
+    derived_from: document.getElementById('pub-derived').value.split(',').map((x) => x.trim()).filter(Boolean),
+    demonstration: document.getElementById('pub-demo').checked,
+  });
+  // Where public data and code live, and the Zenodo deposit, matter only when something is public.
+  const availability = () => {
+    const dataPublic = document.querySelector('input[name=data]:checked').value === 'public';
+    const codePublic = document.querySelector('input[name=code]:checked').value === 'public';
+    document.getElementById('data-url-field').hidden = !dataPublic;
+    document.getElementById('code-url-field').hidden = !codePublic;
+    document.getElementById('zenodo-field').hidden = !(dataPublic || codePublic);
+    const paperPublic = document.querySelector('input[name=paper]:checked').value === 'public';
+    document.getElementById('paper-url-field').hidden = !paperPublic;
+    // What readers on e2er.org see for what stays private (src/core/availability.py reader_notes says the same).
+    document.getElementById('paper-note').hidden = paperPublic;
+    document.getElementById('data-note').hidden = dataPublic;
+    document.getElementById('code-note').hidden = codePublic;
+  };
+  document.querySelectorAll('input[name=data], input[name=code], input[name=paper]').forEach((r) => r.addEventListener('change', availability));
+  availability();
+  const showTerms = (terms) => {
+    if ((terms || []).length) document.getElementById('data-note').textContent = terms.map((t) => t.reader_note).join(' ');
+    document.getElementById('paper-open-access').innerHTML = (terms || []).filter((t) => t.open_access_why).map((t) =>
+      '<p class="small error">The study uses ' + esc(t.the_label) + ' data. ' + esc(t.open_access_why) + '</p>').join('');
+    document.getElementById('terms-box').innerHTML = (terms || []).map((t) =>
+      '<div class="pf-banner terms" data-connector="' + esc(t.connector) + '"><p>The study uses data from ' + esc(t.the_label) + '. Its terms ' + esc(t.reason) + ':</p><ul>' +
+      t.plain.map((l) => '<li>' + esc(l) + '</li>').join('') + '</ul><p class="small">' + (t.citation ? 'Citation: ' + esc(t.citation) + ' · ' : '') +
+      '<a href="' + esc(httpUrl(t.terms_url)) + '" target="_blank" rel="noopener">Full terms</a></p><label class="check"><input type="checkbox" class="confirm-terms" value="' +
+      esc(t.connector) + '"><span>Publish the ' + esc(t.short) + ' data with the study ' + esc(t.confirm) + ' (needed when the data are public).</span></label>' +
+      '<p class="terms-missing error" hidden>Tick this box to publish the data as public, or keep the data private.</p></div>').join('');
+  };
+  const pubMsg = document.getElementById('pub-msg');
+  const pubBtn = document.getElementById('do-publish');
+  let previewOk = false;
+  let previewTitle = '', previewPlatform = {{ platform|tojson }};
+  // A preview or publish refused for terms not confirmed: say so next to each unticked box.
+  const markTerms = (missing) => {
+    document.querySelectorAll('#terms-box .terms').forEach((box) => {
+      const note = box.querySelector('.terms-missing');
+      if (note) note.hidden = !(missing || []).includes(box.dataset.connector);
+    });
+  };
+  // What `e2er publish` printed, folded: the page leads with the outcome.
+  const folded = (text) => text ? '<details class="tech"><summary>Technical details</summary><pre class="preview">' + esc(text) + '</pre></details>' : '';
+  // A refusal: its reason in one sentence first, what e2er printed folded below it.
+  const refused = (d) => '<p class="error pub-reason">' + esc(d.reason || 'e2er could not publish the study.') + '</p>' + folded(d.output);
+  document.getElementById('do-preview').addEventListener('click', async () => {
+    const out = document.getElementById('pub-out'); pubMsg.textContent = 'Preparing the preview…';
+    try {
+      const d = await call('POST', '/api/papers/' + pid + '/publish', { ...form(), dry_run: true });
+      markTerms(d.terms_missing);
+      out.innerHTML = '<h3 class="h3">The request that would be sent to ' + esc(d.platform) + '</h3>' +
+        (d.request ? '<details class="tech" open><summary>The request</summary><pre class="preview">' + esc(JSON.stringify(d.request, null, 2)) + '</pre></details>' : '') +
+        (d.ok ? folded(d.output) : '');
+      if (!d.ok) out.innerHTML = refused(d);
+      pubMsg.textContent = d.ok ? 'Nothing was sent. Publish when it looks right.' : 'The preview found a problem; see below.';
+      previewOk = d.ok;
+      previewTitle = (d.request && d.request.title) || '';
+      previewPlatform = d.platform || previewPlatform;
+      pubBtn.disabled = !d.ok || document.getElementById('signin').hidden === false || currentPublished;
+    } catch (e) { pubMsg.textContent = e.message; }
+  });
+  pubBtn.addEventListener('click', async () => {
+    // Nothing is sent before the researcher says yes (src/cli_publish.py asks the same on the terminal).
+    const f = form();
+    if (!window.confirm("Publish '" + (previewTitle || f.project) + "' to " + previewPlatform + ' as ' + f.owner + '?')) {
+      pubMsg.textContent = 'Not published: nothing was sent.';
+      return;
+    }
+    pubMsg.textContent = 'Publishing…';
+    try {
+      const d = await call('POST', '/api/papers/' + pid + '/publish', { ...f, dry_run: false, confirm: true });
+      markTerms(d.terms_missing);
+      const held = d.held ? '<p>Held on e2er.org until you confirm it, signed in in the browser: <a class="btn-primary" href="' + esc(httpUrl(d.confirm_url)) + '" target="_blank" rel="noopener">Confirm it on e2er.org</a></p>' : '';
+      const links = held + (d.study_url ? '<p><a class="btn-primary" href="' + esc(httpUrl(d.study_url)) + '" target="_blank" rel="noopener">Open the study on e2er.org</a> ' : '<p>') +
+        (d.dossier_url ? '<a class="btn" href="' + esc(httpUrl(d.dossier_url)) + '" target="_blank" rel="noopener">Open its dossier</a>' : '') + '</p>';
+      document.getElementById('pub-out').innerHTML = d.ok ? links + folded(d.output) : refused(d);
+      pubMsg.textContent = d.ok ? (d.held ? 'Held: confirm it in your browser.' : 'Published.') : 'Not published; see below.';
+      card('card-publish', d.ok ? 'ok' : 'bad', d.ok ? 'Published' : 'Not published');
+      if (d.ok) {
+        showFolders(d);
+        // The record on e2er.org now exists: check the folder against it again.
+        document.getElementById('do-verify').click();
+      }
+    } catch (e) { pubMsg.textContent = e.message; }
+  });
+
+  const loginBtn = document.getElementById('do-login');
+  if (loginBtn) loginBtn.addEventListener('click', async () => {
+    const out = document.getElementById('login-out');
+    try { await call('POST', '/api/platform/login'); } catch (e) { out.innerHTML = '<p class="error">' + esc(e.message) + '</p>'; return; }
+    out.innerHTML = '<p class="muted">Contacting e2er.org…</p>';
+    const poll = async () => {
+      let d; try { d = await call('GET', '/api/platform/login'); } catch (e) { out.innerHTML = '<p class="error">' + esc(e.message) + '</p>'; return; }
+      if (d.state === 'waiting') {
+        out.innerHTML = '<p>Open <a href="' + esc(httpUrl(d.verify_url)) + '" target="_blank" rel="noopener">' + esc(d.verify_url) + '</a> and confirm this code:</p><div class="code-box">' + esc(d.code) + '</div><p class="muted">Waiting for your approval…</p>';
+      } else if (d.state === 'done' || d.signed_in) {
+        out.innerHTML = '<p>' + esc(d.message || 'Signed in.') + '</p>';
+        document.getElementById('signin').hidden = true; document.getElementById('signed-in-note').hidden = false; pubBtn.disabled = !previewOk;
+        return;
+      } else if (d.state === 'error') { out.innerHTML = '<p class="error">' + esc(d.message) + '</p>'; return; }
+      setTimeout(poll, 2000);
+    };
+    poll();
+  });
+})();
+</script>
+{% endblock %}

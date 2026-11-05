@@ -1,0 +1,131 @@
+name: schema-drift (Allium OpenAPI)
+
+# Nightly job: re-fetch Allium's OpenAPI specs and compare to the fixtures
+# we ship in tests/data/fixtures/. If anything changed upstream, open a
+# GitHub issue so Lane C maintainers can review whether our provider needs
+# an update. It comments on that issue again only when the drift changes
+# (scripts/check_allium_drift.py fingerprints it), and a spec that cannot be
+# fetched (docs.allium.so now redirects to a login page) is a warning, not drift.
+#
+# Why: live paper runs #14-#18 surfaced wrapper-vs-Allium drift. The PR-time
+# contract tests (tests/data/contract/test_allium_developer_schema.py)
+# guard against drift between OUR code and the cached fixtures. This
+# workflow guards against drift between OUR fixtures and Allium's live
+# spec. Together they form a two-step trap.
+#
+# This is the same pattern coarse uses for its third-party docs sync,
+# minus the bells and whistles.
+
+on:
+  schedule:
+    # 03:30 UTC daily — pick an off-peak slot so cache pressure is low.
+    - cron: '30 3 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read  # every job reads only; a job that writes says so itself
+
+jobs:
+  drift-check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write  # opens or comments on the schema-drift issue
+    timeout-minutes: 3
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          persist-credentials: false
+          ref: dev
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+        with:
+          python-version: '3.12'
+
+      - name: Compare Allium's published specs with the fixtures
+        id: diff
+        run: python3 scripts/check_allium_drift.py --fixtures tests/data/fixtures --diff-dir /tmp/drift-diffs
+
+      - name: Specs not published
+        if: steps.diff.outputs.status == 'unavailable'
+        run: |
+          # docs.allium.so redirects these files to its login page (since mid-2026).
+          # Not a change in the API: no issue, no comment, just a note in the run.
+          echo "::warning::Allium's OpenAPI specs could not be fetched: ${{ steps.diff.outputs.unavailable }}"
+
+      - name: Upload diff artifact
+        if: steps.diff.outputs.status == 'drift'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: schema-drift-diffs
+          path: /tmp/drift-diffs/
+          retention-days: 14
+
+      - name: Check for existing open drift issue
+        if: steps.diff.outputs.status == 'drift'
+        id: existing-issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FP: ${{ steps.diff.outputs.fingerprint }}
+        run: |
+          # If there's already an open drift issue, don't spam a new one.
+          existing=$(gh issue list \
+            --state open \
+            --label "schema-drift" \
+            --json number \
+            --jq '.[0].number // empty')
+          echo "number=$existing" >> $GITHUB_OUTPUT
+          # Already reported this exact drift? Then stay silent.
+          seen=false
+          if [ -n "$existing" ] && gh issue view "$existing" --json body,comments \
+               --jq '[.body] + [.comments[].body] | join("\n")' | grep -q "drift fingerprint: $FP"; then
+            seen=true
+          fi
+          echo "seen=$seen" >> $GITHUB_OUTPUT
+
+      - name: Open issue if no existing one
+        if: steps.diff.outputs.status == 'drift' && steps.existing-issue.outputs.number == ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          FP: ${{ steps.diff.outputs.fingerprint }}
+          DRIFTED: ${{ steps.diff.outputs.drifted }}
+        run: |
+          # Ensure the label exists (idempotent; ignore failure if it does).
+          gh label create schema-drift --color "d93f0b" --description "Upstream API schema changed" 2>/dev/null || true
+
+          gh issue create \
+            --title "Allium OpenAPI drift detected $(date +'%Y-%m-%d')" \
+            --label "schema-drift" \
+            --body "$(cat <<EOF
+          The nightly schema-drift check found that Allium's published OpenAPI
+          differs from \`tests/data/fixtures/\` in: $DRIFTED
+
+          Run: $RUN_URL (artifact \`schema-drift-diffs\` holds a diff per endpoint)
+
+          1. Inspect the diffs.
+          2. If the change is benign, copy the live specs over the fixtures.
+          3. If it breaks the provider, update \`src/modules/data/allium_developer.py\` and the fixtures.
+          4. Run \`pytest tests/data/contract/ -v\`, then close this issue.
+
+          The check comments again only when the drift changes.
+
+          drift fingerprint: $FP
+          EOF
+          )"
+
+      - name: Comment on existing issue when the drift changed
+        if: >-
+          steps.diff.outputs.status == 'drift' && steps.existing-issue.outputs.number != '' &&
+          steps.existing-issue.outputs.seen != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE: ${{ steps.existing-issue.outputs.number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          FP: ${{ steps.diff.outputs.fingerprint }}
+          DRIFTED: ${{ steps.diff.outputs.drifted }}
+        run: |
+          gh issue comment "$ISSUE" --body "The drift changed on $(date +'%Y-%m-%d') ($DRIFTED); see $RUN_URL
+
+          drift fingerprint: $FP"

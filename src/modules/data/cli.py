@@ -1,0 +1,1226 @@
+"""Allium-via-CLI gatekeeper: same guardrails, subprocess entry point.
+
+Why this exists:
+  When `LLM_BACKEND=claude_code`, specialists run inside the Claude Code CLI
+  subprocess. The CLI's tool dispatch is internal, so the in-process
+  `AlliumToolHandler` (which validates the 5 Allium guardrails on every
+  query) cannot intercept anything. Without this gatekeeper, CLI users
+  would have to disable the data module entirely.
+
+How it works:
+  This module is invoked as `python -m src.modules.data.cli <subcommand>`
+  via the `scripts/e2er-allium-query` bash wrapper. The Claude Code CLI is
+  configured with `--allowedTools=Bash(e2er-allium-query:*)` — that bash
+  pattern is the *only* path to Allium for the specialist. Direct HTTP
+  to Allium and other bash invocations are denied at the CLI's tool layer.
+
+  Internally we construct the existing `AlliumToolHandler` and call its
+  methods. The 5 guardrails (no SELECT *, fields in dictionary, time-bound
+  WHERE, granularity justification, feasibility-first), the audit log, and
+  the human-approval flow all use the SAME code as the SDK backends.
+
+Subcommands:
+  feasibility    Run a 1000-row sample query (auto-approved).
+  production     Submit a full query for human approval.
+  check-approval Poll for the approval status of a production query.
+  list-tables    List available Allium dataset schemas/tables.
+
+stdout contains the same text `AlliumToolHandler.handle()` returns to the
+LLM in API mode — guardrail rejections, query_ids, sample rows, status.
+The CLI subprocess sees this as bash command output. Exit code is 0 (the
+model reads the output regardless) except when a `--table` load fails
+(connector error, no rows, no values: exit 4, data.db untouched); fatal
+errors print to stderr. Inside a step of `e2er reproduce` that does not load
+the inputs again (E2ER_DATA_READ_ONLY=1) only `query` runs; anything else
+exits 5 with a plain message.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import os
+import re
+import sys
+from pathlib import Path
+from typing import Any
+
+from ...config import get_settings
+from ...logging_config import get_logger
+
+logger = get_logger(__name__)
+
+
+def _build_handler(paper_id: str, specialist: str, workspace: Path) -> Any:
+    """Build the same AlliumToolHandler used in API-backend mode.
+
+    Reads `data_dictionary.json` from the workspace (the paper's
+    pre-declared minimal data footprint). If absent, the dictionary
+    guardrails (fields-in-dict, granularity) are skipped — the SQL/time/
+    feasibility guardrails still fire.
+    """
+    from .dictionary import DataDictionary
+    from .tools import AlliumToolHandler
+
+    dictionary: DataDictionary | None = None
+    dict_path = workspace / "data_dictionary.json"
+    if dict_path.exists():
+        try:
+            dictionary = DataDictionary.model_validate_json(dict_path.read_text(encoding="utf-8"))
+        except Exception as e:
+            print(
+                f"Warning: data_dictionary.json present but invalid ({e}). "
+                "Dictionary-dependent guardrails will be skipped.",
+                file=sys.stderr,
+            )
+
+    return AlliumToolHandler(
+        paper_id=paper_id,
+        specialist=specialist,
+        dictionary=dictionary,
+        workspace=workspace,
+    )
+
+
+def _resolve_workspace(paper_id: str) -> Path:
+    """Workspace path = workspace_root / paper_id.
+
+    `workspace_root` is read from the ``E2ER_WORKSPACE_ROOT`` env var when
+    set (the runner injects an absolute path), otherwise from
+    ``settings.workspace_root`` (defaults to the relative string ``"workspaces"``).
+
+    Why the env var: the claude_code subprocess runs with cwd = the paper's
+    workspace dir. If we resolve a relative ``"workspaces"`` against that cwd
+    we get ``<workspace>/workspaces/<id>``, i.e. a nested directory. Live
+    test eea5379b on v0.4.4 wrote ``yfinance_SPY_2020_2026.csv`` to
+    ``workspaces/<id>/workspaces/<id>/data/`` for exactly this reason — and
+    the model dutifully papered over it with a ``_candidate_csv_paths``
+    fallback in estimation.py. The env var makes the resolution stable
+    regardless of subprocess cwd.
+    """
+    from ...home import find_workspace
+
+    root = os.environ.get("E2ER_WORKSPACE_ROOT") or get_settings().workspace_root
+    return find_workspace(paper_id, root)
+
+
+async def _run_feasibility(args: argparse.Namespace) -> str:
+    handler = _build_handler(args.paper_id, args.specialist, _resolve_workspace(args.paper_id))
+    return await handler.handle(
+        "query_allium",
+        {
+            "sql": args.sql,
+            "query_type": "feasibility",
+            "fields_requested": [f.strip() for f in args.fields.split(",") if f.strip()] if args.fields else [],
+            "aggregation_level": args.aggregation,
+            "rationale": args.rationale or "",
+            "primary_table": args.primary_table or "",
+            "estimated_rows": args.estimated_rows,
+        },
+    )
+
+
+async def _run_production(args: argparse.Namespace) -> str:
+    handler = _build_handler(args.paper_id, args.specialist, _resolve_workspace(args.paper_id))
+    return await handler.handle(
+        "query_allium",
+        {
+            "sql": args.sql,
+            "query_type": "production",
+            "fields_requested": [f.strip() for f in args.fields.split(",") if f.strip()] if args.fields else [],
+            "aggregation_level": args.aggregation,
+            "rationale": args.rationale or "",
+            "primary_table": args.primary_table or "",
+            "estimated_rows": args.estimated_rows,
+        },
+    )
+
+
+async def _run_check_approval(args: argparse.Namespace) -> str:
+    handler = _build_handler(args.paper_id, args.specialist, _resolve_workspace(args.paper_id))
+    return await handler.handle("check_approval", {"query_id": args.query_id})
+
+
+async def _run_list_tables(args: argparse.Namespace) -> str:
+    handler = _build_handler(args.paper_id, args.specialist, _resolve_workspace(args.paper_id))
+    return await handler.handle("list_allium_tables", {})
+
+
+async def _run_describe_table(args: argparse.Namespace) -> str:
+    """Discovery primitive: list columns + types for a table.
+
+    Goes directly through AlliumProvider rather than the tool handler —
+    no guardrail validation needed (read-only INFORMATION_SCHEMA query).
+    """
+    import json as _json
+
+    from ...config import get_settings
+    from .allium import AlliumProvider
+
+    settings = get_settings()
+    if not settings.allium_api_key:
+        return "Allium not configured. Set ALLIUM_API_KEY in .env."
+    provider = AlliumProvider(settings.allium_api_key, settings.allium_api_base)
+    cols = await provider.describe_table(args.schema, args.table)
+    if not cols:
+        return (
+            f"No columns found for {args.schema}.{args.table}. Either the table "
+            f"doesn't exist, or it's outside your Allium plan tier, or "
+            f"INFORMATION_SCHEMA access is restricted. Try `list-tables` to see "
+            f"what's available."
+        )
+    return _json.dumps({"schema": args.schema, "table": args.table, "columns": cols}, indent=2, default=str)
+
+
+async def _run_dev_transfers(args: argparse.Namespace) -> str:
+    """Developer-tier endpoint: token transfers involving a wallet.
+
+    Despite the name, Allium scopes this to one wallet `address`. Use
+    for hack-event studies by pointing `--address` at the hacker EOA and
+    bounding `--min-timestamp / --max-timestamp` to the window.
+    """
+    import json as _json
+
+    from .allium_developer import AlliumDeveloperProvider
+
+    settings = get_settings()
+    if not settings.allium_api_key:
+        return "Allium not configured. Set ALLIUM_API_KEY in .env."
+    provider = AlliumDeveloperProvider(settings.allium_api_key, settings.allium_api_base)
+    result = await provider.get_token_transfers(
+        chain=args.chain,
+        address=args.address,
+        token=args.token,
+        min_timestamp=args.min_timestamp,
+        max_timestamp=args.max_timestamp,
+        limit=args.limit,
+        cursor=args.cursor,
+    )
+    from .load_record import allium_load, now_utc
+
+    _record(result, args, allium_load(f"token transfers of {args.address} on {args.chain}", now_utc()))
+    return _json.dumps(result, indent=2, default=str)
+
+
+async def _run_dev_wallet_tx(args: argparse.Namespace) -> str:
+    """Developer-tier endpoint: tx history for any address.
+
+    Allium does NOT support date filters on this endpoint. Returns the
+    most recent transactions; page back through history with `--cursor`.
+    For older events, prefer `get-transfers` which DOES support
+    min_timestamp/max_timestamp.
+    """
+    import json as _json
+
+    from .allium_developer import AlliumDeveloperProvider
+
+    settings = get_settings()
+    if not settings.allium_api_key:
+        return "Allium not configured. Set ALLIUM_API_KEY in .env."
+    provider = AlliumDeveloperProvider(settings.allium_api_key, settings.allium_api_base)
+    result = await provider.get_wallet_transactions(
+        chain=args.chain,
+        address=args.address,
+        limit=args.limit,
+        cursor=args.cursor,
+        transaction_hash=args.transaction_hash,
+        activity_type=args.activity_type,
+    )
+    from .load_record import allium_load, now_utc
+
+    _record(result, args, allium_load(f"transactions of {args.address} on {args.chain}", now_utc()))
+    return _json.dumps(result, indent=2, default=str)
+
+
+async def _run_dev_balances_history(args: argparse.Namespace) -> str:
+    """Developer-tier endpoint: daily balance snapshots for an address."""
+    import json as _json
+
+    from .allium_developer import AlliumDeveloperProvider
+
+    settings = get_settings()
+    if not settings.allium_api_key:
+        return "Allium not configured. Set ALLIUM_API_KEY in .env."
+    provider = AlliumDeveloperProvider(settings.allium_api_key, settings.allium_api_base)
+    result = await provider.get_wallet_balances_history(
+        chain=args.chain,
+        address=args.address,
+        from_ts=args.from_ts,
+        to_ts=args.to_ts,
+    )
+    from .load_record import allium_load, now_utc
+
+    _record(result, args, allium_load(f"balance history of {args.address} on {args.chain}", now_utc()))
+    return _json.dumps(result, indent=2, default=str)
+
+
+async def _run_dev_prices_history(args: argparse.Namespace) -> str:
+    """Developer-tier endpoint: OHLC price history for a fungible token.
+
+    Returns empty for NFT contracts. Sanity-check with get-price first if
+    unsure whether a contract is indexed.
+    """
+    import json as _json
+
+    from .allium_developer import AlliumDeveloperProvider
+
+    settings = get_settings()
+    if not settings.allium_api_key:
+        return "Allium not configured. Set ALLIUM_API_KEY in .env."
+    provider = AlliumDeveloperProvider(settings.allium_api_key, settings.allium_api_base)
+    result = await provider.get_token_prices_history(
+        chain=args.chain,
+        token_address=args.token_address,
+        from_ts=args.from_ts,
+        to_ts=args.to_ts,
+    )
+    from .load_record import allium_load, now_utc
+
+    _record(result, args, allium_load(f"price history of {args.token_address} on {args.chain}", now_utc()))
+    return _json.dumps(result, indent=2, default=str)
+
+
+async def _run_dev_get_price(args: argparse.Namespace) -> str:
+    """Developer-tier endpoint: latest spot price for a token (sanity check)."""
+    import json as _json
+
+    from .allium_developer import AlliumDeveloperProvider
+
+    settings = get_settings()
+    if not settings.allium_api_key:
+        return "Allium not configured. Set ALLIUM_API_KEY in .env."
+    provider = AlliumDeveloperProvider(settings.allium_api_key, settings.allium_api_base)
+    result = await provider.get_token_latest_price(chain=args.chain, token_address=args.token_address)
+    from .load_record import allium_load, now_utc
+
+    _record(result, args, allium_load(f"latest price of {args.token_address} on {args.chain}", now_utc()))
+    return _json.dumps(result, indent=2, default=str)
+
+
+async def _run_distinct_values(args: argparse.Namespace) -> str:
+    """Discovery primitive: show actual literal values + frequency for a column.
+
+    Use this BEFORE composing `WHERE col IN (...)` filters — Allium may
+    store marketplace names as 'OpenSea', 'opensea', or contract
+    addresses; this returns the real values so the model uses what's
+    there, not what it guessed.
+    """
+    import json as _json
+
+    from ...config import get_settings
+    from .allium import AlliumProvider
+
+    settings = get_settings()
+    if not settings.allium_api_key:
+        return "Allium not configured. Set ALLIUM_API_KEY in .env."
+    provider = AlliumProvider(settings.allium_api_key, settings.allium_api_base)
+    values = await provider.distinct_values(args.schema, args.table, args.column, limit=args.limit)
+    if not values:
+        return (
+            f"No distinct values returned for {args.schema}.{args.table}.{args.column}. "
+            f"Either the column is empty, doesn't exist, or the discovery query "
+            f"was rejected. Try `describe-table --schema {args.schema} --table "
+            f"{args.table}` to confirm the column name."
+        )
+    return _json.dumps(
+        {"schema": args.schema, "table": args.table, "column": args.column, "values": values},
+        indent=2,
+        default=str,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Raw-data persistence — every public-source handler routes its result
+# through _maybe_save_csv. When the caller passes --save-to <path>, the
+# items list is written to workspace/data/<path>.csv (path is relative;
+# absolute paths are rejected to keep extractions confined to the
+# workspace and replication-package-friendly).
+# ---------------------------------------------------------------------------
+
+
+#: Why a `--table` load failed in this invocation; `main` exits non-zero when it is set.
+_TABLE_FAILURES: list[str] = []
+
+_DATE_KEYS = frozenset({"date", "datetime", "timestamp", "time", "period", "realtime_start", "realtime_end"})
+
+
+def _no_values(items: list) -> bool:
+    """True when every row's non-date fields are empty: a load that returned dates only."""
+    keys = {k for row in items if isinstance(row, dict) for k in row} - _DATE_KEYS
+    return bool(keys) and all(
+        row.get(k) is None or row.get(k) == "" for row in items if isinstance(row, dict) for k in keys
+    )
+
+
+def _maybe_save_table(result: dict, args: argparse.Namespace) -> None:
+    """If `--table <name>` was passed, write result['items'] into the paper's
+    data.db as that table (replacing it), so later specialists and the checks
+    read the exact rows that were loaded. Reports ``saved_table`` and
+    ``saved_table_rows`` (the real count) in the result envelope.
+
+    A connector error, no rows, or rows without a single value leave data.db
+    untouched: no table is created or replaced, ``table_error`` says why, and
+    the command exits non-zero (see ``main``).
+    """
+    table = getattr(args, "table", None)
+    if not table:
+        return
+    items = (result or {}).get("items") or []
+    error = (result or {}).get("error")
+    why = ""
+    if error:
+        why = f"the connector reported an error: {error}"
+    elif not items:
+        why = "the connector returned no rows"
+    elif _no_values(items):
+        why = "every row the connector returned has empty values"
+    if why:
+        result["table_error"] = f"{why}; table {table!r} was not created or changed"
+        _TABLE_FAILURES.append(result["table_error"])
+        return
+    from ...db.paper_data_db import _materialize_dataframe_sync, data_db_path, sanitize_table_name
+
+    name = sanitize_table_name(table)
+    try:
+        import pandas as pd
+
+        rows = _materialize_dataframe_sync(
+            data_db_path(_resolve_workspace(args.paper_id)), name, pd.DataFrame(items), if_exists="replace"
+        )
+    except Exception as e:  # noqa: BLE001 — reported to the model, never raised into its loop
+        result["table_error"] = f"{type(e).__name__}: {e}"
+        _TABLE_FAILURES.append(result["table_error"])
+        return
+    result["saved_table"] = name
+    result["saved_table_rows"] = rows
+    if name != table:
+        result["table_renamed"] = f"{table!r} is stored as {name!r} (lower case, letters, digits and _ only)"
+
+
+def _maybe_save_csv(result: dict, args: argparse.Namespace) -> None:
+    """If `--save-to <rel/path>` was passed, dump result['items'] to a CSV
+    under ``workspace/data/<rel/path>``. The summary text and `error` are
+    still returned as the bash output (model still sees what happened);
+    the CSV is the persisted artifact.
+    """
+    save_to = getattr(args, "save_to", None)
+    if not save_to:
+        return
+    items = (result or {}).get("items") or []
+    if not items:
+        # Nothing to save — but record the skip in the result envelope so
+        # the model sees it and doesn't keep retrying.
+        result["save_skipped"] = "no items to persist"
+        return
+
+    # Resolve target path: <workspace>/data/<save_to>. Reject absolute
+    # paths + paths trying to escape the workspace (no `../` shenanigans).
+    if save_to.startswith("/") or ".." in Path(save_to).parts:
+        result["save_error"] = f"--save-to must be a relative path within workspace/data/; got {save_to!r}"
+        return
+
+    workspace = _resolve_workspace(args.paper_id)
+    data_root = workspace / "data"
+    target = data_root / save_to
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    # workspace/data holds SYMLINKS to the researcher's original files (BYOD
+    # staging), and to_csv() writes through a symlink — a --save-to name that
+    # collides with a staged file would truncate the original outside the
+    # workspace. Never overwrite an existing path: pick a fresh suffixed name.
+    if target.is_symlink() or target.exists():
+        base, ext = target.stem, target.suffix or ".csv"
+        for i in range(1, 1000):
+            candidate = target.with_name(f"{base}_{i}{ext}")
+            if not candidate.is_symlink() and not candidate.exists():
+                result["save_renamed"] = f"{save_to!r} already exists in data/ (staged input?); saved under a new name"
+                target = candidate
+                break
+        else:
+            result["save_error"] = f"could not find a free filename for {save_to!r}"
+            return
+
+    # Belt-and-braces: after symlink handling the fully resolved target must
+    # still live under workspace/data (catches symlinked parent directories).
+    if not target.resolve().is_relative_to(data_root.resolve()):
+        result["save_error"] = f"--save-to resolves outside workspace/data/; got {save_to!r}"
+        return
+
+    # Lazy import — avoid pulling pandas into the hot path for callers
+    # that don't use --save-to.
+    try:
+        import pandas as pd
+
+        from .normalize import normalize_for_materialization
+
+        df = pd.DataFrame(items)
+        # Same guarantee as the data.db path: whatever the provider returned,
+        # the specialist reads tz-naive UTC.
+        df, norm_notes = normalize_for_materialization(df)
+        if norm_notes:
+            result["normalized"] = norm_notes
+        df.to_csv(target, index=False)
+        result["saved_to"] = target.relative_to(workspace).as_posix()
+        result["saved_rows"] = len(df)
+    except Exception as e:
+        result["save_error"] = f"{type(e).__name__}: {e}"
+
+
+def _record(result: dict, args: argparse.Namespace, entry: dict[str, Any]) -> None:
+    """Record a load that returned rows in the study's ``data_sources.json`` (see load_record.py).
+
+    Where it went (``--table``, ``--save-to``) is added; a load that saved
+    nothing is recorded too, because its rows reached the specialist.
+    """
+    if not isinstance(result, dict) or result.get("error") or result.get("table_error") or not result.get("items"):
+        return
+    from .load_record import try_record
+
+    entry = {
+        **entry,
+        "table": result.get("saved_table"),
+        "table_rows": result.get("saved_table_rows"),
+        "saved_to": result.get("saved_to"),
+        "rows": len(result.get("items") or []),
+        "specialist": getattr(args, "specialist", None),
+    }
+    err = try_record(_resolve_workspace(args.paper_id), entry)
+    if err:
+        result["record_error"] = err
+    else:
+        result.setdefault("recorded_in", []).append("data_sources.json")
+
+
+# ---------------------------------------------------------------------------
+# yfinance handlers — public Yahoo Finance data, no API key.
+# ---------------------------------------------------------------------------
+
+
+async def _run_yf_history(args: argparse.Namespace) -> str:
+    """OHLCV time series for a single ticker."""
+    import json as _json
+
+    from .yfinance_provider import YFinanceProvider
+
+    provider = YFinanceProvider()
+    result = await provider.history(
+        ticker=args.ticker,
+        start=args.start,
+        end=args.end,
+        interval=args.interval,
+        auto_adjust=not args.raw,
+    )
+    _maybe_save_csv(result, args)
+    _maybe_save_table(result, args)
+    from .load_record import now_utc, yfinance_load
+
+    what = "daily prices" if args.interval == "1d" else f"prices at interval {args.interval}"
+    entry = yfinance_load(args.ticker, now_utc(), what=what)
+    # The request as it was made, so the load can be repeated (`e2er reproduce`, get_data.py).
+    entry["request"] = {
+        "command": "history",
+        "ticker": args.ticker,
+        "start": args.start,
+        "end": args.end,
+        "interval": args.interval,
+        "adjusted": not args.raw,
+    }
+    _record(result, args, entry)
+    return _json.dumps(result, indent=2, default=str)
+
+
+async def _run_yf_ticker_info(args: argparse.Namespace) -> str:
+    """Current snapshot for a ticker (price, market cap, sector, beta, ...)."""
+    import json as _json
+
+    from .yfinance_provider import YFinanceProvider
+
+    provider = YFinanceProvider()
+    result = await provider.ticker_info(ticker=args.ticker)
+    return _json.dumps(result, indent=2, default=str)
+
+
+async def _run_yf_fundamentals(args: argparse.Namespace) -> str:
+    """Annual financial statements: income, balance_sheet, or cash_flow."""
+    import json as _json
+
+    from .yfinance_provider import YFinanceProvider
+
+    provider = YFinanceProvider()
+    result = await provider.fundamentals(ticker=args.ticker, statement=args.statement)
+    _maybe_save_csv(result, args)
+    _maybe_save_table(result, args)
+    from .load_record import now_utc, yfinance_load
+
+    entry = yfinance_load(args.ticker, now_utc(), what=f"annual {args.statement.replace('_', ' ')}")
+    entry["request"] = {"command": "fundamentals", "ticker": args.ticker, "statement": args.statement}
+    _record(result, args, entry)
+    return _json.dumps(result, indent=2, default=str)
+
+
+async def _run_yf_dividends(args: argparse.Namespace) -> str:
+    """Full dividend history for a ticker."""
+    import json as _json
+
+    from .yfinance_provider import YFinanceProvider
+
+    provider = YFinanceProvider()
+    result = await provider.dividends(ticker=args.ticker)
+    _maybe_save_csv(result, args)
+    _maybe_save_table(result, args)
+    from .load_record import now_utc, yfinance_load
+
+    entry = yfinance_load(args.ticker, now_utc(), what="dividends")
+    entry["request"] = {"command": "dividends", "ticker": args.ticker}
+    _record(result, args, entry)
+    return _json.dumps(result, indent=2, default=str)
+
+
+async def _run_yf_search(args: argparse.Namespace) -> str:
+    """Name-to-ticker lookup."""
+    import json as _json
+
+    from .yfinance_provider import YFinanceProvider
+
+    provider = YFinanceProvider()
+    result = await provider.search(query=args.query, max_results=args.max_results)
+    return _json.dumps(result, indent=2, default=str)
+
+
+# ---------------------------------------------------------------------------
+# FRED handlers — Federal Reserve Economic Data, free key.
+# ---------------------------------------------------------------------------
+
+
+def _fred_provider_or_error_envelope() -> tuple[Any, str | None]:
+    """Build FredProvider from settings; return (provider, None) or (None, json_error_str)."""
+    import json as _json
+
+    settings = get_settings()
+    if not settings.fred_api_key:
+        msg = _json.dumps(
+            {
+                "source": "fred",
+                "items": [],
+                "error": (
+                    "FRED_API_KEY not configured. Set it in .env. "
+                    "Get a free key (~30s) at https://fredaccount.stlouisfed.org/apikey"
+                ),
+            },
+            indent=2,
+        )
+        return None, msg
+    from .fred_provider import FredProvider
+
+    return FredProvider(settings.fred_api_key), None
+
+
+async def _run_fred_series(args: argparse.Namespace) -> str:
+    """Pull a FRED series time series."""
+    import json as _json
+
+    provider, err = _fred_provider_or_error_envelope()
+    if provider is None:
+        return err or ""
+    result = await provider.get_series_observations(
+        series_id=args.series_id,
+        observation_start=args.start,
+        observation_end=args.end,
+        frequency=args.frequency,
+        units=args.units,
+        limit=args.limit,
+    )
+    _maybe_save_csv(result, args)
+    _maybe_save_table(result, args)
+    if result.get("items") and not result.get("error"):
+        from .load_record import fred_load, now_utc
+
+        meta = await provider.citation_info(args.series_id)
+        _record(result, args, fred_load(args.series_id, now_utc(), **meta))
+    return _json.dumps(result, indent=2, default=str)
+
+
+async def _run_fred_series_info(args: argparse.Namespace) -> str:
+    """Metadata for a FRED series — units, frequency, etc."""
+    import json as _json
+
+    provider, err = _fred_provider_or_error_envelope()
+    if provider is None:
+        return err or ""
+    result = await provider.get_series_info(series_id=args.series_id)
+    return _json.dumps(result, indent=2, default=str)
+
+
+async def _run_fred_search(args: argparse.Namespace) -> str:
+    """Free-text search for FRED series."""
+    import json as _json
+
+    provider, err = _fred_provider_or_error_envelope()
+    if provider is None:
+        return err or ""
+    result = await provider.search_series(
+        query=args.query,
+        limit=args.limit,
+        order_by=args.order_by,
+    )
+    return _json.dumps(result, indent=2, default=str)
+
+
+async def _run_fred_releases(args: argparse.Namespace) -> str:
+    """List FRED releases."""
+    import json as _json
+
+    provider, err = _fred_provider_or_error_envelope()
+    if provider is None:
+        return err or ""
+    result = await provider.get_releases(limit=args.limit)
+    return _json.dumps(result, indent=2, default=str)
+
+
+# ---------------------------------------------------------------------------
+# GMD handlers — Global Macro Database, versioned releases, no key.
+# ---------------------------------------------------------------------------
+
+
+def _gmd_failed(result: dict) -> None:
+    """A GMD command that returned an error exits non-zero (the error is printed with the result)."""
+    if result.get("error"):
+        _TABLE_FAILURES.append(f"GMD: {result['error']}")
+
+
+async def _run_gmd_versions(args: argparse.Namespace) -> str:
+    """List GMD releases, newest first."""
+    from .gmd_provider import GMDProvider
+
+    result = await GMDProvider().versions()
+    _gmd_failed(result)
+    return json.dumps(result, indent=2, default=str)
+
+
+async def _run_gmd_variables(args: argparse.Namespace) -> str:
+    """List GMD variables with units and definitions."""
+    from .gmd_provider import GMDProvider
+
+    result = await GMDProvider().variables()
+    _gmd_failed(result)
+    return json.dumps(result, indent=2, default=str)
+
+
+async def _run_gmd_countries(args: argparse.Namespace) -> str:
+    """List GMD countries (ISO3 code and name)."""
+    from .gmd_provider import GMDProvider
+
+    result = await GMDProvider().countries()
+    _gmd_failed(result)
+    return json.dumps(result, indent=2, default=str)
+
+
+def _split(value: str | None) -> list[str]:
+    return [x.strip() for x in (value or "").replace(";", ",").replace(" ", ",").split(",") if x.strip()]
+
+
+async def _run_gmd_series(args: argparse.Namespace) -> str:
+    """A country-year panel from one GMD release; records version, URLs and SHA-256 of every load."""
+    from .gmd_provider import GMDError, GMDProvider, add_citation, record_in_dictionary, record_load
+
+    workspace = _resolve_workspace(args.paper_id)
+    table = getattr(args, "table", None)
+    dict_path = workspace / "data_dictionary.json"
+    if table and dict_path.is_file():
+        # The load is recorded in the dictionary; check it can be before data.db changes.
+        try:
+            json.loads(dict_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as e:
+            bad: dict[str, Any] = {
+                "source": "gmd",
+                "items": [],
+                "error": f"data_dictionary.json is not valid JSON ({e}); fix it before loading",
+            }
+            _maybe_save_table(bad, args)
+            return json.dumps(bad, indent=2, default=str)
+
+    result = await GMDProvider().series(
+        variables=_split(args.variables),
+        countries=_split(args.countries),
+        start=args.start,
+        end=args.end,
+        version=args.version,
+    )
+    if result.get("error") and not table:
+        _TABLE_FAILURES.append(f"GMD: {result['error']}")
+    _maybe_save_csv(result, args)
+    _maybe_save_table(result, args)
+
+    record = result.pop("gmd_record", None)
+    saved = result.get("saved_table") or result.get("saved_to")
+    if record and not result.get("error") and not result.get("table_error"):
+        try:
+            result["citation_added"] = add_citation(workspace)
+            result["cite_key"] = record["cite_key"]
+            if saved:
+                record = {
+                    **record,
+                    "table": result.get("saved_table"),
+                    "table_rows": result.get("saved_table_rows"),
+                    "saved_to": result.get("saved_to"),
+                    "loaded_at": (now := _utc_now()),
+                    "retrieved_at": now,
+                    "specialist": args.specialist,
+                }
+                record = {k: v for k, v in record.items() if v is not None}
+                result["recorded_in"] = [str(record_load(workspace, record).name)]
+                if result.get("saved_table"):
+                    record_in_dictionary(workspace, result["saved_table"], record)
+                    result["recorded_in"].append("data_dictionary.json")
+        except (GMDError, OSError) as e:
+            result["record_error"] = f"{type(e).__name__}: {e}"
+            _TABLE_FAILURES.append(f"GMD: the load could not be recorded: {e}")
+        result["provenance"] = {
+            "version": record["version"],
+            "files": record["files"],
+            "licence": record["licence"],
+        }
+    return json.dumps(result, indent=2, default=str)
+
+
+def _utc_now() -> str:
+    from datetime import UTC, datetime
+
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _add_save_to(p: argparse.ArgumentParser) -> None:
+    """Add the `--save-to <rel/path.csv>` flag to a data-pulling subcommand.
+
+    When passed, the wrapper writes ``result['items']`` to
+    ``workspace/data/<rel/path>`` after the call. Specialists should use
+    this on every meaningful extraction so the replication package is
+    runnable offline.
+    """
+    p.add_argument(
+        "--save-to",
+        dest="save_to",
+        default=None,
+        help=(
+            "Persist the response rows as a CSV under workspace/data/<rel/path>. "
+            "Use this whenever the data will be referenced in the paper — replication "
+            "scripts re-read from disk, not from re-running the API call. Path is "
+            "relative to workspace/data/; absolute paths are rejected."
+        ),
+    )
+    p.add_argument(
+        "--table",
+        dest="table",
+        default=None,
+        help=(
+            "Also write the rows into the paper's data.db as this table (replaced if it exists). "
+            "Use the table name declared in data_dictionary.json `tables`, e.g. spy_prices or dgs2."
+        ),
+    )
+
+
+async def _audit_query_data(paper_id: str, specialist: str, sql: str, actual_rows: int) -> None:
+    """Record an executed query_data call to data_query_records (best-effort).
+    Logged as 'feasibility' (read-only, no approval) with aggregation_level
+    'local_data_db' so it's distinguishable from Allium and detectable as usage."""
+    try:
+        from .audit import log_query, mark_executed
+
+        record_id = await log_query(
+            paper_id=paper_id,
+            specialist=specialist,
+            query_sql=sql,
+            query_type="feasibility",
+            fields_requested=[],
+            aggregation_level="local_data_db",
+        )
+        await mark_executed(record_id, actual_rows)
+    except Exception:  # noqa: BLE001 — audit must never break a query
+        pass
+
+
+async def _run_query_sql(args: argparse.Namespace) -> str:
+    """Run a read-only SQL query against the paper's data.db warehouse.
+
+    The CLI-backend counterpart to the in-process ``query_data`` tool (which the
+    Claude Code CLI never sees). Resolves the workspace from E2ER_PAPER_ID,
+    runs the validated read-only query, records the audit row, and prints the
+    result as JSON for the model to read.
+    """
+    from ...db.paper_data_db import DataQueryError, read_only_query
+
+    workspace = _resolve_workspace(args.paper_id)
+    sql = args.sql
+    try:
+        result = await read_only_query(workspace, sql)
+    except DataQueryError as e:
+        return json.dumps({"error": str(e)})
+    if os.environ.get("E2ER_REPRODUCE") != "1":  # a rerun's queries are not part of any run's record
+        await _audit_query_data(args.paper_id, args.specialist, sql, int(result.get("row_count", 0)))
+    payload: dict[str, Any] = {
+        "columns": result.get("columns", []),
+        "rows": result.get("rows", []),
+        "row_count": result.get("row_count", 0),
+    }
+    if result.get("truncated"):
+        payload["note"] = "results truncated; refine with LIMIT/WHERE/aggregation"
+    return json.dumps(payload, default=str)
+
+
+async def _run_query_tables(args: argparse.Namespace) -> str:
+    """List the data.db tables (name, columns+types, row count, sample rows) so
+    the model can discover what it can query."""
+    from ...db.paper_data_db import list_tables_catalog
+
+    catalog = await list_tables_catalog(_resolve_workspace(args.paper_id))
+    if not catalog:
+        return json.dumps({"tables": [], "note": "no data.db warehouse for this paper yet"})
+    return json.dumps({"tables": catalog}, default=str)
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="e2er-data",
+        description=(
+            "Load data for a study from the command line: e2er-data <source> <command> [options]. "
+            "The same guardrails, audit log and approval flow as the in-process data tools."
+        ),
+    )
+
+    # paper_id and specialist are runner-supplied context — they're the same
+    # for every call within a specialist invocation. The runner sets them
+    # via E2ER_PAPER_ID / E2ER_SPECIALIST env vars; the bash wrapper or this
+    # parser pick them up. CLI flags override env so devs can still test
+    # invocations manually.
+    parser.add_argument(
+        "--paper-id",
+        default=None,
+        help="Paper UUID. Defaults to $E2ER_PAPER_ID; required if neither is set.",
+    )
+    parser.add_argument(
+        "--specialist",
+        default=None,
+        help="Specialist name (audit log). Defaults to $E2ER_SPECIALIST or 'data_analyst'.",
+    )
+
+    # Top-level: dispatch by data source. Each source (allium, yfinance, …)
+    # gets its own nested subparser group. The invocation shape is:
+    #   e2er-data <source> <command> [options]
+    # e.g.
+    #   e2er-data allium feasibility --sql "..." --aggregation daily ...
+    #   e2er-data yfinance history --ticker AAPL --from 2020-01-01 ...
+    #
+    # Allium-specific guardrails (no SELECT *, time-bound WHERE, dictionary
+    # fields, granularity, feasibility-first) only run for the `allium`
+    # source. Public sources (yfinance, FRED, …) just get rate-limit
+    # handling and audit logging — different cost model.
+    sources = parser.add_subparsers(dest="source", required=True)
+
+    allium_parser = sources.add_parser("allium", help="Allium blockchain data (with the 5-rule guardrails)")
+    sub = allium_parser.add_subparsers(dest="command", required=True)
+
+    # --- feasibility / production share the same query options
+    for name, help_text in [
+        ("feasibility", "Sample query (1000-row LIMIT, auto-approved)."),
+        ("production", "Full query, requires prior feasibility + human approval."),
+    ]:
+        p = sub.add_parser(name, help=help_text)
+        p.add_argument("--sql", required=True, help="SQL query string.")
+        p.add_argument(
+            "--fields",
+            default="",
+            help="Comma-separated list of column names selected (must match data_dictionary.json).",
+        )
+        p.add_argument(
+            "--aggregation",
+            required=True,
+            choices=["transaction", "event", "daily", "weekly", "custom"],
+            help="Granularity of result rows.",
+        )
+        p.add_argument(
+            "--rationale", default="", help="Why this query is needed (also justifies transaction/event granularity)."
+        )
+        p.add_argument("--primary-table", default="", help="Main table being queried (for feasibility-first check).")
+        p.add_argument("--estimated-rows", type=int, default=None, help="Your estimate of result-set size.")
+
+    # --- check-approval
+    p = sub.add_parser("check-approval", help="Poll a production query's approval status.")
+    p.add_argument("--query-id", required=True, help="query_id returned when production query was submitted.")
+
+    # --- list-tables
+    sub.add_parser("list-tables", help="List Allium dataset schemas and tables.")
+
+    # --- describe-table (discovery)
+    p = sub.add_parser(
+        "describe-table",
+        help="List columns + types for a table (no guardrail needed; read-only).",
+    )
+    p.add_argument("--schema", required=True, help="e.g. ethereum, polygon, base")
+    p.add_argument("--table", required=True, help="e.g. nft_trades, transactions")
+
+    # --- distinct-values (discovery)
+    p = sub.add_parser(
+        "distinct-values",
+        help="Show actual values + frequency for a column. Use this BEFORE WHERE col IN (...).",
+    )
+    p.add_argument("--schema", required=True)
+    p.add_argument("--table", required=True)
+    p.add_argument("--column", required=True, help="e.g. marketplace, currency_symbol, chain")
+    p.add_argument("--limit", type=int, default=100, help="Max distinct values returned (default 100).")
+
+    # --- Developer-tier REST endpoints (works when Explorer SQL doesn't) ---
+    p = sub.add_parser(
+        "get-transfers",
+        help=(
+            "Token transfers involving a wallet over an optional date window "
+            "(developer tier). Wallet-oriented despite the path name."
+        ),
+    )
+    p.add_argument("--chain", required=True, help="e.g. ethereum, polygon, arbitrum, base")
+    p.add_argument(
+        "--address",
+        required=True,
+        help="0x-prefixed WALLET address (e.g. hacker EOA). Not a token contract.",
+    )
+    p.add_argument(
+        "--token",
+        default=None,
+        help="Optional 0x-prefixed token contract to restrict transfers to.",
+    )
+    p.add_argument(
+        "--min-timestamp",
+        dest="min_timestamp",
+        default=None,
+        help="ISO timestamp (e.g. 2022-03-22T00:00:00Z) or YYYY-MM-DD",
+    )
+    p.add_argument(
+        "--max-timestamp",
+        dest="max_timestamp",
+        default=None,
+        help="ISO timestamp or YYYY-MM-DD",
+    )
+    p.add_argument("--limit", type=int, default=100, help="Max rows per page (default 100)")
+    p.add_argument(
+        "--cursor",
+        default=None,
+        help="Pagination cursor from a previous response, if continuing.",
+    )
+
+    p = sub.add_parser(
+        "get-wallet-tx",
+        help=(
+            "Transaction history for an address (developer tier). NO date filter — pages back from now via --cursor."
+        ),
+    )
+    p.add_argument("--chain", required=True)
+    p.add_argument("--address", required=True, help="0x-prefixed address")
+    p.add_argument("--limit", type=int, default=100)
+    p.add_argument(
+        "--cursor",
+        default=None,
+        help="Pagination cursor; page back through older transactions.",
+    )
+    p.add_argument(
+        "--transaction-hash",
+        dest="transaction_hash",
+        default=None,
+        help="Filter to a single tx hash (e.g. the documented drain tx of a hack).",
+    )
+    p.add_argument(
+        "--activity-type",
+        dest="activity_type",
+        default=None,
+        help="Filter by activity type (e.g. 'transfer', 'swap', 'mint').",
+    )
+
+    p = sub.add_parser(
+        "get-balances-history",
+        help="Daily balance snapshots for an address (developer tier).",
+    )
+    p.add_argument("--chain", required=True)
+    p.add_argument("--address", required=True)
+    p.add_argument("--from-ts", dest="from_ts", required=True, help="Required: YYYY-MM-DD")
+    p.add_argument("--to-ts", dest="to_ts", required=True, help="Required: YYYY-MM-DD")
+
+    p = sub.add_parser(
+        "get-prices-history",
+        help="OHLC price history for a fungible token (developer tier). Empty for NFTs.",
+    )
+    p.add_argument("--chain", required=True)
+    p.add_argument("--token-address", required=True)
+    p.add_argument("--from-ts", dest="from_ts", required=True)
+    p.add_argument("--to-ts", dest="to_ts", required=True)
+
+    p = sub.add_parser(
+        "get-price",
+        help="Latest spot price for a token (developer tier). Sanity check.",
+    )
+    p.add_argument("--chain", required=True)
+    p.add_argument("--token-address", required=True)
+
+    # ── the connector kit's sources (sources/): yfinance, FRED, the GMD, USGS, … ──
+    # Each source's subcommands and their arguments come from its definition; a
+    # loading operation also takes --save-to and --table.
+    from .sources import all_sources
+    from .sources.runtime import add_arguments
+
+    for source in all_sources():
+        src_parser = sources.add_parser(source.name, help=source.help or source.label)
+        src_sub = src_parser.add_subparsers(dest="command", required=True)
+        for op in source.operations:
+            p = src_sub.add_parser(op.name, help=op.help)
+            add_arguments(p, op)
+            if op.loads:
+                _add_save_to(p)
+
+    # ── query — read-only SQL over the paper's local data.db warehouse ──────
+    # The CLI-backend path to the in-process `query_data` tool. Allow-listed as
+    # Bash(e2er-data:*), so the Claude Code CLI model can actually reach it.
+    query_parser = sources.add_parser(
+        "query",
+        help="Read-only SQL over the paper's local data warehouse (data.db).",
+    )
+    query_sub = query_parser.add_subparsers(dest="command", required=True)
+    p = query_sub.add_parser("sql", help='Run one read-only SELECT, e.g. e2er-data query sql "SELECT ..."')
+    p.add_argument("sql", help="A single read-only SQL SELECT/WITH statement (quote it).")
+    query_sub.add_parser("tables", help="List data.db tables: columns, row counts, sample rows.")
+
+    return parser
+
+
+# Per-source dispatch table. Top-level key is the data source; nested key
+# is the subcommand within that source. The connector kit's sources
+# (sources/) are added from their definitions by _dispatch().
+_DISPATCH: dict[str, dict[str, Any]] = {
+    "allium": {
+        "feasibility": _run_feasibility,
+        "production": _run_production,
+        "check-approval": _run_check_approval,
+        "describe-table": _run_describe_table,
+        "distinct-values": _run_distinct_values,
+        "list-tables": _run_list_tables,
+        "get-transfers": _run_dev_transfers,
+        "get-wallet-tx": _run_dev_wallet_tx,
+        "get-balances-history": _run_dev_balances_history,
+        "get-prices-history": _run_dev_prices_history,
+        "get-price": _run_dev_get_price,
+    },
+    "query": {
+        "sql": _run_query_sql,
+        "tables": _run_query_tables,
+    },
+}
+
+
+def _dispatch() -> dict[str, dict[str, Any]]:
+    """The dispatch table: Allium and query, and every source of the connector kit."""
+    from .sources import all_sources
+    from .sources.runtime import cli_handler
+
+    table = dict(_DISPATCH)
+    for source in all_sources():
+        table[source.name] = {op.name: op.run or cli_handler(source, op) for op in source.operations}
+    return table
+
+
+def _refuse_in_rerun(args: argparse.Namespace) -> int:
+    """Inside `e2er reproduce`, a step that does not load the inputs again may only read data.db.
+
+    The study's code then depends on nothing but its own folder: a call that loads
+    data from a source is stopped with a plain message, and recorded for the report.
+    """
+    command = f"{args.source} {args.command}"
+    log = os.environ.get("E2ER_REPRODUCE_NETWORK_LOG", "").strip()
+    if log:
+        try:
+            with open(log, "a", encoding="utf-8", newline="\n") as f:
+                f.write(json.dumps({"command": command, "blocked": True}) + "\n")
+        except OSError:
+            pass
+    print(
+        f"e2er reproduce: `e2er-data {command}` loads data from a source on the web, which this step of the "
+        "rerun may not do. The study's code can read its own data with `e2er-data query sql` and "
+        "`e2er-data query tables` (they read data.db); loading data belongs in the data step (get_data.py).",
+        file=sys.stderr,
+    )
+    return 5
+
+
+_NEGATIVE_VALUE = re.compile(r"^-\d[\d.]*(,\s*-?[\d.]+)+$")
+
+
+def _join_negative_values(argv: list[str]) -> list[str]:
+    """``--bbox -125,32,-114,42`` as ``--bbox=-125,32,-114,42``.
+
+    argparse reads a value that starts with a dash as an option and stops with
+    "expected one argument"; a comma-separated list of numbers (a region, a
+    range) is joined to its option so it reads as the value it is.
+    """
+    out: list[str] = []
+    for word in argv:
+        if out and out[-1].startswith("--") and "=" not in out[-1] and _NEGATIVE_VALUE.match(word):
+            out[-1] = f"{out[-1]}={word}"
+        else:
+            out.append(word)
+    return out
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Entry point. Returns process exit code."""
+    import os
+
+    parser = _build_parser()
+    args = parser.parse_args(_join_negative_values(list(sys.argv[1:] if argv is None else argv)))
+
+    # Resolve paper_id / specialist: explicit flag wins, then env var, then
+    # default. Without paper_id we cannot route the query (workspace lookup
+    # + audit log both need it). Public sources don't strictly need paper_id
+    # for authorisation, but we still record it on the audit row so the
+    # reproducibility chain isn't broken.
+    args.paper_id = args.paper_id or os.environ.get("E2ER_PAPER_ID")
+    args.specialist = args.specialist or os.environ.get("E2ER_SPECIALIST") or "data_analyst"
+    if not args.paper_id:
+        print(
+            "e2er-data: paper_id missing. Pass --paper-id <uuid> or set "
+            "E2ER_PAPER_ID in the environment. (Normally the runner injects this "
+            "automatically; this error means the wrapper is being called outside a "
+            "specialist run.)",
+            file=sys.stderr,
+        )
+        return 2
+
+    dispatch = _dispatch()
+    source_dispatch = dispatch.get(args.source)
+    if source_dispatch is None:
+        print(f"Unknown source: {args.source!r}. Known: {sorted(dispatch.keys())}", file=sys.stderr)
+        return 2
+    runner = source_dispatch.get(args.command)
+    if runner is None:
+        print(
+            f"Unknown {args.source} command: {args.command!r}. Known: {sorted(source_dispatch.keys())}",
+            file=sys.stderr,
+        )
+        return 2
+    if os.environ.get("E2ER_DATA_READ_ONLY") == "1" and args.source != "query":
+        return _refuse_in_rerun(args)
+    _TABLE_FAILURES.clear()
+    try:
+        result = asyncio.run(runner(args))
+    except Exception as e:
+        # Fatal infrastructure error (DB unavailable, no Allium key, etc.).
+        # Guardrail rejections come back as a string from handler.handle()
+        # — those are NOT exceptions and reach the print() below.
+        print(f"e2er-data {args.source} {args.command} failed: {type(e).__name__}: {e}", file=sys.stderr)
+        return 3
+    print(result)
+    if _TABLE_FAILURES:
+        # A declared table that could not be loaded is not an empty table: the
+        # model sees the error above, and the exit code stops a script chain.
+        print(f"e2er-data {args.source} {args.command}: {_TABLE_FAILURES[0]}", file=sys.stderr)
+        return 4
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

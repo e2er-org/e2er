@@ -1,0 +1,251 @@
+"""Paper and pipeline state machines."""
+
+from __future__ import annotations
+
+from enum import StrEnum
+
+
+class PaperStatus(StrEnum):
+    IDEA = "idea"
+    DESIGNING = "designing"
+    DATA_COLLECTION = "data_collection"
+    DATA_APPROVAL = "data_approval"
+    IN_PROGRESS = "in_progress"
+    CEILING_CHECK = "ceiling_check"
+    SELF_ATTACK = "self_attack"
+    POLISH = "polish"
+    REVIEW = "review"
+    REVISION = "revision"
+    # Every step is done; the replication package and the final export are being
+    # written. COMPLETED only once they are (runner._update_status defers it), so a
+    # folder exported while the status said "completed" is never a half-written one.
+    FINISHING = "finishing"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+    # A check stopped the run (verify_numbers / verify_citations before the
+    # internal quality review). Distinct from FAILED (a crash). Resumable via
+    # /api/papers/{id}/resume — the operator fixes what the check names and
+    # re-runs. The value is an internal code: it is shown as "stopped by a
+    # check" (core/run_outcome.py). The internal quality review never sets it
+    # after 0.13.1: a run that finishes its steps is COMPLETED whatever its score.
+    REJECTED = "rejected"
+    # Circuit-breaker halt + budget-exhausted halt. Set when a non-tolerant
+    # specialist has failed too many times in a row, OR when the per-paper
+    # cost cap is reached. Workspace artifacts + `.pipeline_state.json`
+    # are preserved, so resuming with a higher --max-cost picks up at the
+    # first incomplete phase. Operator inspects the workspace + events
+    # and either resumes via /api/papers/{id}/resume or restarts from IDEA.
+    PAUSED = "paused"
+
+
+class PipelineMode(StrEnum):
+    SINGLE_PASS = "single_pass"  # Mode 1 — fast draft, single specialist sequence
+    ITERATIVE = "iterative"  # Mode 2 — full loop with ceiling detection + attack
+
+
+class BudgetExceededError(Exception):
+    """Raised when a paper's cumulative LLM cost reaches its per-paper cap."""
+
+    def __init__(self, spent: float, cap: float) -> None:
+        self.spent = spent
+        self.cap = cap
+        super().__init__(f"Budget exceeded: spent ${spent:.2f}, cap ${cap:.2f}")
+
+
+# The runner's stage sequence (the keys checkpointed to .pipeline_state.json).
+# Shared so the API can validate a requested review point against real stages.
+PIPELINE_STAGES: tuple[str, ...] = (
+    "initial",
+    "iterative",
+    "estimation_gate",
+    "self_attack",
+    "polish",
+    "review",
+    "revision",
+    "replication",
+)
+
+
+class HumanReviewRequestedError(Exception):
+    """Raised by the runner after a stage the researcher asked to review, to
+    pause the run cleanly (status=PAUSED) for inspection before the next stage.
+
+    PipelineRunner.run() catches this, records an `awaiting_review` event with
+    the stage, and returns gracefully. Resuming (after the operator approves
+    the pending stage) continues at the next incomplete stage."""
+
+    def __init__(self, stage: str) -> None:
+        self.stage = stage
+        super().__init__(f"Human review requested after stage '{stage}'")
+
+
+class StepFailedError(Exception):
+    """A step ended the run: ``failed``, or ``rejected`` (shown as "stopped by a check").
+
+    Raised instead of returning the status, so the run stops at once (no later
+    step runs), the step is not marked done (``e2er resume`` runs it again), and
+    the reason always reaches the paper's ``last_error``.
+    """
+
+    def __init__(self, status: PaperStatus, reason: str, stage: str = "") -> None:
+        self.status = status
+        self.reason = reason.strip() or f"the step '{stage or '?'}' ended the run without a recorded reason"
+        self.stage = stage
+        super().__init__(self.reason)
+
+
+class GateHaltError(HumanReviewRequestedError):
+    """A check placed inside the dispatch (a gate step with `after`) failed and halts the run.
+
+    A halt is a stop for the researcher: the step's design files can be edited,
+    or the specialist that wrote them sent back, and the check runs again when
+    the run resumes. Approving does not pass a failed check; only a design that
+    passes it does.
+    """
+
+    def __init__(self, stage: str, reasons: list[str] | tuple[str, ...]) -> None:
+        super().__init__(stage)
+        self.reasons = list(reasons)
+
+
+class CircuitBreakerError(Exception):
+    """Raised when a non-tolerant specialist has failed ``max_attempts`` times in a row.
+
+    Halts the run cleanly with status=PAUSED instead of looping through
+    the strategist's revision logic until budget is exhausted (the run
+    #14 failure mode where data_analyst was re-dispatched 3 times when
+    Allium was unrecoverably down).
+
+    The PipelineRunner.run() catches this, marks the paper PAUSED, logs
+    a circuit_breaker_tripped event with the specialist + reason, and
+    returns gracefully. The operator inspects the workspace + events
+    and either fixes the underlying issue + resumes, or cancels.
+    """
+
+    def __init__(self, specialist: str, attempts: int, last_error: str | None = None) -> None:
+        self.specialist = specialist
+        self.attempts = attempts
+        self.last_error = last_error
+        msg = f"Circuit breaker: {specialist} failed {attempts} times in a row"
+        if last_error:
+            msg += f". Last error: {last_error[:200]}"
+        super().__init__(msg)
+
+
+# Every state can transition to CANCELLED (user can cancel at any point).
+# CANCELLED is terminal except for restart back to IDEA.
+# PAUSED is reachable from every non-terminal state (circuit breaker), and
+# can transition to IDEA (restart) or any non-terminal state (resume).
+_NON_TERMINAL = {
+    PaperStatus.IDEA,
+    PaperStatus.DESIGNING,
+    PaperStatus.DATA_COLLECTION,
+    PaperStatus.DATA_APPROVAL,
+    PaperStatus.IN_PROGRESS,
+    PaperStatus.CEILING_CHECK,
+    PaperStatus.SELF_ATTACK,
+    PaperStatus.POLISH,
+    PaperStatus.REVIEW,
+    PaperStatus.REVISION,
+    PaperStatus.FINISHING,
+}
+
+VALID_TRANSITIONS: dict[PaperStatus, set[PaperStatus]] = {
+    PaperStatus.IDEA: {PaperStatus.DESIGNING, PaperStatus.FAILED, PaperStatus.CANCELLED},
+    PaperStatus.DESIGNING: {
+        PaperStatus.DATA_COLLECTION,
+        PaperStatus.IN_PROGRESS,
+        PaperStatus.FAILED,
+        PaperStatus.CANCELLED,
+    },
+    PaperStatus.DATA_COLLECTION: {
+        PaperStatus.DATA_APPROVAL,
+        PaperStatus.IN_PROGRESS,
+        PaperStatus.FAILED,
+        PaperStatus.CANCELLED,
+    },
+    PaperStatus.DATA_APPROVAL: {
+        PaperStatus.IN_PROGRESS,
+        PaperStatus.DATA_COLLECTION,
+        PaperStatus.FAILED,
+        PaperStatus.CANCELLED,
+    },
+    # IN_PROGRESS → REJECTED for the pre-review verify_numbers audit gate.
+    PaperStatus.IN_PROGRESS: {
+        PaperStatus.CEILING_CHECK,
+        PaperStatus.REVIEW,
+        PaperStatus.REJECTED,
+        PaperStatus.FAILED,
+        PaperStatus.CANCELLED,
+    },
+    PaperStatus.CEILING_CHECK: {
+        PaperStatus.SELF_ATTACK,
+        PaperStatus.REVIEW,
+        PaperStatus.IN_PROGRESS,
+        PaperStatus.FAILED,
+        PaperStatus.CANCELLED,
+    },
+    PaperStatus.SELF_ATTACK: {
+        PaperStatus.POLISH,
+        PaperStatus.REVIEW,
+        PaperStatus.FAILED,
+        PaperStatus.CANCELLED,
+    },
+    PaperStatus.POLISH: {PaperStatus.REVIEW, PaperStatus.FAILED, PaperStatus.CANCELLED},
+    PaperStatus.REVIEW: {
+        PaperStatus.REVISION,
+        PaperStatus.FINISHING,
+        PaperStatus.COMPLETED,
+        PaperStatus.FAILED,
+        PaperStatus.REJECTED,
+        PaperStatus.CANCELLED,
+    },
+    PaperStatus.REVISION: {
+        PaperStatus.REVIEW,
+        PaperStatus.FINISHING,
+        PaperStatus.COMPLETED,
+        PaperStatus.FAILED,
+        PaperStatus.REJECTED,
+        PaperStatus.CANCELLED,
+    },
+    PaperStatus.FINISHING: {PaperStatus.COMPLETED, PaperStatus.FAILED, PaperStatus.CANCELLED},
+    PaperStatus.COMPLETED: set(),
+    PaperStatus.FAILED: {PaperStatus.IDEA},
+    PaperStatus.CANCELLED: {PaperStatus.IDEA},
+    # REJECTED (stopped by a check) is reachable from REVIEW/REVISION (a check
+    # on the re-reviewed draft of a deep revision round) and can transition
+    # back to IDEA (restart) or any non-terminal phase when the operator
+    # resumes after revising the source artifacts.
+    PaperStatus.REJECTED: {
+        PaperStatus.IDEA,
+        PaperStatus.CANCELLED,
+        PaperStatus.IN_PROGRESS,
+        PaperStatus.REVIEW,
+        PaperStatus.REVISION,
+    },
+    # PAUSED → can restart from IDEA, cancel, OR resume by re-entering any
+    # non-terminal phase. Resume picks the phase based on the workspace's
+    # last completed canonical artifact (see runner._resume_target_status).
+    PaperStatus.PAUSED: {
+        PaperStatus.IDEA,
+        PaperStatus.CANCELLED,
+        PaperStatus.DESIGNING,
+        PaperStatus.DATA_COLLECTION,
+        PaperStatus.IN_PROGRESS,
+        PaperStatus.CEILING_CHECK,
+        PaperStatus.SELF_ATTACK,
+        PaperStatus.POLISH,
+        PaperStatus.REVIEW,
+        PaperStatus.REVISION,
+    },
+}
+
+# Augment every non-terminal state with PAUSED as a valid exit target.
+# Kept out of the literal above so the FSM diagram stays readable.
+for _state in _NON_TERMINAL:
+    VALID_TRANSITIONS[_state].add(PaperStatus.PAUSED)
+
+
+def can_transition(current: PaperStatus, target: PaperStatus) -> bool:
+    return target in VALID_TRANSITIONS.get(current, set())

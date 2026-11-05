@@ -1,0 +1,447 @@
+"""E2ER v3 — Unified configuration (all BYOK settings)."""
+
+from __future__ import annotations
+
+from functools import lru_cache
+from pathlib import Path
+from typing import Literal
+
+from pydantic import ValidationInfo, field_validator
+from pydantic_settings import BaseSettings
+
+#: Setting names that hold a key or secret: their values are stripped of surrounding whitespace.
+_SECRET_SUFFIXES = ("_key", "_token", "_secret", "_password")
+
+
+def is_secret_setting(name: str) -> bool:
+    return name.lower().endswith(_SECRET_SUFFIXES)
+
+
+def strip_secret(value: str | None) -> str | None:
+    """A key as pasted, without the spaces, tabs or line breaks around it."""
+    return value.strip() if isinstance(value, str) else value
+
+
+class Settings(BaseSettings):
+    @field_validator("*", mode="before")
+    @classmethod
+    def _strip_secrets(cls, value: object, info: ValidationInfo) -> object:
+        """Keys and secrets lose surrounding whitespace, from `.env` and the environment alike.
+
+        A key pasted as ``FRED_API_KEY=" e5f…"`` (or exported with a space) was
+        sent to FRED with the space, which FRED rejects as not a 32-character key.
+        """
+        if isinstance(value, str) and info.field_name and is_secret_setting(info.field_name):
+            return value.strip()
+        return value
+
+    # ── LLM ───────────────────────────────────────────────────────────────────
+    llm_backend: Literal["anthropic", "openrouter", "claude_code", "codex", "gemini"] = "anthropic"
+    anthropic_api_key: str | None = None
+    anthropic_model: str = "claude-sonnet-4-5"
+    openrouter_api_key: str | None = None
+    openrouter_model: str = "anthropic/claude-sonnet-4-5"
+    #: Which of a model's providers OpenRouter sends each call to: "price" (the
+    #: providers in order of what a study's calls cost there, mostly cached input;
+    #: see llm/openrouter_models.provider_order), "throughput", "latency", or ""
+    #: for OpenRouter's own balancing. Measured 2026-10-10 on DeepSeek V4 Pro: both
+    #: OpenRouter's balancing and its own sort=price billed ~5-8x the cheapest provider.
+    openrouter_provider_sort: Literal["price", "throughput", "latency", ""] = "price"
+    enable_prompt_caching: bool = True
+    #: Input tokens one OpenRouter tool-loop attempt may send in total (fresh plus
+    #: cached, summed over its turns) before it stops with a plain message. Each
+    #: turn resends the conversation; one data-analyst attempt (2026-10-13) sent
+    #: 9.4 million and cost $1.44. 0 turns the limit off.
+    openrouter_attempt_token_budget: int = 3_000_000
+
+    # ── Governance regime (the experiment's treatment variable) ───────────────
+    # Which verification institutions BLOCK a run:
+    #   full      — every mechanism enforces (default; current behaviour)
+    #   contracts — specialist output contracts enforce; the deterministic
+    #               gates (estimation / numbers / citations) run in shadow
+    #   off       — nothing blocks; all gates run in shadow
+    # In shadow mode a gate still computes its verdict and writes its report,
+    # and the runner logs a `gate_shadow` event — so fabrication that WOULD
+    # have been caught is measured, not merely absent. Per-paper override via
+    # the API / `e2er run --governance`.
+    governance: Literal["off", "contracts", "full"] = "full"
+
+    # ── Database ──────────────────────────────────────────────────────────────
+    # Default: SQLite at ~/.e2er/papers.db (zero-setup, single-user).
+    # Production / multi-user: set DATABASE_URL=postgresql://… (enables
+    # pgvector, concurrent writes, the literature KB).
+    #
+    # Legacy db_* fields preserved for back-compat with prior docker
+    # compose envs. Set DATABASE_URL explicitly to override.
+    database_url: str = ""  # empty → SQLite default
+    db_password: str = "changeme"
+    db_host: str = "db"
+    db_port: int = 5432
+    db_name: str = "e2er"
+    db_user: str = "e2er"
+    postgres_url: str | None = None  # legacy alias; overrides db_* if set
+
+    @property
+    def resolved_database_url(self) -> str:
+        """The DB URL the client should actually use.
+
+        Order of precedence (highest → lowest):
+          1. ``database_url`` env var (most explicit)
+          2. ``postgres_url`` env var (legacy alias)
+          3. The composed ``postgresql://`` URL from db_* fields — ONLY
+             if any db_* field was explicitly overridden (i.e., not the
+             docker-only defaults). Otherwise falls through to SQLite.
+          4. SQLite at ``~/.e2er/papers.db``.
+        """
+        if self.database_url:
+            return self.database_url
+        if self.postgres_url:
+            return self.postgres_url
+        # If the user has explicitly set ANY db_* field (i.e. they want
+        # Postgres), compose the URL. Otherwise default to SQLite —
+        # avoids tripping the "connect to docker DB called 'db'" failure
+        # mode for fresh pip installs.
+        defaults = (
+            self.db_password == "changeme"
+            and self.db_host == "db"
+            and self.db_port == 5432
+            and self.db_name == "e2er"
+            and self.db_user == "e2er"
+        )
+        if not defaults:
+            return f"postgresql://{self.db_user}:{self.db_password}@{self.db_host}:{self.db_port}/{self.db_name}"
+        # Fall through to SQLite — empty string signals "use default".
+        return ""
+
+    # ── Data — Allium ─────────────────────────────────────────────────────────
+    allium_api_key: str | None = None
+    allium_api_base: str = "https://api.allium.so/api/v1"
+    auto_approve_feasibility: bool = True
+    max_queries_per_paper: int = 20
+    max_rows_per_paper: int = 5_000_000
+
+    # ── Data — FRED (Federal Reserve Economic Data) ───────────────────────────
+    # Free key, ~30s to register at https://fredaccount.stlouisfed.org/apikey.
+    # Without a key, FRED subcommands return a structured error envelope
+    # pointing the user at the registration URL.
+    fred_api_key: str | None = None
+
+    # ── Zenodo (deposits with the researcher's own account) ───────────────────
+    # Read by src/core/zenodo.load_token after the environment; Setup writes it.
+    zenodo_token: str | None = None
+    zenodo_sandbox_token: str | None = None
+
+    @property
+    def data_module_enabled(self) -> bool:
+        return self.allium_api_key is not None
+
+    # ── Local datasets + literature directory ────────────────────────────────
+    # Single env var that holds the researcher's BYOD ("bring your own data")
+    # corpus reusable across papers. Mixed content, extension-routed:
+    #   *.csv / *.tsv / *.jsonl / *.parquet / *.xlsx / *.txt → data files,
+    #     symlinked into `workspace/<paper_id>/data/` at paper creation so
+    #     `_list_user_data` picks them up and specialists can `read_file`
+    #     them through the standard sandbox.
+    #   *.bib → additional BibTeX, parsed alongside LITERATURE_BIBTEX_FILE in
+    #     `_load_reference_summary`.
+    # When unset, both pathways are no-ops; everything that worked pre-v0.8
+    # still works.
+    local_data_dir: str | None = None
+    # Walk subdirectories of LOCAL_DATA_DIR rather than only top-level files.
+    # When True, file destinations under workspace/data/ preserve the
+    # relative path from the corpus root (so a/raw/x.csv → workspace/data/a/raw/x.csv).
+    local_data_dir_recursive: bool = False
+    # Replication template: the published paper as a PDF the researcher
+    # supplies (e.g. downloaded in a browser when the publisher refuses
+    # automated downloads). Looked for here, then as paper.pdf in each
+    # LOCAL_DATA_DIR folder, then as data/paper.pdf in the paper's workspace.
+    # The fetch step fingerprints it and records it as researcher-supplied.
+    paper_pdf: str = ""
+
+    # ── Literature ────────────────────────────────────────────────────────────
+    literature_bibtex_file: str | None = None
+    semantic_scholar_api_key: str | None = None
+
+    # The structured-review corpus: one SQLite file holding what papers *claim*,
+    # accumulated across projects. Deliberately outside any workspace — a
+    # library that resets per paper is not a library. Defaults to
+    # ~/.e2er/corpus.db; point CORPUS_DB elsewhere to keep it on another drive
+    # or to run a throwaway one. Unrelated to LOCAL_DATA_DIR, which is folders
+    # of the researcher's own files.
+    corpus_db: str | None = None
+
+    # Read the paper's own staged PDFs (workspace/<id>/literature/, filled from
+    # LITERATURE_DIR or Zotero) into the corpus before drafting starts. On by
+    # default because those are papers the researcher deliberately supplied, and
+    # they are the only ones guaranteed to be readable — no paywalls.
+    #
+    # It costs one model call per NEW paper. Nothing is re-read: the corpus is
+    # incremental, so the second run on the same folder spends nothing. Set
+    # CORPUS_AUTOINGEST=false to turn it off.
+    corpus_autoingest: bool = True
+
+    # A local checkout of the RISE catalogue (github.com/e2er-org/RISE), which
+    # indexes skill packs published by other research projects. `e2er skills`
+    # reads it to install packs from their own sources rather than vendoring
+    # them — most of the catalogue is not E2ER's to redistribute. Unset: e2er
+    # downloads the pack list from GitHub into ~/.e2er/cache/rise.
+    rise_path: str | None = None
+
+    # BYOD literature folder: a directory of the researcher's own papers,
+    # discovered + persisted into SQLite at paper creation. May be a plain
+    # folder of PDFs OR a Zotero folder (auto-detected by a zotero.sqlite at
+    # the root). Comma-separated paths allowed. Falls back to local_data_dir.
+    literature_dir: str | None = None
+    # Route search_papers to the local SQLite library first (SQLite backend).
+    literature_local_search_enabled: bool = True
+    # Optional: local sentence-transformers embeddings for semantic local
+    # search (off by default; needs the pgvector extra). FTS/LIKE otherwise.
+    literature_embeddings_enabled: bool = False
+    # Cap on papers discovered+persisted from LITERATURE_DIR at paper creation
+    # (protects startup latency + CrossRef rate limits on huge libraries).
+    literature_max_ingest: int = 500
+    # How many hits per query the always-on acquisition stage records when no
+    # bibliography exists yet. Two queries (research question + title) run, so
+    # the ceiling is roughly twice this before de-duplication. Sized for a
+    # normal reference list, not a survey. 0 turns the web search off (no
+    # request to OpenAlex or arXiv; the offline corpus still seeds literature.bib).
+    literature_acquire_limit: int = 30
+
+    # Email used to identify this client to the OpenAlex / Crossref / Unpaywall
+    # polite pools (all keyless, all ask for a contact in every request). Each
+    # of those services prioritises requests from registered emails; the
+    # default keeps us in the polite pool with a stable address.
+    unpaywall_email: str = "research@e2er.app"
+    # Optional free OpenAlex key (https://help.openalex.org/api/authentication/).
+    # Without it every request draws on a daily budget shared by all machines on
+    # the same network; with it the key's own budget applies. The field map
+    # sends it as a bearer token, never in an address.
+    openalex_api_key: str | None = None
+
+    # Zotero Web API (reference library). Set the key plus exactly one of
+    # user_id / group_id. The library's bibliographic items are merged into
+    # the reference summary alongside local .bib (see reference_libraries()).
+    zotero_api_key: str | None = None
+    zotero_user_id: str | None = None
+    zotero_group_id: str | None = None
+
+    @property
+    def zotero_enabled(self) -> bool:
+        return self.zotero_api_key is not None and (self.zotero_user_id is not None or self.zotero_group_id is not None)
+
+    @property
+    def literature_kb_enabled(self) -> bool:
+        # The pgvector KB requires Postgres. Derive from the *resolved* URL so
+        # the documented `DATABASE_URL=postgresql://…` path enables it — the
+        # old check only looked at the legacy postgres_url/db_password fields
+        # and left the KB silently off (keyword-only) for DATABASE_URL users.
+        return self.resolved_database_url.startswith("postgres")
+
+    def resolved_literature_dirs(self) -> str | None:
+        """The BYOD literature folder(s): ``literature_dir`` if set, else the
+        shared ``local_data_dir`` (so existing PDF-in-LOCAL_DATA_DIR setups
+        keep working with zero new config)."""
+        return self.literature_dir or self.local_data_dir
+
+    @property
+    def literature_local_enabled(self) -> bool:
+        """Local SQLite literature library is the active search backend: on the
+        SQLite backend with local search enabled (mirror of literature_kb_enabled
+        for the no-Postgres path)."""
+        return self.literature_local_search_enabled and not self.resolved_database_url.startswith("postgres")
+
+    # ── Structured export ─────────────────────────────────────────────────────
+    # At the end of a run (and on demand via `e2er export`), assemble a clean,
+    # portable project folder from the flat workspace. See
+    # docs/STRUCTURED_EXPORT_SPEC.md.
+    export_enabled: bool = True
+    output_dir: str | None = None  # where exported project folders land
+
+    def resolved_output_root(self) -> Path:
+        """Root dir for exported studies: OUTPUT_DIR, else ``exports`` in the studies folder.
+
+        Never inside the data folder: before 0.14.0 the default was
+        ``<LOCAL_DATA_DIR>/e2er_papers``, which put every export among the
+        researcher's data (the corpus reader skips that folder, so studies
+        exported there before keep working).
+        """
+        if self.output_dir:
+            return Path(self.output_dir).expanduser()
+        from . import home
+
+        here = home.project_dir() if home.kind() != "none" else home.default_studies_folder()
+        return here / "exports"
+
+    # ── GitHub ────────────────────────────────────────────────────────────────
+    github_token: str | None = None
+    github_username: str | None = None
+    github_org: str | None = None
+    github_paper_prefix: str = "E2ER"
+    github_private_repos: bool = True
+
+    @property
+    def github_enabled(self) -> bool:
+        return self.github_token is not None and self.github_username is not None
+
+    # ── Pipeline ──────────────────────────────────────────────────────────────
+    max_concurrent_specialists: int = 3
+    specialist_timeout: int = 3600
+    max_review_rounds: int = 3
+    weak_accept_threshold: float = 7.0
+    max_revision_iterations: int = 3
+    default_max_cost_usd: float = 25.0  # fallback per-paper cost cap
+    # Per-API-call output cap. Must be large enough for ONE specialist's
+    # `write_file` tool argument (the JSON / LaTeX / markdown content).
+    # 16384 was too low: data_architect / paper_drafter writing
+    # data_dictionary.json or full paper drafts hit finish_reason="length"
+    # mid-write, the tool_loop correctly bails (looping is futile — same
+    # wall every time), and the specialist is marked failed. Both Anthropic
+    # Claude Sonnet 4.6 and Haiku 4.5 support 64K output tokens; use
+    # 32K as a balanced default that leaves headroom without burning extra
+    # latency on calls that don't need it.
+    max_tokens_per_call: int = 32768
+
+    # ── Server ────────────────────────────────────────────────────────────────
+    host: str = "127.0.0.1"
+    # More host names the dashboard answers to (comma-separated), e.g. behind a reverse proxy.
+    allowed_hosts: str = ""
+    port: int = 8280
+    log_level: str = "INFO"
+    artifacts_dir: str = "artifacts"
+    repos_dir: str = "repos"
+    workspace_root: str = "workspaces"
+
+    # ── Claude Code CLI backend (free under Max plan) ─────────────────────────
+    # Set LLM_BACKEND=claude_code to delegate every specialist call to the
+    # `claude` CLI subprocess instead of paying API tokens. Requires Claude
+    # Code installed (`npm i -g @anthropic-ai/claude-code`) AND a Max plan.
+    # See src/modules/llm/claude_code.py for trade-offs (Allium guardrails
+    # need a wrapper script, prompt tool-name conventions differ).
+    claude_code_path: str = "claude"
+    claude_code_timeout: int = 1800  # 30 min hard cap per specialist invocation
+    claude_code_max_turns: int = 60  # Default agentic-turn cap inside the CLI
+    claude_code_cwd: str = ""  # Empty → use os.getcwd() at invocation time
+    # Model for the `claude` subprocesses (passed as `--model`). Empty → the
+    # CLI's own configured default, which is whatever the user last set via
+    # /model — a run can silently burn the priciest tier's usage credits that
+    # way (a July 2026 validation run died mid-pipeline on a Fable 5 credit
+    # ceiling because the interactive default leaked in). Pin it explicitly:
+    # e.g. CLAUDE_CODE_MODEL=claude-sonnet-4-6 (aliases like "sonnet" work).
+    claude_code_model: str = ""
+
+    # ── Codex CLI backend (runs on a ChatGPT plan) ────────────────────────────
+    # Set LLM_BACKEND=codex to delegate to the `codex exec` subprocess.
+    # Requires the Codex CLI (`npm install -g @openai/codex`, or the copy inside
+    # the ChatGPT desktop app, found automatically) + `codex login`.
+    # Validated live on codex-cli 0.155 (2026-10).
+    codex_path: str = "codex"
+    codex_timeout: int = 1800
+    # Empty → the first model in the CLI's own list ($CODEX_HOME/models_cache.json),
+    # passed explicitly so the run records which model it was.
+    codex_model: str = ""
+    # low | medium | high | xhigh (some models also max); empty → the model's default.
+    codex_reasoning_effort: str = ""
+    # read-only | workspace-write | danger-full-access. workspace-write is the
+    # only one under which specialists can write files and stay confined.
+    codex_sandbox: str = "workspace-write"
+    codex_cwd: str = ""
+    # Off by default since 0.19.0: in a workspace-write sandbox with the network on, any shell command
+    # of the model reaches any address. True lets e2er-data and e2er-lit download (and every command).
+    codex_network_access: bool = False
+    # danger-full-access (no sandbox at all) runs only with this set as well (and a warning).
+    codex_allow_full_access: bool = False
+
+    # ── Gemini CLI backend (not tested) ───────────────────────────────────────
+    # Set LLM_BACKEND=gemini to delegate to the `gemini` subprocess. Requires
+    # the Gemini CLI (`npm install -g @google/gemini-cli`) and GEMINI_API_KEY:
+    # Google ended the Gemini CLI for AI Pro/Ultra plans and free individual
+    # accounts on 18 June 2026; only a paid Gemini API key works.
+    # No full study has run on it; full runs are tested on Claude Code and Codex.
+    gemini_path: str = "gemini"
+    gemini_timeout: int = 1800
+    gemini_model: str = ""  # Empty → CLI's default
+    gemini_cwd: str = ""
+    # The Gemini CLI always runs with --sandbox. Its shell tool runs commands without asking only with
+    # this set (--approval-mode yolo, with a warning); otherwise it may edit files only (auto_edit).
+    gemini_yolo: bool = False
+
+    # ── API security ──────────────────────────────────────────────────────────
+    # When set, API requests may use `Authorization: Bearer <token>` instead of the
+    # dashboard's session token. Required to serve on an address other than
+    # 127.0.0.1 (`e2er serve --host`, the Docker image). Unset (default), every
+    # /api/ route needs the session token that `e2er` makes at each start.
+    api_auth_token: str | None = None
+    # Comma-separated origins for CORS. Default is the dashboard on localhost.
+    # Set to '*' explicitly to allow any origin (only do this for non-secret deploys).
+    cors_origins: str = "http://localhost:8280,http://127.0.0.1:8280"
+
+    def default_model_for(self, backend: str) -> str:
+        """The configured model for an EXPLICIT backend.
+
+        Per-paper backend overrides (`e2er run --backend`, `run-matrix`, the
+        governance experiment) must resolve their model against the backend
+        the paper actually runs on — not the process-global one. Falling back
+        to `default_model` there sends e.g. a bare `claude-sonnet-4-5` to
+        OpenRouter (which needs the `anthropic/` prefix), and every call in
+        the run fails.
+
+        For the CLI backends the returned string is bookkeeping only (the
+        subprocess reads its own `*_model` setting, and cost is flat-rate $0)
+        — but it labels the run in `papers.model`, `compare`, and the
+        experiment results, so it must name the right family.
+        """
+        if backend == "openrouter":
+            return self.openrouter_model
+        if backend == "claude_code":
+            return self.claude_code_model or self.anthropic_model
+        if backend == "codex":
+            if self.codex_model:
+                return self.codex_model
+            from .modules.llm.codex import effective_codex_model
+
+            return effective_codex_model(self) or "codex-cli-default"
+        if backend == "gemini":
+            return self.gemini_model or "gemini-cli-default"
+        return self.anthropic_model
+
+    @property
+    def default_model(self) -> str:
+        """Model for the process-global backend (`LLM_BACKEND`)."""
+        return self.default_model_for(self.llm_backend)
+
+    model_config = {
+        "env_file": ".env",
+        "env_file_encoding": "utf-8",
+        "extra": "ignore",  # tolerate extra env vars (e.g. POSTGRES_PASSWORD for docker)
+    }
+
+
+@lru_cache(maxsize=1)
+def get_settings() -> Settings:
+    """The settings: the environment, then the `.env` of the studies folder (src/home.py).
+
+    A relative ``WORKSPACE_ROOT`` (the default ``workspaces``) is taken inside
+    that folder when e2er was started somewhere else, so studies always land
+    next to the settings they were made with.
+    """
+    from . import home
+
+    here = home.project_dir()
+    s = Settings(_env_file=str(here / ".env"))  # type: ignore[call-arg]
+    # What a folder's .env may not decide without a yes: the programs e2er starts, their sandbox (env_trust.py).
+    from .env_trust import untrusted, warn
+
+    refused = untrusted(here / ".env")
+    if refused:
+        warn(here / ".env", refused)
+        for key in refused:
+            name = key.lower()
+            if name in Settings.model_fields:
+                setattr(s, name, Settings.model_fields[name].default)
+    try:
+        elsewhere = here.resolve() != Path.cwd().resolve()
+    except OSError:
+        elsewhere = False
+    if elsewhere and not Path(s.workspace_root).expanduser().is_absolute():
+        s.workspace_root = str(here / s.workspace_root)
+    return s

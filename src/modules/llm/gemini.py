@@ -1,0 +1,304 @@
+"""LLM backend that delegates to the Google ``gemini`` CLI.
+
+Same pattern as `claude_code.py` and `codex.py`: hand the CLI the whole prompt
+on stdin, let it run its own tool loop, read back the answer and usage.
+
+Status: NOT tested. No full study has run on it; the command line and the
+JSON shape below follow the CLI's documented headless mode and are covered by
+mocked tests only. Full runs are tested on Claude Code and Codex.
+
+Install: ``npm install -g @google/gemini-cli`` and set GEMINI_API_KEY. Google
+ended the Gemini CLI for AI Pro/Ultra plans and free individual accounts on
+18 June 2026 (replaced by its Antigravity CLI, ``agy``, which e2er does not
+support): gemini 0.63.0 answers "This client is no longer supported for Gemini Code Assist for
+individuals" and points to Antigravity. So the backend runs with a paid Gemini
+API key only, and that path has not been tested.
+
+Like Codex, the Gemini CLI has no per-run command allowlist: with
+``--approval-mode yolo`` its shell tool can run any command. See
+docs/BACKENDS.md.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import subprocess
+import time
+from pathlib import Path
+from typing import Any
+
+from ...config import get_settings
+from ...logging_config import get_logger
+from .base import LLMBackend, TokenUsage, ToolHandler, ToolLoopResult
+from .cli_support import (
+    audit_journal,
+    cli_name,
+    cli_path_or_setting,
+    cli_version,
+    clip,
+    effective_timeout,
+    flatten_prompt,
+    kill_process_group,
+    run_env,
+    stop_on_cancel,
+    workspace_cwd,
+)
+from .plan_limit import detect as detect_plan_limit
+
+logger = get_logger(__name__)
+
+#: The CLI's own sign-in, the only credentials besides the wrappers' that reach its shell (run_env).
+CLI_KEYS = ("GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_APPLICATION_CREDENTIALS")
+
+#: Flags found in `gemini --help`, per CLI path. Only a probe that actually
+#: read the help text is kept; a slow or failed probe is retried next time
+#: instead of pinning the legacy flags for the life of the process.
+_FLAG_CACHE: dict[str, tuple[bool, bool]] = {}
+
+#: Node CLIs can take well over 5 s to print their help on a cold start.
+_PROBE_TIMEOUT = 30
+
+
+def _probe_gemini_flags(cli_path: str) -> tuple[bool, bool]:
+    """(supports --approval-mode, supports --output-format) for this CLI.
+
+    When the help text cannot be read, assume a current CLI (both flags):
+    the legacy ``--yolo``/text fallback is for old versions that print their
+    help fine.
+    """
+    if cli_path in _FLAG_CACHE:
+        return _FLAG_CACHE[cli_path]
+    try:
+        out = subprocess.run(
+            [cli_path, "--help"], capture_output=True, encoding="utf-8", errors="replace", timeout=_PROBE_TIMEOUT
+        )
+        help_out = (out.stdout or "") + (out.stderr or "")
+    except (OSError, subprocess.SubprocessError):
+        help_out = ""
+    if not help_out.strip():
+        return True, True
+    flags = ("--approval-mode" in help_out, "--output-format" in help_out)
+    _FLAG_CACHE[cli_path] = flags
+    if not flags[0]:
+        logger.warning(
+            "This Gemini CLI has no --approval-mode (older version); using --yolo. "
+            "Update with `npm install -g @google/gemini-cli@latest`."
+        )
+    return flags
+
+
+class GeminiBackend(LLMBackend):
+    """Gemini CLI subprocess backend (not tested). Runs with a Gemini API key (GEMINI_API_KEY)."""
+
+    def __init__(self, model: str | None = None) -> None:
+        settings = get_settings()
+        self._cli_path = cli_path_or_setting("gemini", settings)
+        self._timeout = settings.gemini_timeout
+        self._model = model or settings.gemini_model
+        self._cwd = settings.gemini_cwd or os.getcwd()
+        self._yolo = bool(getattr(settings, "gemini_yolo", False))
+        if self._yolo:
+            logger.warning(
+                "GEMINI_YOLO=true: the Gemini CLI runs every shell command the model asks for without asking "
+                "(inside its --sandbox)."
+            )
+
+    @property
+    def model(self) -> str:
+        return self._model
+
+    def identity(self) -> dict[str, Any]:
+        return {
+            "backend": "gemini",
+            "model": self._model or None,
+            "cli": cli_name(self._cli_path),
+            "cli_version": cli_version(self._cli_path),
+        }
+
+    def build_cmd(self, approval_mode: bool, output_format: bool) -> list[str]:
+        # Always in the CLI's sandbox (a container, or macOS's sandbox-exec). Its shell tool runs
+        # commands without asking only with GEMINI_YOLO=true (security review 2026-10-23).
+        cmd: list[str] = [self._cli_path, "--sandbox"]
+        if self._yolo:
+            cmd += ["--approval-mode", "yolo"] if approval_mode else ["--yolo"]
+        elif approval_mode:
+            cmd += ["--approval-mode", "auto_edit"]
+        if output_format:
+            cmd += ["--output-format", "json"]
+        if self._model:
+            cmd += ["--model", self._model]
+        # The prompt goes on stdin; no positional.
+        return cmd
+
+    async def tool_loop(
+        self,
+        system: str,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],  # noqa: ARG002 — the CLI has its own tool set
+        tool_handler: ToolHandler | None,  # noqa: ARG002
+        max_turns: int = 30,  # noqa: ARG002 — the CLI has its own cap
+        *,
+        paper_id: str | None = None,
+        specialist: str | None = None,
+    ) -> ToolLoopResult:
+        settings = get_settings()
+        prompt = flatten_prompt(system, messages)
+        cwd, root = workspace_cwd(settings, paper_id, self._cwd)
+        # The wrappers' audit rows go to a journal in the workspace (cli_support.audit_journal).
+        async with audit_journal(paper_id, cwd if paper_id else None):
+            return await self._invoke(prompt, cwd, root, settings, paper_id, specialist)
+
+    async def _invoke(
+        self,
+        prompt: str,
+        cwd: str,
+        root: Path | None,
+        settings: Any,
+        paper_id: str | None,
+        specialist: str | None,
+    ) -> ToolLoopResult:
+        env = run_env(
+            settings,
+            paper_id=paper_id,
+            specialist=specialist,
+            workspace_root_abs=root,
+            cli_keys=CLI_KEYS,
+            cli_prefixes=("GEMINI_", "GOOGLE_CLOUD_", "NODE_", "NVM_"),
+        )
+        # The probe is a blocking subprocess; keep it off the event loop.
+        approval_mode, output_format = await asyncio.to_thread(_probe_gemini_flags, self._cli_path)
+        cmd = self.build_cmd(approval_mode, output_format)
+        start = time.monotonic()
+        logger.info("Gemini: invoking %s (prompt=%d chars)", self._cli_path, len(prompt))
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=cwd,
+                env=env,
+                start_new_session=True,
+            )
+        except FileNotFoundError:
+            return ToolLoopResult(
+                success=False,
+                output="",
+                error=(
+                    f"Gemini CLI not found at: {self._cli_path}. Install it with "
+                    "`npm install -g @google/gemini-cli` and set GEMINI_API_KEY to a paid key (Google ended the "
+                    "Gemini CLI for AI Pro/Ultra plans and free accounts on 18 June 2026); set GEMINI_PATH "
+                    "if it is not on PATH."
+                ),
+                duration_seconds=time.monotonic() - start,
+            )
+        except OSError as e:
+            return ToolLoopResult(
+                success=False,
+                output="",
+                error=f"Failed to start Gemini CLI: {e}",
+                duration_seconds=time.monotonic() - start,
+            )
+
+        try:
+            stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                proc.communicate(input=prompt.encode("utf-8")),
+                timeout=effective_timeout(self._timeout),
+            )
+        except asyncio.CancelledError:
+            await stop_on_cancel(proc)
+            raise
+        except TimeoutError:
+            kill_process_group(proc)
+            await proc.wait()
+            elapsed = time.monotonic() - start
+            return ToolLoopResult(
+                success=False,
+                output="",
+                error=f"Gemini timed out after {elapsed:.0f}s (limit {effective_timeout(self._timeout)}s)",
+                duration_seconds=elapsed,
+                stop_reason="timeout",
+            )
+
+        duration = time.monotonic() - start
+        stdout = (stdout_bytes or b"").decode("utf-8", errors="replace")
+        stderr = (stderr_bytes or b"").decode("utf-8", errors="replace")
+        parsed = parse_gemini_json(stdout)
+        output = parsed["response"] if parsed["json"] else stdout.strip()
+
+        if proc.returncode != 0 or parsed["error"]:
+            error = parsed["error"] or stderr.strip() or f"Exit code {proc.returncode}: {stdout.strip()}"
+            # A used-up daily quota: calls fail until it resets, so the run pauses (paused_plan_limit).
+            if limit := detect_plan_limit("gemini", f"{error}\n{stderr}"):
+                raise limit
+            return ToolLoopResult(
+                success=False,
+                output=output,
+                error=clip(f"Gemini failed (exit {proc.returncode}): {error}"),
+                tool_calls_made=parsed["tool_calls"],
+                usage=parsed["usage"],
+                duration_seconds=duration,
+                stop_reason="error",
+            )
+
+        return ToolLoopResult(
+            success=True,
+            output=output,
+            tool_calls_made=parsed["tool_calls"],
+            usage=parsed["usage"],
+            duration_seconds=duration,
+            stop_reason="end_turn",
+        )
+
+
+def parse_gemini_json(stdout: str) -> dict[str, Any]:
+    """Read `gemini --output-format json`: response, per-model token stats, tool calls, error.
+
+    Shape (documented headless mode): ``{"response": str, "stats": {"models":
+    {name: {"tokens": {"prompt", "candidates", "cached", ...}}}, "tools":
+    {"totalCalls": n}}, "error": {"message": ...}}``. Anything else — plain
+    text from an older CLI — comes back with ``json=False``.
+    """
+    empty: dict[str, Any] = {"json": False, "response": "", "usage": TokenUsage(), "tool_calls": 0, "error": ""}
+    text = stdout.strip()
+    if not text.startswith("{"):
+        # Some versions print a notice line before the JSON object.
+        brace = text.find("\n{")
+        if brace < 0:
+            return empty
+        text = text[brace + 1 :]
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return empty
+    if not isinstance(data, dict):
+        return empty
+    usage = TokenUsage()
+    stats = data.get("stats") or {}
+    models = stats.get("models") if isinstance(stats, dict) else None
+    if isinstance(models, dict):
+        for m in models.values():
+            tokens = (m or {}).get("tokens") or {}
+            cached = int(tokens.get("cached", 0) or 0)
+            prompt = int(tokens.get("prompt", 0) or 0)
+            usage = usage + TokenUsage(
+                input_tokens=max(0, prompt - cached),
+                output_tokens=int(tokens.get("candidates", 0) or 0) + int(tokens.get("thoughts", 0) or 0),
+                cache_read_tokens=cached,
+            )
+    tools = stats.get("tools") if isinstance(stats, dict) else None
+    tool_calls = int((tools or {}).get("totalCalls", 0) or 0) if isinstance(tools, dict) else 0
+    err = data.get("error")
+    error = ""
+    if err:
+        error = str(err.get("message") or err) if isinstance(err, dict) else str(err)
+    return {
+        "json": True,
+        "response": str(data.get("response") or "").strip(),
+        "usage": usage,
+        "tool_calls": tool_calls,
+        "error": error,
+    }

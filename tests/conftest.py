@@ -1,0 +1,761 @@
+"""Shared test fixtures and mock LLM backend."""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+import uuid
+from pathlib import Path
+from typing import Any
+from unittest.mock import AsyncMock, patch
+
+import pytest
+
+from src.modules.llm.base import LLMBackend, TokenUsage, ToolHandler, ToolLoopResult
+
+# The dashboard sends a first-time user to /setup while no settings exist. Tests
+# of other pages run without a .env; tests of the setup page delete this.
+os.environ.setdefault("E2ER_SKIP_SETUP_REDIRECT", "1")
+
+
+def _loopback_test_clients() -> None:
+    """Every TestClient talks to 127.0.0.1 unless a test names another base_url.
+
+    The server answers only to a Host that names this computer (local_session.guard_request);
+    TestClient's own default, "testserver", is not one. Patched here, at import, so module-scoped
+    clients made before any function fixture get it too.
+    """
+    from starlette.testclient import TestClient
+
+    real = TestClient.__init__
+
+    def init(self, *args, **kwargs):
+        if len(args) < 2:
+            kwargs.setdefault("base_url", "http://127.0.0.1")
+        real(self, *args, **kwargs)
+
+    TestClient.__init__ = init  # type: ignore[method-assign]
+
+
+_loopback_test_clients()
+
+
+def _home_is_home_on_windows() -> None:
+    """On Windows, ``~`` follows HOME in the suite, as on Linux and macOS.
+
+    The tests isolate the user's folder by pointing HOME at a temporary folder. Windows resolves ``~``
+    (``Path.home()``, ``os.path.expanduser``) from USERPROFILE and ignores HOME, so those tests read and
+    wrote the runner's real profile (C:\\Users\\runneradmin\\.e2er). e2er itself keeps using USERPROFILE.
+    """
+    if sys.platform != "win32":
+        return
+    import ntpath
+
+    real = ntpath.expanduser
+
+    def expanduser(path):  # noqa: ANN001, ANN202 - os.path.expanduser's own signature
+        text = os.fspath(path)
+        home = os.environ.get("HOME")
+        if home and isinstance(text, str) and (text == "~" or text.startswith(("~/", "~\\"))):
+            return ntpath.join(home, text[2:]) if len(text) > 2 else home
+        return real(path)
+
+    ntpath.expanduser = expanduser  # type: ignore[assignment]
+
+
+_home_is_home_on_windows()
+# Tests run in pytest's temporary folders with nothing set up: e2er would otherwise use the
+# default studies folder (~/e2er-studies) instead of a temporary current folder (src/home.py).
+os.environ.setdefault("E2ER_TEMPORARY_FOLDER_OK", "1")
+# No real Codex call: a run on the codex backend first asks Codex to write a test file in its
+# sandbox (llm/codex.py check_sandbox). The tests of that check clear this themselves.
+os.environ.setdefault("E2ER_SKIP_SANDBOX_PREFLIGHT", "1")
+
+# ---------------------------------------------------------------------------
+# Deterministic specialist outputs (filename, content)
+# ---------------------------------------------------------------------------
+
+# Mock specialist outputs. Each must clear the v0.9 M4.3
+# output-contract check (>= 100 non-whitespace chars for prose / code,
+# non-empty JSON) so the contract check doesn't false-trip on stubby
+# tests. The bodies match what a real (skill-driven) specialist would
+# emit at minimum substance — a paragraph or three, not a one-liner.
+_SPECIALIST_OUTPUTS: dict[str, tuple[str, str]] = {
+    "idea_developer": (
+        "paper_plan.md",
+        "# Paper Plan\n\n## Research Question\nDoes X affect Y in the post-treatment "
+        "sample? We test this on a panel of N units over T periods.\n\n## Propositions\n"
+        "- H1: X increases Y monotonically.\n- H2: Effect heterogeneity by group.",
+    ),
+    "literature_scanner": (
+        "literature_review.md",
+        "# Literature Review\n\n## Background\nPrior work establishes the baseline "
+        "relationship between X and Y in canonical settings. We extend along three "
+        "dimensions: identification, sample, and outcome.\n\n## Gaps\nNo prior paper "
+        "tests this jointly on the post-2020 sample.",
+    ),
+    "identification_strategist": (
+        "identification_strategy.md",
+        "# Identification Strategy\n\nWe use a staggered difference-in-differences "
+        "design around the treatment date, with unit and time fixed effects. "
+        "Pre-trends are tested via event-study coefficients. Robustness: alternative "
+        "control groups, Callaway-Sant'Anna estimator.",
+    ),
+    "data_architect": (
+        "data_dictionary.json",
+        json.dumps(
+            {
+                "datasets": [{"name": "panel", "freq": "monthly"}],
+                "fields": [{"name": "x", "type": "float"}, {"name": "y", "type": "float"}],
+                "time_filter": {"start": "2020-01-01", "end": "2024-12-31"},
+            },
+            indent=2,
+        ),
+    ),
+    "econometrics_specialist": (
+        "econometric_spec.md",
+        "# Econometric Specification\n\nOLS with two-way fixed effects. Standard "
+        "errors clustered by unit. Pre-trend test via leads-and-lags event study. "
+        "Robustness: TWFE, CCDH-Sant'Anna, sun-and-abraham. Reporting horizon: "
+        "[-6, +12] months around treatment.",
+    ),
+    "data_analyst": (
+        "data_summary.md",
+        "# Data Summary\n\nThe dataset contains 10,000 observations across 100 "
+        "units and 100 monthly periods. Outcome y has mean 0.05 (sd 0.12). Treatment "
+        "variable x is binary, with 40% of units treated at some point in the sample.",
+    ),
+    "theory_specialist": (
+        "model_spec.md",
+        "# Formal Model\n\n## Setup\nAgents maximise utility subject to budget. "
+        "Demand depends on price and income. Supply is competitive.\n\n"
+        "## Propositions\nP1: Equilibrium price is monotone in supply.\n"
+        "P2: Quantity adjusts to clear the market in the long run.",
+    ),
+    "paper_drafter": (
+        "paper_draft.tex",
+        "\\documentclass{article}\n\\begin{document}\n\\title{Test Paper}\n"
+        "\\maketitle\n\\section{Introduction}\nWe study whether X affects Y in a "
+        "panel of N units. Our main finding: a 1-unit increase in X raises Y by "
+        "0.04 (s.e. 0.01) on average, robust to controls.\n\\end{document}",
+    ),
+    "section_writer": (
+        "paper_draft.tex",
+        "\\documentclass{article}\n\\begin{document}\n\\section{Introduction}\n"
+        "We study whether X affects Y in a panel of N units. The headline finding "
+        "is a 1-unit increase in X raising Y by 0.04 on average, robust to "
+        "alternative specifications and sample restrictions.\n\\end{document}",
+    ),
+    "abstract_writer": (
+        "abstract.tex",
+        "\\begin{abstract}\nWe study whether X affects Y in a panel of N units "
+        "over T periods. Using staggered difference-in-differences, we find a "
+        "1-unit increase in X raises Y by 0.04 on average, robust to alternative "
+        "controls.\n\\end{abstract}",
+    ),
+    "latex_formatter": (
+        "paper_draft.tex",
+        "\\documentclass{article}\n\\usepackage{booktabs}\n\\usepackage{amsmath}\n"
+        "\\begin{document}\nFormatted draft with tables and equations. "
+        "\\section{Results}\nMain estimate 0.04 (s.e. 0.01).\n\\end{document}",
+    ),
+    # Reviewers: scores embedded in text so parse_review_output() finds them.
+    # Bodies bulked to clear the M4.3 100-char threshold; a real review is
+    # always longer than this.
+    "mechanism_reviewer": (
+        "review_mechanism.md",
+        "# Mechanism Review\n\nScore: 7/10\n\nThe mechanism is plausible and "
+        "well-motivated. The causal chain from X to Y is grounded in the literature. "
+        "Minor concern: the heterogeneity story could be tighter.",
+    ),
+    "technical_reviewer": (
+        "review_technical.md",
+        "# Technical Review\n\nScore: 7/10\n\nEconometrics are sound. Standard "
+        "errors are correctly clustered. The pre-trend test passes at conventional "
+        "levels. Robustness to alternative DiD estimators is reported.",
+    ),
+    "literature_reviewer": (
+        "review_literature.md",
+        "# Literature Review Review\n\nScore: 7/10\n\nWell-grounded in prior work. "
+        "Citations to Welch-Goyal, Campbell-Shiller, and Lettau-Ludvigson are "
+        "appropriate. One omission: the recent Goyal-Welch update.",
+    ),
+    "writing_reviewer": (
+        "review_writing.md",
+        "# Writing Review\n\nScore: 7/10\n\nProse is clear. The introduction "
+        "frames the contribution well. Tables are readable. Minor: some passive "
+        "constructions in section 3 could be tightened.",
+    ),
+    "data_reviewer": (
+        "review_data.md",
+        "# Data Review\n\nScore: 7/10\n\nData sourcing is appropriate. The "
+        "sample period is well-justified. Frequency choice (monthly) matches the "
+        "outcome's dynamics. Missing-data treatment is documented.",
+    ),
+    "identification_reviewer": (
+        "review_identification.md",
+        "# Identification Review\n\nScore: 7/10\n\nIdentification strategy is "
+        "credible. Pre-trends are flat by inspection. Parallel-trends assumption "
+        "discussed honestly. Robust to event-study and Callaway-Sant'Anna.",
+    ),
+    # V3 extensions
+    "self_attacker": (
+        "self_attack_report.json",
+        json.dumps({"findings": [], "overall_severity": 1}, indent=2),
+    ),
+    "polish_formula": (
+        "polish_formula.md",
+        "# Formula Polish\n\nFormula check passed. All math-mode expressions "
+        "balance. Subscripts and superscripts are consistent. Notation matches "
+        "the standard convention for panel data econometrics.",
+    ),
+    "polish_numerics": (
+        "polish_numerics.md",
+        "# Numerics Polish\n\nNumeric consistency verified. Table values match "
+        "the estimation results JSON. Rounding is consistent at 3 significant "
+        "figures. No rounding errors > 0.005.",
+    ),
+    "polish_institutions": (
+        "polish_institutions.md",
+        "# Institutions Polish\n\nInstitutional context accurate. References to "
+        "the Fed, ECB, and regulatory framework are correct as of the sample end "
+        "date. Acronyms expanded on first use.",
+    ),
+    "polish_bibliography": (
+        "polish_bibliography.md",
+        "# Bibliography Polish\n\nBibliography complete. All cited references "
+        "appear in the bib file. Bibliography entries are formatted to one style "
+        "(APA). No duplicates by DOI.",
+    ),
+    "polish_equilibria": (
+        "polish_equilibria.md",
+        "# Equilibria Polish\n\nEquilibrium conditions satisfied. The first-order "
+        "conditions hold at the proposed equilibrium. Comparative statics signs "
+        "match the propositions in the model section.",
+    ),
+    "revisor": (
+        "paper_draft.tex",
+        "\\documentclass{article}\n\\begin{document}\n\\section{Introduction}\n"
+        "Revised draft incorporating reviewer feedback. We tighten the "
+        "identification discussion and expand the robustness section.\n"
+        "\\end{document}",
+    ),
+    "replication_packager": (
+        "replication/estimation.py",
+        "# Replication: estimation script\nimport pandas as pd\nimport "
+        "statsmodels.api as sm\n\n# Load and clean.\n# Estimate with TWFE.\n"
+        "# Output to estimation_results.json.\nprint('estimation complete')\n",
+    ),
+    "replication_planner": (
+        "replication_plan.md",
+        "# Replication plan\n\nEntry points, in run order: code/main.R (Rscript, from study/). "
+        "Table 1 comes from code/main.R and output/table1.csv; its ATT is printed on page 12.",
+    ),
+    "reproduction_comparer": (
+        "reproduction_report.md",
+        "# Reproduction report\n\nTable 1: reproduced with minor differences. The ATT is -0.01214 "
+        "in output/table1.csv against -0.012 printed on page 12.",
+    ),
+}
+
+
+# Minimal valid sidecar contents the mock writes for specialists with
+# declared SPECIALIST_SIDECAR_ARTIFACTS. Real specialists fill these
+# with substantive content; the mock writes enough to clear the M4.3
+# contract check (parses as non-empty JSON with the field shape the
+# downstream consumers expect).
+_MOCK_SIDECAR_CONTENTS: dict[str, str] = {
+    "summary_statistics.json": json.dumps({"n_observations": 100, "outcome": {"mean": 0.0, "sd": 1.0}}),
+    "figure_spec.json": json.dumps({"figures": [{"name": "f1", "kind": "line"}]}),
+    # The spec + results pair is kept COHERENT (results echo the declared
+    # FE/clustering) so every mocked pipeline run exercises the full
+    # identified-spec contract the way a compliant real run would.
+    "identification_spec.json": json.dumps(
+        {
+            "primary": {
+                "estimator": "twfe_ols",
+                "fixed_effects": ["unit", "time"],
+                "controls": [],
+                "cluster_level": "unit",
+                "identifying_assumption": "Parallel trends conditional on unit and time FE.",
+            }
+        }
+    ),
+    "estimation_results.json": json.dumps(
+        {
+            "main": {
+                "coefficients": {"treat": {"estimate": 0.04, "se": 0.01, "t_stat": 4.0, "p_value": 0.001}},
+                "fixed_effects": ["unit", "time"],
+                "controls": [],
+                "cluster_level": "unit",
+                "n_clusters": 40,
+                "diagnostics": {"n_observations": 100},
+            }
+        }
+    ),
+}
+
+# JSON the strategist engine returns from decide() for "designing" status
+_DESIGNING_DECISION = {
+    "action": "dispatch_parallel",
+    "work_orders": [
+        {"specialist": "idea_developer", "focus": "Develop idea", "parallel_group": 0},
+        {"specialist": "literature_scanner", "focus": "Scan literature", "parallel_group": 0},
+        {
+            "specialist": "identification_strategist",
+            "focus": "Develop ID strategy",
+            "parallel_group": 0,
+        },
+        {"specialist": "econometrics_specialist", "focus": "Specify model", "parallel_group": 1},
+        {"specialist": "paper_drafter", "focus": "Draft paper", "parallel_group": 2},
+        {"specialist": "abstract_writer", "focus": "Write abstract", "parallel_group": 2},
+        {"specialist": "latex_formatter", "focus": "Format LaTeX", "parallel_group": 3},
+    ],
+    "rationale": "Initial design phase — run all core specialists.",
+}
+
+_CEILING_RESULT = {
+    "verdict": "proceed_to_review",
+    "reason": "Quality ceiling reached.",
+    "suggested_pivots": [],
+}
+_SELF_ATTACK_RESULT = {"findings": [], "overall_severity": 1}
+
+
+class MockLLMBackend(LLMBackend):
+    """
+    Deterministic LLM backend for testing.
+
+    Specialist calls: writes the expected output file via the tool_handler so
+    the FileToolHandler is exercised, then returns a ToolLoopResult with the
+    canned content.
+
+    Strategist calls: returns JSON decisions without hitting any API.
+    """
+
+    def __init__(self, fail_specialists: set[str] | None = None) -> None:
+        self.specialist_calls: list[str] = []
+        self.strategist_calls: list[str] = []
+        # Names in this set will raise RuntimeError when invoked, simulating
+        # transient backend failures. Used by parallel-dispatch tests.
+        self._fail_specialists: set[str] = fail_specialists or set()
+
+    async def tool_loop(
+        self,
+        system: str,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        tool_handler: ToolHandler | None,
+        max_turns: int = 30,
+        *,
+        paper_id: str | None = None,  # noqa: ARG002 — interface parity with backends
+        specialist: str | None = None,  # noqa: ARG002
+    ) -> ToolLoopResult:
+        usage = TokenUsage(input_tokens=100, output_tokens=50)
+
+        # Detect strategist vs. self-attack vs. ceiling vs. specialist
+        if "adversarial reviewer" in system.lower():
+            self.strategist_calls.append("self_attack")
+            return ToolLoopResult(success=True, output=json.dumps(_SELF_ATTACK_RESULT), usage=usage)
+
+        if "the strategist, the meta-agent" in system.lower():
+            phase = self._detect_phase(messages)
+            self.strategist_calls.append(phase)
+            if phase == "ceiling":
+                return ToolLoopResult(success=True, output=json.dumps(_CEILING_RESULT), usage=usage)
+            return ToolLoopResult(success=True, output=json.dumps(_DESIGNING_DECISION), usage=usage)
+
+        # Specialist call
+        specialist = self._detect_specialist(system)
+        self.specialist_calls.append(specialist)
+        if specialist in self._fail_specialists:
+            raise RuntimeError(f"simulated failure for {specialist}")
+        filename, content = _SPECIALIST_OUTPUTS.get(
+            specialist, (f"{specialist}.md", f"# Output\n\nTest output for {specialist}.")
+        )
+
+        # Write the file through the real FileToolHandler so path sandboxing is exercised
+        if tool_handler is not None:
+            try:
+                # Create parent directory for nested paths (e.g. replication/estimation.py)
+                if "/" in filename:
+                    await tool_handler.handle("list_directory", {"path": "."})
+                await tool_handler.handle("write_file", {"path": filename, "content": content})
+                # v0.9 M4.3: real specialists with declared sidecars in
+                # SPECIALIST_SIDECAR_ARTIFACTS produce them alongside the
+                # primary file. The mock didn't pre-M4.3, so under the
+                # new output-contract check it would now flip every
+                # sidecar-bearing specialist to success=False. Write
+                # minimal valid sidecars per declared contract so the
+                # mock stays a faithful stand-in.
+                from src.core.specialists.registry import SPECIALIST_SIDECAR_ARTIFACTS
+
+                for sidecar in SPECIALIST_SIDECAR_ARTIFACTS.get(specialist, []):
+                    await tool_handler.handle(
+                        "write_file",
+                        {"path": sidecar, "content": _MOCK_SIDECAR_CONTENTS.get(sidecar, "{}")},
+                    )
+                if "estimation_results.json" in SPECIALIST_SIDECAR_ARTIFACTS.get(specialist, []):
+                    # The script that computes the results: e2er holds the results file to it.
+                    results = _MOCK_SIDECAR_CONTENTS["estimation_results.json"]
+                    await tool_handler.handle(
+                        "write_file",
+                        {
+                            "path": "run_estimation.py",
+                            "content": f"import json\njson.dump(json.loads({results!r}), "
+                            "open('estimation_results.json', 'w'))\n",
+                        },
+                    )
+            except Exception:
+                pass  # handler may reject; that's still a valid test signal
+
+        return ToolLoopResult(success=True, output=content, tool_calls_made=1, usage=usage)
+
+    def _detect_phase(self, messages: list[dict[str, Any]]) -> str:
+        text = " ".join(str(m.get("content", "")) for m in messages).lower()
+        if "ceiling" in text or "diminishing returns" in text:
+            return "ceiling"
+        return "designing"
+
+    def _detect_specialist(self, system: str) -> str:
+        """Detect which specialist this call is for.
+
+        Match against the canonical role line emitted by
+        `_build_system_prompt`: `You are the <Title Cased Name> specialist`.
+        This is exactly one occurrence per system prompt and never appears
+        in skill content. The earlier "look for the name anywhere in the
+        system text" heuristic was brittle: skills that referenced other
+        specialists by name (e.g. writing/cite-numbers-by-source mentions
+        `econometrics specialist`) would cause paper_drafter calls to
+        misroute to whichever name was named earliest in
+        _SPECIALIST_OUTPUTS — silently writing the wrong file and
+        breaking downstream tests.
+        """
+        import re
+
+        m = re.search(r"You are the ([A-Z][A-Za-z ]+) specialist", system)
+        if m:
+            canonical = m.group(1).strip().lower().replace(" ", "_")
+            if canonical in _SPECIALIST_OUTPUTS:
+                return canonical
+        # Fallback: prior substring heuristic, for system prompts that
+        # don't follow the role-line convention (e.g. tests that build
+        # synthetic prompts).
+        system_lower = system.lower()
+        for name in _SPECIALIST_OUTPUTS:
+            if name.replace("_", " ") in system_lower:
+                return name
+        return "unknown"
+
+
+# ---------------------------------------------------------------------------
+# Pytest fixtures
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def mock_llm() -> MockLLMBackend:
+    return MockLLMBackend()
+
+
+@pytest.fixture
+def paper_id() -> str:
+    return f"test-{uuid.uuid4()}"
+
+
+@pytest.fixture
+def tmp_workspace(tmp_path: Path, paper_id: str) -> Path:
+    ws = tmp_path / paper_id
+    ws.mkdir(parents=True)
+    return ws
+
+
+@pytest.fixture
+def sample_manifest(tmp_workspace: Path, paper_id: str) -> dict[str, Any]:
+    manifest: dict[str, Any] = {
+        "paper_id": paper_id,
+        "title": "Test Paper: DeFi Liquidity",
+        "research_question": "How does concentrated liquidity in Uniswap v3 affect price discovery?",
+        "datasets": [],
+        "mode": "single_pass",
+        "current_stage": "idea",
+    }
+    (tmp_workspace / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8", newline="\n")
+    return manifest
+
+
+@pytest.fixture
+def mock_db():
+    """Patch all DB helper functions to avoid needing a live PostgreSQL instance."""
+
+    async def _execute(sql: str, params: dict | None = None) -> None:
+        pass
+
+    async def _fetch_one(sql: str, params: dict | None = None) -> dict | None:
+        if "INSERT INTO" in sql and "RETURNING id" in sql:
+            return {"id": str(uuid.uuid4())}
+        if "SELECT" in sql and "papers" in sql:
+            return {
+                "id": "test-uuid",
+                "title": "Test",
+                "status": "idea",
+                "research_question": "Test RQ",
+                "workspace": "/tmp/test",
+                "mode": "single_pass",
+                "github_repo": None,
+                "created_at": "2026-01-01T00:00:00",
+            }
+        return None
+
+    async def _fetch_all(sql: str, params: dict | None = None) -> list[dict]:
+        return []
+
+    with (
+        patch("src.db.client.execute", side_effect=_execute),
+        patch("src.db.client.fetch_one", side_effect=_fetch_one),
+        patch("src.db.client.fetch_all", side_effect=_fetch_all),
+    ):
+        yield
+
+
+@pytest.fixture(autouse=True)
+def _temporary_files_stay_in_the_test(monkeypatch, tmp_path_factory):
+    """Every temporary folder a test makes (`e2er reproduce`'s run folder, an unpacked package, a subprocess's
+    TMPDIR) lands under pytest's own base folder, which pytest prunes, never in the machine's $TMPDIR.
+
+    On 2026-10-14 the suite filled a disk: each failing reproduce test kept its run folder (up to ~140 MB with
+    its environment) in $TMPDIR, run after run.
+    """
+    import tempfile
+
+    tmp = tmp_path_factory.mktemp("tmp")
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp))
+    monkeypatch.setenv("TMPDIR", str(tmp))
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _no_real_platform(monkeypatch, tmp_path_factory):
+    """No test signs in to a real platform or reaches one: no keychain, an empty credentials file, no
+    E2ER_TOKEN, and a platform client that refuses every request a test did not fake.
+
+    On 2026-10-20 `publish --github` began to publish on e2er.org by default; the suite, run on a machine
+    signed in to e2er.org, published test studies there with the machine's token.
+    """
+    import httpx
+
+    from src.core import platform_client as pc
+
+    monkeypatch.setattr(pc, "_keyring", lambda: None)
+    monkeypatch.setenv("E2ER_CREDENTIALS", str(tmp_path_factory.mktemp("no-credentials") / "credentials.json"))
+    monkeypatch.delenv("E2ER_TOKEN", raising=False)
+
+    def refuse(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"a test reached a real platform: {request.method} {request.url}")
+
+    monkeypatch.setattr(
+        pc, "client_factory", lambda url: httpx.Client(base_url=url, transport=httpx.MockTransport(refuse))
+    )
+    # Zenodo the same way, and no GitHub login of this machine (gh's own config, GH_TOKEN).
+    from src.core import zenodo as zen
+
+    monkeypatch.setattr(
+        zen, "client_factory", lambda base: httpx.Client(base_url=base, transport=httpx.MockTransport(refuse))
+    )
+    # The study package's download (`e2er fetch`): refused unless a test fakes it.
+    from src.core import study_package as sp
+
+    monkeypatch.setattr(sp, "download_client", lambda: httpx.Client(transport=httpx.MockTransport(refuse)))
+    for var in ("ZENODO_TOKEN", "ZENODO_SANDBOX_TOKEN", "GH_TOKEN", "GITHUB_TOKEN", "E2ER_TEST_SERVER"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("GH_CONFIG_DIR", str(tmp_path_factory.mktemp("no-gh-config")))
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _no_real_approval_seals(monkeypatch, tmp_path_factory):
+    """The dashboard's approval seals (src/modules/data/approval_seal.py) go to a folder of the test,
+    never to this machine's ~/.e2er."""
+    from src.modules.data import approval_seal
+
+    folder = tmp_path_factory.mktemp("approval-seals")
+    monkeypatch.setattr(approval_seal, "_dir", lambda: folder)
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _isolate_the_cli_installs(monkeypatch, tmp_path_factory):
+    """Never let the suite see this machine's AI CLIs outside PATH or Codex's model list.
+
+    The Codex backend finds the ChatGPT app's own `codex` and reads the model
+    list Codex keeps in $CODEX_HOME. On a machine with both, a test asserting
+    "not installed" or the "codex-cli-default" label failed only there. Tests
+    that want either point at their own.
+    """
+    from src.modules.llm import cli_support, codex
+
+    monkeypatch.setattr(cli_support, "_EXTRA_LOCATIONS", {})
+    empty_home = tmp_path_factory.mktemp("no-codex-home")
+    monkeypatch.setattr(codex, "_codex_home", lambda: empty_home)
+    codex.default_codex_model.cache_clear()
+    yield
+    codex.default_codex_model.cache_clear()
+
+
+@pytest.fixture(autouse=True)
+def _no_openrouter_model_list(monkeypatch, tmp_path_factory):
+    """Never fetch OpenRouter's model list or read the machine's cached copy.
+
+    The OpenRouter backend reads the list when it starts and the setup page
+    shows it; in the suite both see an empty list unless a test supplies one.
+    """
+    from src.modules.llm import openrouter_models
+
+    cache = tmp_path_factory.mktemp("no-openrouter-cache") / "openrouter-models.json"
+    monkeypatch.setattr(openrouter_models, "_get_json", lambda url: None)
+    monkeypatch.setattr(openrouter_models, "cache_file", lambda: cache)
+    openrouter_models._reset_for_tests()
+    yield
+    openrouter_models._reset_for_tests()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_the_corpus(monkeypatch, tmp_path_factory):
+    """Never let the suite read the machine's real corpus at ~/.e2er/corpus.db.
+
+    acquire_literature consults the corpus, so on a developer machine with one
+    built, bibliography tests silently gained extra entries and failed with
+    `assert 5 == 2` — a real failure caused entirely by ambient state, and one
+    that would pass in CI and fail locally, which is the worst way round.
+
+    Points at a directory that stays empty, so the default is "no corpus".
+    Tests that want one pass `db=` explicitly.
+    """
+    empty = tmp_path_factory.mktemp("no-corpus") / "corpus.db"
+    monkeypatch.setattr("src.modules.literature.corpus_context.corpus_path", lambda explicit=None: explicit or empty)
+
+
+@pytest.fixture(autouse=True)
+def _block_real_db_pool(monkeypatch):
+    """Hard-fail on any unmocked DB helper.
+
+    The runner's _best_effort_finalize() (added to support graceful
+    degradation on partial breakdowns) calls write_audit_csv/
+    write_data_queries_sql in a finally block. Without mocks, those
+    helpers try to connect to a real Postgres pool and hang for 30s+
+    each, sometimes blocking the whole test process. This fixture
+    swaps in fast no-ops so tests that don't explicitly need the DB
+    don't pay that cost.
+
+    Tests that DO need DB behavior should patch over these (the
+    `with patch(...)` chain in those tests runs after this fixture
+    and takes precedence).
+    """
+    stub = DBStub()
+    monkeypatch.setattr("src.db.client.execute", stub.execute)
+    monkeypatch.setattr("src.db.client.fetch_one", stub.fetch_one)
+    monkeypatch.setattr("src.db.client.fetch_all", stub.fetch_all)
+    _DB_STUBS.append(stub)
+    # Note: write_audit_csv / write_data_queries_sql intentionally NOT mocked
+    # here — they call the patched fetch_all internally and degrade to an
+    # empty CSV / SQL file, which is the right behavior for runner tests.
+    # Tests that exercise audit-module logic directly (test_audit.py) get
+    # the real fetch_all mock that returns canned rows.
+    yield
+    _DB_STUBS.remove(stub)
+
+
+class DBStub:
+    """The no-op database of every test, which records what was written.
+
+    ``execute``, ``fetch_one`` and ``fetch_all`` are AsyncMocks (None, None, []), so a test can still
+    replace them or assert on their calls. A runner test that does not use a database fixture of its
+    own can now see a status or event write go missing: ``db_stub.statuses()`` lists the statuses
+    written to the papers row, ``db_stub.writes(fragment)`` every statement that contains ``fragment``.
+    """
+
+    def __init__(self) -> None:
+        self.execute = AsyncMock(return_value=None)
+        self.fetch_one = AsyncMock(return_value=None)
+        self.fetch_all = AsyncMock(return_value=[])
+
+    def writes(self, fragment: str = "") -> list[tuple[str, Any]]:
+        out = []
+        for call in self.execute.await_args_list:
+            sql = call.args[0] if call.args else call.kwargs.get("sql", "")
+            params = call.args[1] if len(call.args) > 1 else call.kwargs.get("params")
+            if fragment in sql:
+                out.append((sql, params))
+        return out
+
+    def statuses(self) -> list[str]:
+        return [
+            params["s"]
+            for sql, params in self.writes("UPDATE papers SET status")
+            if isinstance(params, dict) and "s" in params
+        ]
+
+
+_DB_STUBS: list[DBStub] = []
+
+
+@pytest.fixture
+def db_stub() -> DBStub:
+    """The recording database stub of this test (see DBStub)."""
+    return _DB_STUBS[-1]
+
+
+@pytest.fixture(autouse=True)
+def _fresh_settings():
+    """``get_settings`` is cached: without a reset, a test that sets the environment and forgets to clear
+    the cache got the settings of the test before it (30 files cleared it themselves)."""
+    from src.config import get_settings
+
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
+
+
+#: The session token the test API server runs with; the TestClient sends it as the `e2er` commands do.
+TEST_SESSION_TOKEN = "test-session-token"
+
+
+@pytest.fixture(autouse=True)
+def _the_local_session(monkeypatch):
+    """Requests to the local API carry the server's session token (X-E2ER-Token), as the `e2er`
+    commands and the dashboard do; since 0.13.8 the endpoints that start, steer or stop a run
+    refuse a request without it. A test of the refusal builds its client with ``headers={"x-e2er-token": ""}``."""
+    from starlette.testclient import TestClient
+
+    monkeypatch.setenv("E2ER_SESSION_TOKEN", TEST_SESSION_TOKEN)
+    real = TestClient.__init__
+
+    def init(self, *args, headers=None, **kwargs):
+        real(self, *args, headers={"x-e2er-token": TEST_SESSION_TOKEN, **(headers or {})}, **kwargs)
+
+    monkeypatch.setattr(TestClient, "__init__", init)
+
+
+def pytest_collection_modifyitems(config, items):
+    """With ``E2ER_TEST_PART=k/n`` run only part k of n (whole files; tests/parts.py).
+
+    The release workflow runs the suite as four parallel jobs this way; without the variable every
+    test runs, as before.
+    """
+    spec = os.environ.get("E2ER_TEST_PART")
+    if not spec:
+        return
+    from tests.parts import assign, load_durations, parse_part
+
+    part, parts = parse_part(spec)
+    counts: dict[str, int] = {}
+    for item in items:
+        f = item.nodeid.split("::", 1)[0]
+        counts[f] = counts.get(f, 0) + 1
+    keep = set(assign(counts, parts, load_durations())[part - 1])
+    selected = [i for i in items if i.nodeid.split("::", 1)[0] in keep]
+    deselected = [i for i in items if i.nodeid.split("::", 1)[0] not in keep]
+    if deselected:
+        config.hook.pytest_deselected(items=deselected)
+    items[:] = selected

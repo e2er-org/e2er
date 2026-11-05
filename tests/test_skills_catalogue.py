@@ -1,0 +1,418 @@
+"""Installing skill packs from the RISE catalogue.
+
+RISE indexes packs published by other projects, each with its own repository and
+licence. E2ER installs them; it does not vendor them. Roughly half the
+catalogue's 358 skills are CC BY-NC, unlicensed, or private to their curator, so
+copying them into an MIT package on PyPI would be republishing work that is not
+ours to republish.
+
+Most of what is tested here is tolerance of a catalogue that is slightly wrong,
+because the first real install proved it is: every `details_url` assumes the
+`main` branch, and one entry disagrees with its siblings about the case of
+SKILL.md.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+from src.modules.skills_catalogue import (
+    CatalogueError,
+    SkillPack,
+    _candidate_urls,
+    find_pack,
+    install_pack,
+    installed_packs,
+    read_catalogue,
+    remove_pack,
+)
+
+PACK_YML = """
+pack:
+  slug: demo
+  name: 'Demo Pack'
+  source_url: 'https://github.com/someone/demo'
+  maintainers:
+    - 'A. Person'
+  license: 'MIT'
+  total_skills: 2
+  compatibility:
+    - claude-code
+skills:
+  - slug: alpha
+    name: 'Alpha'
+    category: audit
+    field: economics
+    description: 'Does alpha things.'
+    source_path: 'skills/alpha/SKILL.md'
+    details_url: 'https://github.com/someone/demo/blob/main/skills/alpha/SKILL.md'
+  - slug: beta
+    name: 'Beta'
+    category: infra
+    field: economics
+    description: 'Does beta things.'
+    source_path: 'skills/beta/SKILL.md'
+    details_url: 'https://github.com/someone/demo/blob/main/skills/beta/SKILL.md'
+"""
+
+
+@pytest.fixture
+def catalogue(tmp_path: Path) -> Path:
+    (tmp_path / "skills").mkdir()
+    (tmp_path / "skills" / "demo.yml").write_text(PACK_YML, encoding="utf-8", newline="\n")
+    return tmp_path
+
+
+# ---------------------------------------------------------------------------
+# Reading
+# ---------------------------------------------------------------------------
+
+
+def test_a_pack_is_read_with_its_licence_and_authors(catalogue):
+    packs = read_catalogue(catalogue)
+
+    assert len(packs) == 1
+    pack = packs[0]
+    assert pack.slug == "demo"
+    assert pack.license == "MIT"
+    assert pack.maintainers == ("A. Person",)
+    assert [s.slug for s in pack.skills] == ["alpha", "beta"]
+
+
+def test_a_malformed_pack_does_not_hide_the_others(catalogue):
+    (catalogue / "skills" / "broken.yml").write_text("pack: [[[ not yaml", encoding="utf-8", newline="\n")
+
+    assert [p.slug for p in read_catalogue(catalogue)] == ["demo"]
+
+
+def test_a_missing_catalogue_says_where_to_get_one(tmp_path):
+    with pytest.raises(CatalogueError, match="RISE"):
+        read_catalogue(tmp_path / "nowhere")
+
+
+def test_an_unknown_pack_is_reported(catalogue):
+    with pytest.raises(CatalogueError, match="no pack named"):
+        find_pack("nonesuch", catalogue)
+
+
+# ---------------------------------------------------------------------------
+# Licence awareness — the reason this installs rather than copies
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("licence", "bundleable"),
+    [
+        ("MIT", True),
+        ("Apache-2.0", True),
+        ("BSD-3-Clause", True),
+        ("CC BY-NC 4.0", False),
+        ("none declared", False),
+        ("private (curator-owned)", False),
+        ("Other (see repo)", False),
+        ("", False),
+    ],
+)
+def test_bundleability_is_judged_from_the_licence(licence, bundleable):
+    """Not used to block an install — installing a public file on your own
+    machine is not redistribution. It answers "could E2ER ship this?", which is
+    the question that made this an installer."""
+    assert SkillPack(slug="x", license=licence).redistributable is bundleable
+
+
+# ---------------------------------------------------------------------------
+# Surviving a catalogue that is slightly wrong
+# ---------------------------------------------------------------------------
+
+
+def test_a_blob_url_becomes_a_raw_url():
+    urls = _candidate_urls("https://github.com/o/r/blob/main/skills/a/SKILL.md")
+
+    assert urls[0] == "https://raw.githubusercontent.com/o/r/main/skills/a/SKILL.md"
+
+
+def test_the_other_default_branch_is_tried():
+    """Found on the first real install: the catalogue writes /blob/main/ for
+    every pack, and theorist-toolbox is on master, so all eleven skills 404'd."""
+    urls = _candidate_urls("https://github.com/o/r/blob/main/skills/a/SKILL.md")
+
+    assert any("/master/" in u for u in urls)
+
+
+def test_both_spellings_of_skill_md_are_tried():
+    """One catalogue entry says skill.md where its ten siblings say SKILL.md,
+    and raw.githubusercontent is case-sensitive."""
+    lower = _candidate_urls("https://github.com/o/r/blob/main/skills/a/skill.md")
+    upper = _candidate_urls("https://github.com/o/r/blob/main/skills/a/SKILL.md")
+
+    assert any(u.endswith("SKILL.md") for u in lower)
+    assert any(u.endswith("skill.md") for u in upper)
+
+
+def test_a_non_github_url_is_left_alone():
+    url = "https://example.org/skills/a.md"
+    assert _candidate_urls(url) == [url]
+
+
+# ---------------------------------------------------------------------------
+# Installing
+# ---------------------------------------------------------------------------
+
+
+async def test_installing_writes_the_skills_and_their_provenance(catalogue, tmp_path, monkeypatch):
+    async def _fetch(url, headers=None, max_bytes=None):
+        return b"# a skill\n\nbody"
+
+    monkeypatch.setattr("src.modules.fetch.http.fetch_bytes", _fetch)
+    dest = tmp_path / "installed"
+
+    report = await install_pack(find_pack("demo", catalogue), dest=dest)
+
+    assert report["installed"] == 2
+    assert (dest / "demo" / "alpha.md").read_text(encoding="utf-8") == "# a skill\n\nbody"
+
+    # Six months later, someone has to be able to ask whose file this is.
+    manifest = json.loads((dest / "demo" / "pack.json").read_text(encoding="utf-8"))
+    assert manifest["pack"]["license"] == "MIT"
+    assert manifest["pack"]["source_url"] == "https://github.com/someone/demo"
+    assert manifest["pack"]["maintainers"] == ["A. Person"]
+
+
+async def test_one_unreachable_skill_does_not_stop_the_pack(catalogue, tmp_path, monkeypatch):
+    async def _fetch(url, headers=None, max_bytes=None):
+        if "beta" in url:
+            raise RuntimeError("404 Not Found")
+        return b"ok"
+
+    monkeypatch.setattr("src.modules.fetch.http.fetch_bytes", _fetch)
+    dest = tmp_path / "installed"
+
+    report = await install_pack(find_pack("demo", catalogue), dest=dest)
+
+    assert report["installed"] == 1
+    assert report["failed"] == 1
+    assert (dest / "demo" / "alpha.md").is_file()
+
+
+async def test_failures_are_recorded_not_just_counted(catalogue, tmp_path, monkeypatch):
+    async def _fetch(url, headers=None, max_bytes=None):
+        raise RuntimeError("410 Gone")
+
+    monkeypatch.setattr("src.modules.fetch.http.fetch_bytes", _fetch)
+    dest = tmp_path / "installed"
+
+    report = await install_pack(find_pack("demo", catalogue), dest=dest)
+
+    assert len(report["failures"]) == 2
+    assert "410" in report["failures"][0]["error"]
+    # Nothing came: no folder that would read as an installed pack with 0 files (and hide Install).
+    assert not (dest / "demo").exists()
+
+
+async def test_installed_then_removed(catalogue, tmp_path, monkeypatch):
+    async def _fetch(url, headers=None, max_bytes=None):
+        return b"ok"
+
+    monkeypatch.setattr("src.modules.fetch.http.fetch_bytes", _fetch)
+    dest = tmp_path / "installed"
+
+    await install_pack(find_pack("demo", catalogue), dest=dest)
+
+    listed = installed_packs(dest)
+    assert [p["slug"] for p in listed] == ["demo"]
+    assert listed[0]["files"] == 2
+    assert listed[0]["license"] == "MIT"
+
+    assert remove_pack("demo", dest) is True
+    assert installed_packs(dest) == []
+    assert remove_pack("demo", dest) is False
+
+
+def test_nothing_installed_is_not_an_error(tmp_path):
+    assert installed_packs(tmp_path / "absent") == []
+
+
+def test_the_loader_searches_installed_packs():
+    """Installing is pointless if a specialist cannot then load the skill."""
+    from src.skills.loader import _SKILLS_DIRS
+
+    assert any(".e2er" in str(d) and d.name == "skills" for d in _SKILLS_DIRS)
+
+
+def test_a_bundled_skill_wins_over_an_installed_one():
+    """An installed pack should extend the library, not silently replace part
+    of it — so the packaged directories are searched first."""
+    from src.skills.loader import _SKILLS_DIRS
+
+    installed_at = next(i for i, d in enumerate(_SKILLS_DIRS) if ".e2er" in str(d))
+    assert installed_at == len(_SKILLS_DIRS) - 1
+
+
+# ---------------------------------------------------------------------------
+# Default: the public catalogue on GitHub, not a path on one person's machine
+# ---------------------------------------------------------------------------
+
+
+def _tarball(files: dict[str, str]) -> bytes:
+    import io
+    import tarfile
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        for name, text in files.items():
+            data = text.encode()
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+    return buf.getvalue()
+
+
+def test_without_a_checkout_the_catalogue_comes_from_github(tmp_path, monkeypatch):
+
+    from src.modules import skills_catalogue as sc
+
+    monkeypatch.setattr(sc, "catalogue_path", lambda explicit=None: tmp_path / "cache")
+    monkeypatch.setattr(sc, "downloaded_catalogue_dir", lambda: tmp_path / "cache")
+    calls = []
+
+    def fake_fetch(url, max_bytes=None):
+        calls.append(url)
+        return _tarball({"RISE-main/skills/demo.yml": PACK_YML, "RISE-main/README.md": "x"})
+
+    monkeypatch.setattr(sc, "_fetch_tarball", fake_fetch)
+    assert [p.slug for p in read_catalogue()] == ["demo"]
+    assert calls and "e2er-org/RISE" in calls[0]
+    read_catalogue()  # a fresh copy is reused
+    assert len(calls) == 1
+
+
+def test_no_network_and_no_copy_says_how_to_point_to_a_catalogue(tmp_path, monkeypatch):
+    import httpx
+
+    from src.modules import skills_catalogue as sc
+
+    monkeypatch.setattr(sc, "catalogue_path", lambda explicit=None: tmp_path / "cache")
+    monkeypatch.setattr(sc, "downloaded_catalogue_dir", lambda: tmp_path / "cache")
+
+    def offline(url, max_bytes=None):
+        raise httpx.ConnectError("offline")
+
+    monkeypatch.setattr(sc, "_fetch_tarball", offline)
+    with pytest.raises(CatalogueError, match="RISE_PATH"):
+        read_catalogue()
+
+
+def test_the_default_path_is_not_a_personal_folder(monkeypatch):
+    from src.modules import skills_catalogue as sc
+
+    monkeypatch.setattr("src.config.get_settings", lambda: type("S", (), {"rise_path": None})())
+    assert sc.catalogue_path() == sc.downloaded_catalogue_dir()
+    assert "Documents" not in str(sc.catalogue_path())
+
+
+def test_a_huge_or_odd_member_of_the_rise_download_is_not_read(monkeypatch):
+    """Security review 2026-10-23: every member was read whole, whatever its size."""
+    from src.modules import skills_catalogue as sc
+
+    monkeypatch.setattr(sc, "_MAX_MANIFEST_BYTES", 1000)
+    body = _tarball(
+        {
+            "RISE-main/skills/demo.yml": PACK_YML,
+            "RISE-main/skills/huge.yml": "x" * 5000,
+            "RISE-main/skills/../evil.yml": PACK_YML,
+            "RISE-main/skills/.hidden.yml": PACK_YML,
+        }
+    )
+    assert sorted(sc._manifests_from_tarball(body)) == ["demo.yml"]
+
+
+def test_the_rise_download_is_capped_while_it_streams(monkeypatch):
+    import httpx
+
+    from src.modules import skills_catalogue as sc
+
+    sent = []
+
+    def handler(request):
+        def chunks():
+            for _ in range(100):
+                sent.append(1)
+                yield b"x" * 1024
+
+        return httpx.Response(200, content=chunks())
+
+    monkeypatch.setattr(
+        httpx, "stream", lambda m, u, **kw: httpx.Client(transport=httpx.MockTransport(handler)).stream(m, u)
+    )
+    with pytest.raises(CatalogueError, match="larger than expected"):
+        sc._fetch_tarball("https://codeload.github.com/x", max_bytes=10 * 1024)
+    assert len(sent) < 100
+
+
+# ---------------------------------------------------------------------------
+# Private packs (tester report, 2026-11-02: "100xOS" did not install, with no reason given)
+# ---------------------------------------------------------------------------
+
+PRIVATE_YML = """
+pack:
+  slug: hundredx-os
+  name: '100xOS shared skills'
+  source_url: 'private (the e2er authors, 100xOS ecosystem)'
+  maintainers:
+    - 'the e2er authors'
+  license: 'private (curator-owned)'
+skills:
+  - slug: 'base-economist'
+    name: 'economist'
+    source_path: 'base/economist.md'
+    details_url: ''
+"""
+
+
+def test_a_private_pack_is_marked_and_says_whom_to_ask(catalogue, tmp_path, monkeypatch):
+    from src.modules.skills_catalogue import PrivatePackError
+
+    (catalogue / "skills" / "hundredx-os.yml").write_text(PRIVATE_YML, encoding="utf-8", newline="\n")
+    packs = {p.slug: p for p in read_catalogue(catalogue)}
+    assert packs["hundredx-os"].private and not packs["demo"].private
+
+    async def never(*a, **k):  # pragma: no cover - must not be called
+        raise AssertionError("a private pack is not fetched")
+
+    monkeypatch.setattr("src.modules.fetch.http.fetch_bytes", never)
+    import asyncio
+
+    with pytest.raises(PrivatePackError) as err:
+        asyncio.run(install_pack(packs["hundredx-os"], dest=tmp_path / "installed"))
+    assert "private or no longer available" in str(err.value)
+    assert "ask the e2er authors for access" in str(err.value)
+    assert not (tmp_path / "installed" / "hundredx-os").exists()
+
+
+async def test_github_refusing_every_file_reads_as_a_private_repository(catalogue, tmp_path, monkeypatch):
+    import httpx
+
+    async def _fetch(url, headers=None, max_bytes=None):
+        request = httpx.Request("GET", url)
+        raise httpx.HTTPStatusError("404 Not Found", request=request, response=httpx.Response(404, request=request))
+
+    monkeypatch.setattr("src.modules.fetch.http.fetch_bytes", _fetch)
+    report = await install_pack(find_pack("demo", catalogue), dest=tmp_path / "installed")
+    assert report["installed"] == 0
+    assert "private or no longer available" in report["reason"] and "A. Person" in report["reason"]
+
+
+def test_the_cli_says_why_without_a_traceback(catalogue, tmp_path, monkeypatch, capsys):
+    from src import cli_skills
+
+    (catalogue / "skills" / "hundredx-os.yml").write_text(PRIVATE_YML, encoding="utf-8", newline="\n")
+    monkeypatch.setattr("src.modules.skills_catalogue.install_root", lambda: tmp_path / "installed")
+    code = cli_skills.main(["--catalogue", str(catalogue), "install", "hundredx-os"])
+    err = capsys.readouterr().err
+    assert code == 2
+    assert "ask the e2er authors for access" in err and "Traceback" not in err
+    cli_skills.main(["--catalogue", str(catalogue), "list"])
+    assert "private: ask its owner for access" in capsys.readouterr().out

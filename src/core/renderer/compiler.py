@@ -1,0 +1,183 @@
+"""LaTeX compiler — wraps the drafter's body in a standard preamble + bib and compiles to PDF."""
+
+from __future__ import annotations
+
+import asyncio
+import re
+import shutil
+from pathlib import Path
+
+from ...logging_config import get_logger
+from .templates import assemble_document, assemble_refs_bib, looks_like_full_document
+
+logger = get_logger(__name__)
+
+# Compiler preference order. latexmk and tectonic both run bib + multiple
+# passes in one shot; tectonic is self-contained (single binary, fetches
+# packages on demand) so it's the zero-install fallback. Bare pdflatex is last
+# (it doesn't run the bibliography on its own).
+_ENGINE_PREFERENCE = ("latexmk", "tectonic", "pdflatex")
+
+
+def _select_engine() -> str | None:
+    for name in _ENGINE_PREFERENCE:
+        if shutil.which(name):
+            return name
+    return None
+
+
+def _build_cmd(engine: str, main_file: str) -> list[str]:
+    """The compile command. The paper is AI-written: no latexmkrc is read (``-norc``; a workspace
+    ``latexmkrc`` is Perl that latexmk runs), no shell escape, and tectonic in ``--untrusted`` mode."""
+    if engine == "latexmk":
+        return ["latexmk", "-norc", "-pdf", "-no-shell-escape", "-interaction=nonstopmode", main_file]
+    if engine == "tectonic":
+        # Non-interactive by default; --keep-logs leaves a .log for debugging.
+        # -Z continue-on-errors is tectonic's nonstopmode equivalent: a missing
+        # figure or a stray undefined macro still yields a PDF instead of
+        # halting (so a paper always compiles to *something*). Default output is
+        # the input file's directory (cwd=workspace) → workspace/<main>.pdf.
+        return ["tectonic", "--untrusted", "--keep-logs", "--chatter", "minimal", "-Z", "continue-on-errors", main_file]
+    return ["pdflatex", "-no-shell-escape", "-interaction=nonstopmode", main_file]
+
+
+def compile_env() -> dict[str, str]:
+    """The compiler's environment: no key or token (child_env), and TeX may read and write files only
+    below the workspace (kpathsea's paranoid ``openin_any=p`` / ``openout_any=p``: no ``..``, no
+    absolute path, no dot file), so ``\\input{/Users/x/.ssh/id_rsa}`` reads nothing."""
+    import os
+
+    from ..child_env import agent_env
+
+    env = agent_env(source=dict(os.environ))
+    env["openin_any"] = "p"
+    env["openout_any"] = "p"
+    return env
+
+
+def _mirror_figures_into_subdir(workspace: Path) -> None:
+    """Copy root-level ``fig_*.pdf`` into a ``figures/`` subdir so both
+    ``\\includegraphics{fig_x.pdf}`` and ``…{figures/fig_x.pdf}`` resolve.
+    Best-effort; never raises."""
+    try:
+        figs = list(workspace.glob("fig_*.pdf"))
+        if not figs:
+            return
+        dest = workspace / "figures"
+        dest.mkdir(exist_ok=True)
+        for f in figs:
+            target = dest / f.name
+            if not target.exists() or target.stat().st_mtime < f.stat().st_mtime:
+                shutil.copy2(f, target)
+    except OSError as e:
+        logger.warning("could not mirror figures into figures/: %s", e)
+
+
+_HTML_COMMENT_RE = re.compile(r"[ \t]*<!--.*?-->", re.DOTALL)
+
+
+def strip_html_comments(path: Path) -> bool:
+    """Remove ``<!-- ... -->`` from a LaTeX file (LaTeX prints them); True when it changed."""
+    if not path.is_file():
+        return False
+    text = path.read_text(encoding="utf-8")
+    cleaned = _HTML_COMMENT_RE.sub("", text)
+    if cleaned == text:
+        return False
+    path.write_text(cleaned, encoding="utf-8", newline="\n")
+    logger.warning(
+        "%s: removed %d HTML comment(s), which LaTeX would print", path.name, len(_HTML_COMMENT_RE.findall(text))
+    )
+    return True
+
+
+async def compile_latex(workspace: Path, main_file: str = "paper_draft.tex") -> Path | None:
+    """Assemble (preamble + body + bibliography) and compile to PDF.
+
+    Pipeline:
+      1. Read paper_draft.tex (the drafter's body, ideally without \\documentclass) and put
+         abstract.tex into it (the abstract step's abstract).
+      2. Assemble refs.bib by merging literature.bib + user_refs.bib (deduped).
+      3. Wrap body with the standard preamble (templates.PREAMBLE).
+      4. Compile with the first available engine: latexmk, tectonic, or pdflatex.
+    """
+    tex_path = workspace / main_file
+    if not tex_path.exists():
+        logger.warning("No LaTeX file found at %s", tex_path)
+        return None
+
+    # Assemble refs.bib (no-op if no sources present).
+    refs = assemble_refs_bib(workspace)
+    if refs:
+        logger.info("Assembled refs.bib at %s", refs)
+
+    # HTML comments are not LaTeX: "<!-- src: ... -->" source notes (which the
+    # cite-numbers skill once taught) were printed into the PDF as text.
+    for part in (tex_path, workspace / "abstract.tex"):
+        strip_html_comments(part)
+
+    # The abstract step's abstract (src/core/abstract.py) is the paper's: in place
+    # of the draft's abstract environment, or where one belongs when it has none.
+    from ..abstract import insert_into_file
+
+    if insert_into_file(tex_path, workspace / "abstract.tex"):
+        logger.info("Put abstract.tex into %s", tex_path.name)
+
+    # Wrap the body if needed. Original draft is preserved as paper_draft.body.tex.
+    body = tex_path.read_text(encoding="utf-8")
+    if not looks_like_full_document(body):
+        backup = workspace / "paper_draft.body.tex"
+        backup.write_text(body, encoding="utf-8", newline="\n")
+        wrapped = assemble_document(body)
+        tex_path.write_text(wrapped, encoding="utf-8", newline="\n")
+        logger.info("Wrapped paper_draft.tex with preamble (body backup at %s)", backup)
+
+    # Figures render to the workspace root as `fig_*.pdf`, but drafters commonly
+    # reference them as `figures/fig_*.pdf`. Mirror them into a `figures/` subdir
+    # so both styles resolve (with the preamble's \graphicspath{{./}{figures/}}).
+    _mirror_figures_into_subdir(workspace)
+
+    engine = _select_engine()
+    if engine is None:
+        logger.warning("No LaTeX compiler found (looked for latexmk, tectonic, pdflatex) — skipping PDF compilation")
+        return None
+
+    cmd = _build_cmd(engine, main_file)
+    # tectonic fetches packages from the network on first use (cached after),
+    # so give it a longer ceiling than a local TeX install.
+    timeout = 600 if engine == "tectonic" else 180
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            cwd=str(workspace),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=compile_env(),
+            start_new_session=True,  # the time limit stops the compiler with what it started
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        except TimeoutError:
+            from ...modules.llm.cli_support import kill_process_group
+
+            kill_process_group(proc)
+            await proc.wait()
+            raise
+        # Use the PDF if it was produced, even on a non-zero exit: with
+        # continue-on-errors / nonstopmode the engine often emits a usable PDF
+        # while still returning non-zero on non-fatal warnings (undefined refs,
+        # a missing figure). A produced PDF beats no PDF.
+        pdf_path = workspace / main_file.replace(".tex", ".pdf")
+        if pdf_path.exists():
+            if proc.returncode != 0:
+                logger.warning("LaTeX compile had non-fatal errors but produced a PDF: %s", stderr.decode()[:300])
+            else:
+                logger.info("Compiled PDF: %s", pdf_path)
+            return pdf_path
+        logger.warning("LaTeX compilation failed (no PDF produced): %s", stderr.decode()[:500])
+    except TimeoutError:
+        logger.warning("LaTeX compilation timed out")
+    except Exception as e:
+        logger.warning("LaTeX compilation error: %s", e)
+    return None

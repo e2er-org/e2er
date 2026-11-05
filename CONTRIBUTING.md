@@ -1,0 +1,140 @@
+# Contributing to E2ER
+
+Thanks for your interest. This document covers the most common contribution paths. For specific topics there are deeper guides:
+
+- **Adding skill files** (most common) → [`skills/CONTRIBUTING_SKILLS.md`](skills/CONTRIBUTING_SKILLS.md)
+- **Adding natural experiments / IVs** → [`docs/iv_database.md`](docs/iv_database.md)
+
+---
+
+## Quick start (development setup)
+
+```bash
+git clone https://github.com/e2er-org/e2er.git
+cd E2ER-project
+pip install -e ".[dev]"
+# Optional, only for the Postgres code path (default is SQLite): see docker/README.md
+#   docker compose -f docker/docker-compose.yml up -d db && python scripts/migrate.py
+bash scripts/vendor_htmx.sh
+make hooks      # install pre-commit hooks (ruff + mypy on every commit)
+pytest tests/
+```
+
+The default `pytest` invocation skips real-LLM tests (`-m 'not e2e'`). To run the haiku smoke test against the real Anthropic API:
+
+```bash
+ANTHROPIC_API_KEY=sk-ant-... pytest tests/e2e/test_haiku_smoke.py -v -m e2e
+```
+
+Four replay tests (policy evaluation, spatial analysis, text analysis, systematic review) end with
+`e2er reproduce`, which builds an environment with [uv](https://docs.astral.sh/uv/). Locally that step
+runs offline from uv's cache and is skipped when uv is missing or the cache lacks a requirement. CI
+installs uv and sets `E2ER_REQUIRE_UV=1`: there the step runs online and fails instead of skipping
+(`tests/replay/uv.py`). Set the variable yourself to run the step as CI does.
+
+### Pre-commit hooks (recommended)
+
+`make hooks` installs git pre-commit hooks that run `ruff check`, `ruff format --check`, and `mypy` before every commit — catching the same issues CI would, locally, in seconds. Skip a single commit's hooks with `git commit --no-verify` (rarely a good idea). Run all hooks against the whole tree with `pre-commit run --all-files`.
+
+### Local checks before pushing
+
+```bash
+make lint       # ruff check + format --check
+make typecheck  # mypy
+make smoke      # full mocked test suite (~10s, no API key needed)
+```
+
+Or all three at once via the pre-commit hooks if you've installed them.
+
+---
+
+## What you can contribute
+
+### 1. Skill files (no code changes)
+
+Most domain expertise lives in `skills/files/**/*.md`. These are markdown documents injected into specialist system prompts at runtime. No Python changes are needed.
+
+See [`skills/CONTRIBUTING_SKILLS.md`](skills/CONTRIBUTING_SKILLS.md) for the file format, naming rules, and how skills are routed to specialists.
+
+### 2. Specialists
+
+Specialists live in `src/core/specialists/` and follow the contract in `src/core/specialists/contracts.py` (`WorkOrder` in, `Contribution` out). To add a new one:
+
+1. Add the specialist name to `src/core/specialists/registry.py`.
+2. Wire its expected output filename into `SPECIALIST_ARTIFACTS` so the runner can find it on resume.
+3. Map its skill bundle in `src/skills/loader.py` (`_SPECIALIST_SKILLS`).
+4. Add a deterministic mock entry in `tests/conftest.py` (`_SPECIALIST_OUTPUTS`) so the existing pipeline tests cover it.
+
+The Strategist's prompt at `src/core/strategist/engine.py` lists the available specialists — update that prompt if you want the Strategist to be aware of yours.
+
+### 3. Data sources
+
+The data module is designed to be pluggable. The Allium implementation in `src/modules/data/` is one example. To add a new provider:
+
+1. Add tools (`*_TOOLS: list[dict]`) and a handler (subclass `ToolHandler`) under `src/modules/<provider>/tools.py`.
+2. Wire the tools and handler into `_run_pipeline` in `src/api/app.py`, gated on a feature flag (e.g. `WRDS_ENABLED`).
+3. Document the provider in the README's "Data sources for integration" table.
+4. If the provider needs guardrails (mandatory time bounds, approval flow, etc.) put them in the handler's `handle()` method — never trust raw LLM output.
+
+The literature module at `src/modules/literature/tools.py` is a more recent, smaller example to copy.
+
+### 4. LLM backends
+
+Two backends ship today: `AnthropicBackend` and `OpenRouterBackend` in `src/modules/llm/`. They both implement the `LLMBackend` interface (`tool_loop` method). To add a third:
+
+1. Implement `tool_loop(system, messages, tools, tool_handler, max_turns)` returning a `ToolLoopResult`.
+2. Register it in `src/modules/llm/registry.py`.
+3. Add the corresponding env var to `Settings` in `src/config.py` and to `.env.example`.
+
+Per the Anthropic/OpenRouter precedent, configure the SDK client with `max_retries=5`.
+
+### 5. Bug reports / feedback / "I want this provider"
+
+The repo has structured GitHub issue templates for the most common asks
+(under `.github/ISSUE_TEMPLATE/`):
+
+- **Bug report** — something is broken or behaving unexpectedly.
+- **Feature request** — generic feature ideas.
+- **Data source request** — propose a new data provider (FRED-style series,
+  SQL warehouse, etc.). Fields cover provider, auth, coverage, and an
+  example RQ that needs it.
+- **Literature provider request** — propose a reference manager, search
+  source, or PDF resolver.
+
+Pick the most specific one when opening an issue; the data/literature
+forms route the request to the right lane.
+
+If a paper run produces something obviously broken, please include:
+
+- The research question that triggered it
+- The model + backend used
+- The relevant `last_error` (or full audit bundle if you can share it)
+- What you expected vs. what happened
+
+Edge cases and failure modes are particularly valuable for the evaluation framework.
+
+---
+
+## Code style
+
+- **Python 3.11+**. Type hints throughout.
+- **Lint**: `ruff check src/ tests/` and `ruff format src/ tests/`.
+- **Type-check**: `mypy src/` (pragmatic, non-strict baseline — see pyproject [tool.mypy]).
+- **No `print` in library code** — use `from .logging_config import get_logger`.
+- **Tests are mock-only by default**: no network calls, no real LLM, no DB. Real-LLM tests live under `tests/e2e/` and are gated on `@pytest.mark.e2e`.
+- **Per the project rules**: SQL migrations are additive — never modify existing `sql/*.sql` files. Add a new one with the next number.
+
+---
+
+## PR process
+
+1. Open an issue first for non-trivial changes so we can scope it before you write code.
+2. Branch from `dev` (the integration branch; see AGENTS.md), keep PRs small and focused.
+3. CI runs `pytest tests/` — must be green before merge.
+4. PR description should call out user-facing changes and any new env vars.
+
+---
+
+## Contact
+
+Open an issue or email **the e2er authors** for direct questions.

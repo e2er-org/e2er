@@ -1,0 +1,504 @@
+"""``e2er run`` — one-command submit-a-paper.
+
+Replaces the multi-step "start uvicorn, POST the question, open dashboard, watch
+events" flow with a single CLI command. Designed as the FIRST thing a
+new user runs after ``pip install e2er``.
+
+Flow:
+  1. Check if a local uvicorn is reachable at the configured port.
+     If not, start one in the background (detached subprocess).
+  2. POST /api/papers with the research question + flags.
+  3. Tail the events endpoint until the paper reaches a terminal status
+     (completed / failed / cancelled / paused).
+  4. Print a final summary with the paper's workspace path and dashboard URL.
+
+The user can ^C at any point — the run keeps going in the background;
+they can re-attach by visiting the dashboard URL.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+from .core.run_outcome import status_words
+
+
+class RQInputError(Exception):
+    """The RQ source was given but could not be read — reported as a one-line
+    CLI message, never a traceback."""
+
+
+def resolve_rq_input(rq: str | None, rq_file: str | None) -> str | None:
+    """Resolve the research question from a positional/``--rq`` arg or a file.
+
+    A file may be an rq.json (from `e2er rq`, with a "research_question" key)
+    or plain text. Returns None when neither yields a non-empty RQ."""
+    if rq_file:
+        import json
+        from pathlib import Path
+
+        path = Path(rq_file).expanduser()
+        try:
+            raw = path.read_text(encoding="utf-8").strip()
+        except OSError as e:
+            raise RQInputError(f"could not read --rq-file {path}: {e.strerror or e}") from e
+        try:
+            obj = json.loads(raw)
+            if isinstance(obj, dict) and obj.get("research_question"):
+                return str(obj["research_question"]).strip()
+        except (ValueError, TypeError):
+            pass
+        return raw or None
+    return rq
+
+
+def _api_port() -> int:
+    """The port `e2er serve` would bind, from settings (PORT in .env)."""
+    try:
+        from .config import get_settings
+
+        return int(get_settings().port)
+    except Exception:  # noqa: BLE001 — a bad config must not break `run`
+        return 8280
+
+
+def _api_root() -> str:
+    """Resolve the API URL from settings; the user can override via E2ER_API_URL."""
+    if url := os.environ.get("E2ER_API_URL"):
+        return url.rstrip("/")
+    return f"http://127.0.0.1:{_api_port()}"
+
+
+def api_headers() -> dict[str, str]:
+    """Headers that let an `e2er` command steer the runs of the e2er server it talks to.
+
+    The server's session token (``E2ER_SESSION_TOKEN`` in this process, else the
+    session file the server wrote for its port, ``~/.e2er/session-<port>.json``)
+    and, when set, the bearer token ``E2ER_API_TOKEN``.
+    """
+    from urllib.parse import urlparse
+
+    from .api import local_session as ls
+
+    headers: dict[str, str] = {}
+    if token := os.environ.get("E2ER_API_TOKEN"):
+        headers["Authorization"] = f"Bearer {token}"
+    session = os.environ.get(ls.ENV_TOKEN)
+    if not session:
+        try:
+            port = urlparse(_api_root()).port or _api_port()
+        except ValueError:
+            port = _api_port()
+        session = ls.read_session_token(port)
+    if session:
+        headers[ls.HEADER] = session
+    return headers
+
+
+def _api_reachable(timeout: float = 1.5) -> bool:
+    import httpx
+
+    try:
+        # /health answers without the session (the API itself needs it since 0.19.0).
+        r = httpx.get(f"{_api_root()}/health", timeout=timeout)
+        return r.status_code == 200 and (r.json() or {}).get("service") == "e2er-v3"
+    except Exception:
+        return False
+
+
+#: Port -> (token, pid) of a server this command started; its session file is
+#: written once the server answers (a file written before binding could replace
+#: the session file of a server already on the port).
+_pending_session: dict[int, tuple[str, int]] = {}
+
+
+def _start_uvicorn_in_background() -> int:
+    """Spawn `uvicorn src.api.app:app` on the configured port, detached.
+
+    Returns the PID. The caller waits up to ~10s for /api/papers to come up,
+    then proceeds.
+    """
+    from .api import local_session as ls
+
+    log_path = Path.home() / ".e2er" / "uvicorn.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    # The server needs the session token that this and later `e2er` commands
+    # send (X-E2ER-Token); without it the server made a random one of its own
+    # and refused every POST with 403.
+    token = os.environ.get(ls.ENV_TOKEN) or ls.new_token()  # a new token per start (0.19.0)
+    env = {**os.environ, ls.ENV_TOKEN: token}
+    cmd = [
+        sys.executable,
+        "-m",
+        "uvicorn",
+        "src.api.app:app",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        str(_api_port()),
+        "--log-level",
+        "info",
+    ]
+    with log_path.open("ab") as log_f:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=log_f,
+            stderr=log_f,
+            start_new_session=True,  # detach from terminal — survives ^C
+            env=env,
+        )
+    _pending_session[_api_port()] = (token, proc.pid)
+    return proc.pid
+
+
+def _write_pending_session_file() -> None:
+    """Write ``~/.e2er/session-<port>.json`` for the server this command started."""
+    from .api import local_session as ls
+
+    port = _api_port()
+    pending = _pending_session.pop(port, None)
+    if pending is None:
+        return
+    token, pid = pending
+    try:
+        ls.write_session_file(port, token, pid=pid)
+    except OSError:
+        pass  # api_headers falls back to the token in this process's environment
+
+
+def _ensure_api_up(deadline_seconds: float = 12.0) -> tuple[bool, str | None]:
+    """If API isn't reachable, start uvicorn. Block until it's up or timeout.
+
+    Returns (success, message_to_user_if_failed).
+    """
+    if _api_reachable():
+        return True, None
+    print(f"Starting local e2er API server (uvicorn on :{_api_port()})...", file=sys.stderr)
+    pid = _start_uvicorn_in_background()
+    deadline = time.monotonic() + deadline_seconds
+    while time.monotonic() < deadline:
+        if _api_reachable():
+            _write_pending_session_file()
+            print(f"  ✓ uvicorn ready (PID {pid}). Logs: ~/.e2er/uvicorn.log", file=sys.stderr)
+            return True, None
+        time.sleep(0.5)
+    return False, (f"Failed to bring up uvicorn within {deadline_seconds:.0f}s. Check ~/.e2er/uvicorn.log for errors.")
+
+
+#: Where the first sentence of a research question ends: a question or
+#: exclamation mark, or a full stop followed by whitespace and a capital letter
+#: (or the end of the text). A full stop inside a token (a DOI such as
+#: 10.1016/j.jfineco.2020.01.001, a decimal, "U.S.") does not end it.
+_SENTENCE_END = re.compile(r"[?!]|\.(?=\s+[A-Z(\"'\u201c]|\s*$)")
+
+
+def derive_title(rq: str, limit: int = 80) -> str:
+    """The run's title: the first sentence of the research question, at most `limit` characters."""
+    title = _SENTENCE_END.split(rq.strip(), maxsplit=1)[0].strip()
+    if not title:
+        title = rq.strip()
+    if len(title) > limit:
+        title = title[: limit - 3] + "..."
+    return title
+
+
+def resolve_inputs(data: list[str] | None, papers: list[str] | None) -> tuple[list[str] | None, list[str] | None]:
+    """``--data`` and ``--papers`` as the server takes them: full paths and paper ids.
+
+    A folder given to ``--papers`` stands for every PDF and .bib file in it (and
+    below); a folder given to ``--data`` for every data file in it. Raises
+    ValueError with one plain sentence for a missing file or a type e2er does not read.
+    """
+    from .core.study_inputs import InputError, check_data_files, check_paper_ids
+    from .modules.local_corpus import DATA_EXTENSIONS
+
+    def expand(items: list[str], suffixes: set[str]) -> list[str]:
+        out: list[str] = []
+        for raw in items:
+            p = Path(raw).expanduser()
+            if p.is_dir():
+                found = sorted(str(f.resolve()) for f in p.rglob("*") if f.is_file() and f.suffix.lower() in suffixes)
+                if not found:
+                    raise ValueError(f"{p} holds no {' or '.join(sorted(suffixes))} files.")
+                out.extend(found)
+            else:
+                out.append(str(p.resolve()) if p.exists() else str(p.absolute()))
+        return out
+
+    try:
+        data_files = (
+            [str(p) for p in check_data_files(expand(data, set(DATA_EXTENSIONS)))] if data is not None else None
+        )
+        paper_ids = check_paper_ids(expand(papers, {".pdf", ".bib"})) if papers is not None else None
+    except InputError as e:
+        raise ValueError(str(e)) from e
+    return data_files, paper_ids
+
+
+def _submit_paper(
+    rq: str,
+    methodology: str,
+    mode: str,
+    max_cost: float,
+    acknowledge: bool = False,
+    backend: str | None = None,
+    model: str | None = None,
+    governance: str | None = None,
+    review_stages: list[str] | None = None,
+    title_suffix: str = "",
+    template: str | None = None,
+    demonstration: bool = False,
+    data_files: list[str] | None = None,
+    papers: list[str] | None = None,
+    web_search: bool = True,
+) -> dict | None:
+    """POST /api/papers and return the response body."""
+    import httpx
+
+    from .config import get_settings
+
+    # Derive a title: first sentence of the RQ, truncated. run-matrix passes a
+    # title_suffix like " [claude_code/rep-1]" so sibling runs are labeled.
+    title = derive_title(rq)
+    if title_suffix:
+        title = f"{title}{title_suffix}"
+
+    # The $1 first-run floor protects against a runaway loop on an unvalidated
+    # (model, methodology, mode) tuple — but it only matters for metered API
+    # backends. The flat-rate CLI backends cost $0/token, so auto-acknowledge
+    # there; otherwise enforce the floor unless the user passed --acknowledge.
+    # Key the decision on the EFFECTIVE backend (the --backend override wins).
+    effective_backend = backend or get_settings().llm_backend
+    flat_rate = effective_backend in {"claude_code", "codex", "gemini"}
+    acknowledge_unproven = acknowledge or flat_rate
+
+    body = {
+        "title": title,
+        "research_question": rq,
+        "methodology": methodology,
+        # Field name on the API side is `mode`. Older callers used
+        # `pipeline_mode` (still accepted via Pydantic alias) — see
+        # CreatePaperRequest in src/api/app.py. Use the canonical name
+        # here so the log line in api/app.py reflects what the user
+        # actually passed instead of the default.
+        "mode": mode,
+        "max_specialists_per_phase": 6,
+        "acknowledge_unproven_tuple": acknowledge_unproven,
+        "max_cost_usd": max_cost,
+    }
+    if backend:
+        body["backend"] = backend
+    if model:
+        body["model"] = model
+    if governance:
+        body["governance"] = governance
+    if review_stages:
+        body["review_stages"] = review_stages
+    if template:
+        body["pipeline"] = template
+    if demonstration:
+        # Recorded in the study's manifest.json at start: export, publish, the
+        # paper's footnote, the reproduction report and the dossier take it from there.
+        body["purpose"] = "demonstration"
+    # What the study uses (src/core/study_inputs.py): full paths, checked by the caller.
+    if data_files is not None:
+        body["data_files"] = data_files
+    if papers is not None:
+        body["papers"] = papers
+    if not web_search:
+        body["web_search"] = False
+    try:
+        r = httpx.post(f"{_api_root()}/api/papers", json=body, headers=api_headers(), timeout=30.0)
+    except httpx.HTTPError as e:
+        print(f"  ✗ POST /api/papers failed: {e}", file=sys.stderr)
+        return None
+    if r.status_code != 200:
+        print(f"  ✗ POST /api/papers returned {r.status_code}: {r.text[:300]}", file=sys.stderr)
+        return None
+    return r.json()
+
+
+def short_reason(text: object, max_sentences: int = 3, max_chars: int = 400) -> str:
+    """A run's ``last_error`` in a few sentences: whitespace collapsed, the first sentences kept.
+
+    A paused or failed run says why in its ``last_error``; that text can run to a
+    paragraph with a raw error after the sentence that matters.
+    """
+    flat = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not flat:
+        return ""
+    sentences = re.split(r"(?<=[.!?])\s+(?=[A-Z0-9`\"'(])", flat)
+    out = " ".join(sentences[:max_sentences])
+    if len(out) > max_chars:
+        out = out[: max_chars - 1].rstrip() + "…"
+    return out
+
+
+def _fetch_paper(paper_id: str) -> dict:
+    """The run as GET /api/papers/{id} returns it; {} when the server does not answer."""
+    import httpx
+
+    try:
+        r = httpx.get(f"{_api_root()}/api/papers/{paper_id}", headers=api_headers(), timeout=10.0)
+        d = r.json() if r.status_code == 200 else {}
+    except Exception:  # noqa: BLE001 — the hint below stands without the reason
+        return {}
+    return d if isinstance(d, dict) else {}
+
+
+def _poll_status(paper_id: str, total_seconds: float, poll_interval: float = 15.0) -> str:
+    """Tail status until terminal. Returns the final status."""
+    import httpx
+
+    # The API's `shown_status` says whether the run finished (run_outcome.py):
+    # `stopped` is a check that stopped the run (stored as `rejected`, a
+    # v0.5+ terminal status distinct from `failed`, which means crash). Pre-fix
+    # the tailer kept polling forever on such papers because they weren't in
+    # this set — observed during fresh-install testing.
+    terminal = {"completed", "failed", "cancelled", "paused", "stopped", "rejected"}
+    start = time.monotonic()
+    last_state = ""
+    while time.monotonic() - start < total_seconds:
+        try:
+            r = httpx.get(f"{_api_root()}/api/papers/{paper_id}", headers=api_headers(), timeout=10.0)
+            d = r.json()
+        except Exception:
+            time.sleep(poll_interval)
+            continue
+        status = d.get("shown_status") or d.get("status") or "?"
+        u = d.get("usage") or {}
+        line = (
+            f"  [{status:12s}] specialists={u.get('specialist_calls') or 0:>3}  "
+            f"tokens={u.get('total_tokens') or 0:>10}  "
+            f"cost=${u.get('total_cost_usd') or 0}"
+        )
+        if line != last_state:
+            print(line, file=sys.stderr)
+            last_state = line
+        if status in terminal:
+            return status
+        time.sleep(poll_interval)
+    return "(monitor timed out — paper still in flight)"
+
+
+def run(
+    rq: str,
+    methodology: str = "empirical",
+    mode: str = "single_pass",
+    max_cost: float = 5.0,
+    monitor_seconds: float = 1800.0,
+    acknowledge: bool = False,
+    backend: str | None = None,
+    model: str | None = None,
+    governance: str | None = None,
+    review_stages: list[str] | None = None,
+    template: str = "empirical",
+    demonstration: bool = False,
+    data: list[str] | None = None,
+    papers: list[str] | None = None,
+    only_my_papers: bool = False,
+) -> int:
+    """Submit a paper and tail it. Entry point for `e2er run "<RQ>"`."""
+    # The template must be a file e2er can load, checked before the server is
+    # started or anything is submitted: a typo costs a message, not a run.
+    from .core.pipeline.spec import PipelineError, available, find_spec
+
+    try:
+        find_spec(template)
+    except PipelineError as e:
+        names = ", ".join(sorted(available())) or "none"
+        print(f"e2er run: {str(e).splitlines()[0]}. Available templates: {names}", file=sys.stderr)
+        return 2
+    # Studies, runs and their database in a folder the operating system empties: said before the run starts.
+    from .home import print_storage_warnings
+
+    print_storage_warnings()
+    # The chosen files are checked here, before anything is started: a typo costs a message.
+    try:
+        data_files, paper_ids = resolve_inputs(data, papers)
+    except ValueError as e:
+        print(f"e2er run: {e}", file=sys.stderr)
+        return 2
+    ok, err = _ensure_api_up()
+    if not ok:
+        print(f"e2er run: {err}", file=sys.stderr)
+        return 4
+
+    print(f"Submitting paper:\n  {rq[:120]}", file=sys.stderr)
+    backend_note = f", backend={backend}" if backend else ""
+    model_note = f", model={model}" if model else ""
+    gov_note = f", governance={governance}" if governance else ""
+    review_note = f", review-at={','.join(review_stages)}" if review_stages else ""
+    demo_note = ", demonstration or test run" if demonstration else ""
+    if data_files is not None:
+        demo_note += f", data: {', '.join(Path(f).name for f in data_files) or 'none'}"
+    if paper_ids is not None:
+        demo_note += f", papers: {len(paper_ids)} file(s)/entries"
+    if only_my_papers:
+        demo_note += ", only my papers"
+    print(
+        f"  template={template}, methodology={methodology}, mode={mode}, max_cost=${max_cost}"
+        f"{backend_note}{model_note}{gov_note}{review_note}{demo_note}",
+        file=sys.stderr,
+    )
+    resp = _submit_paper(
+        rq,
+        methodology,
+        mode,
+        max_cost,
+        acknowledge=acknowledge,
+        backend=backend,
+        model=model,
+        governance=governance,
+        review_stages=review_stages,
+        template=template,
+        demonstration=demonstration,
+        data_files=data_files,
+        papers=paper_ids,
+        web_search=not only_my_papers,
+    )
+    if not resp:
+        return 5
+
+    paper_id = resp.get("paper_id")
+    workspace = resp.get("workspace")
+    if not paper_id:
+        # Should never happen given _submit_paper returned successfully, but
+        # narrow the type for mypy + give the user a clear error if it does.
+        print("  ✗ API returned 200 but no paper_id — cannot tail.", file=sys.stderr)
+        return 5
+    dashboard_url = f"{_api_root()}/papers/{paper_id}"
+
+    print(f"\n  Paper ID:  {paper_id}", file=sys.stderr)
+    print(f"  Workspace: {workspace}", file=sys.stderr)
+    print(f"  Dashboard: {dashboard_url}\n", file=sys.stderr)
+    print(f"Polling status (max {monitor_seconds:.0f}s, ^C is safe — run continues in background):", file=sys.stderr)
+
+    try:
+        final = _poll_status(paper_id, total_seconds=monitor_seconds)
+    except KeyboardInterrupt:
+        print("\n  ^C received — the run continues in the background.", file=sys.stderr)
+        print(f"  Watch progress at: {dashboard_url}", file=sys.stderr)
+        return 0
+
+    print(f"\n  Final status: {status_words(final)}", file=sys.stderr)
+    print(f"  Dashboard:    {dashboard_url}", file=sys.stderr)
+    if final == "completed":
+        print("\n✓ Paper completed. Open the dashboard or read directly from:", file=sys.stderr)
+        print(f"  {workspace}/paper_draft.tex", file=sys.stderr)
+        print(f"  {workspace}/abstract.tex", file=sys.stderr)
+        return 0
+    if final in {"failed", "paused", "stopped"}:
+        print(f"\n⚠ Paper {status_words(final)}.", file=sys.stderr)
+        reason = short_reason(_fetch_paper(paper_id).get("last_error"))
+        if reason:
+            print(f"  Why: {reason}", file=sys.stderr)
+        # A command that works the same in PowerShell, cmd, bash and zsh.
+        print(f"  Next: e2er status {paper_id}", file=sys.stderr)
+        return 1
+    return 0

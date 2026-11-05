@@ -1,0 +1,364 @@
+"""What the three CLI backends (Claude Code, Codex, Gemini) share.
+
+Finding the executable, the PATH the model's shell sees, the prompt layout, the
+process-group kill on timeout, and the CLI version stamp. Each of these was
+first written for Claude Code and then copied, incompletely, into the other
+two backends; keeping one copy here stops the copies drifting apart again.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import os
+import re
+import shutil
+import subprocess
+import sysconfig
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from contextvars import ContextVar
+from functools import lru_cache
+from pathlib import Path
+from typing import Any
+
+#: The time limit of the current specialist's call, as its template or step sets it
+#: (src/core/pipeline/components.py ``timeout_for``): ``(seconds, at_least)``. With
+#: ``at_least`` the backend's own setting wins when it is longer (a built-in default for
+#: slow specialists); without, the template's value is the limit. None: the setting.
+call_timeout: ContextVar[tuple[int, bool] | None] = ContextVar("e2er_call_timeout", default=None)
+
+
+#: This call's audit journal (modules/data/audit_journal.py), set by :func:`audit_journal` and
+#: passed to the wrappers by :func:`run_env` as ``E2ER_AUDIT_JOURNAL``.
+_journal: ContextVar[Path | None] = ContextVar("e2er_audit_journal", default=None)
+
+
+@asynccontextmanager
+async def audit_journal(paper_id: str | None, workspace: str | Path | None) -> AsyncIterator[Path | None]:
+    """One CLI call's audit journal: the wrappers write their audit rows into the workspace, e2er imports them.
+
+    Every CLI backend wraps its call in this, on every operating system. No CLI gets a writable folder
+    outside the workspace (Codex's ``--add-dir`` broke file edits on Windows, openai/codex#30009): the
+    wrappers append to ``<workspace>/.e2er-audit-journal-<call>.jsonl``, e2er reads it every few seconds
+    while the call runs and once after it, writes the checked rows into the run database and removes the
+    journal. Without a paper (a strategist call) there is no journal.
+    """
+    if not paper_id or not workspace:
+        yield None
+        return
+    from ..data.audit_journal import JournalImporter, new_journal_path
+
+    path = new_journal_path(Path(workspace))
+    importer = JournalImporter(path, paper_id)
+    token = _journal.set(path)
+    follower = asyncio.create_task(importer.follow())
+    try:
+        yield path
+    finally:
+        _journal.reset(token)
+        follower.cancel()
+        with contextlib.suppress(BaseException):
+            await follower
+        await importer.finish()
+
+
+def effective_timeout(configured: int) -> int:
+    """The time limit for this call in seconds: the template's or step's, else the backend setting."""
+    chosen = call_timeout.get()
+    if chosen is None:
+        return configured
+    seconds, at_least = chosen
+    return max(configured, seconds) if at_least else seconds
+
+
+#: `scripts/` holds the e2er-* wrappers in a source checkout. On an installed
+#: wheel it does not exist and the entry-point shims in the venv's bin/ apply.
+SCRIPTS_DIR = Path(__file__).resolve().parent.parent.parent.parent / "scripts"
+
+#: Setting that names each CLI, and the executable name it defaults to.
+CLI_SETTING: dict[str, tuple[str, str]] = {
+    "claude_code": ("claude_code_path", "claude"),
+    "codex": ("codex_path", "codex"),
+    "gemini": ("gemini_path", "gemini"),
+}
+
+#: Places a CLI is installed without being put on PATH. The ChatGPT desktop app
+#: ships its own `codex` inside the app bundle.
+_EXTRA_LOCATIONS: dict[str, tuple[str, ...]] = {
+    "codex": (
+        "/Applications/ChatGPT.app/Contents/Resources/codex",
+        "~/Applications/ChatGPT.app/Contents/Resources/codex",
+        "/Applications/Codex.app/Contents/Resources/codex",
+    ),
+}
+
+#: How much of a backend error to keep: both ends, because a CLI's cause is
+#: usually printed last.
+MAX_ERROR_CHARS = 4000
+
+
+def clip(text: str, limit: int = MAX_ERROR_CHARS) -> str:
+    """Trim to `limit`, keeping the head AND tail."""
+    if len(text) <= limit:
+        return text
+    head = limit // 2
+    tail = limit - head
+    return f"{text[:head]}\n… [{len(text) - limit} chars omitted] …\n{text[-tail:]}"
+
+
+def resolve_cli(backend: str, settings: Any = None) -> str | None:
+    """Full path of the CLI for `backend`, or None when it is not installed.
+
+    Order: the configured path (CLAUDE_CODE_PATH / CODEX_PATH / GEMINI_PATH),
+    looked up on PATH when it is a bare name; then the known install places
+    that are not on PATH (the ChatGPT app's own `codex`).
+    """
+    if backend not in CLI_SETTING:
+        return None
+    attr, default = CLI_SETTING[backend]
+    configured = (getattr(settings, attr, None) if settings is not None else None) or default
+    configured = os.path.expanduser(str(configured))
+    if os.sep in configured:
+        if os.path.isfile(configured) and os.access(configured, os.X_OK):
+            return configured
+    else:
+        found = shutil.which(configured)
+        if found:
+            return found
+    # Only fall back to the known places when the setting is the default name:
+    # a path someone typed and got wrong should be reported, not papered over.
+    if configured == default:
+        for place in _EXTRA_LOCATIONS.get(backend, ()):
+            p = os.path.expanduser(place)
+            if os.path.isfile(p) and os.access(p, os.X_OK):
+                return p
+    return None
+
+
+def cli_path_or_setting(backend: str, settings: Any) -> str:
+    """The path to run: the resolved CLI, else the setting as written (so the
+    error names what was tried)."""
+    attr, default = CLI_SETTING[backend]
+    return resolve_cli(backend, settings) or (getattr(settings, attr, None) or default)
+
+
+def subprocess_path(current: str | None) -> str:
+    """PATH for the CLI subprocess: the e2er-* wrappers first, then the venv's
+    entry-point shims, then the inherited PATH.
+
+    `sysconfig.get_path("scripts")` rather than `Path(sys.executable).parent`:
+    on macOS framework venvs the interpreter is a symlink into the framework,
+    whose bin/ does not hold the venv's shims.
+    """
+    parts = [sysconfig.get_path("scripts"), current or ""]
+    if SCRIPTS_DIR.exists():
+        parts.insert(0, str(SCRIPTS_DIR))
+    return os.pathsep.join(p for p in parts if p)
+
+
+def flatten_prompt(system: str, messages: list[dict[str, Any]]) -> str:
+    """System prompt plus messages as one prompt, roles marked in markdown.
+
+    The CLIs take one prompt; a multi-message conversation is not part of
+    their contract.
+    """
+    parts = [system, ""]
+    for m in messages:
+        role = m.get("role", "user").upper()
+        content = m.get("content", "")
+        if isinstance(content, list):
+            content = "\n".join(
+                block.get("text", "") for block in content if isinstance(block, dict) and block.get("type") == "text"
+            )
+        parts.append(f"# {role}\n{content}")
+    return "\n\n".join(parts).replace("\x00", "")
+
+
+def kill_process_group(proc: Any) -> None:
+    """Kill the CLI and everything it started.
+
+    The CLIs run the model's shell commands as their own children (a Python
+    script under `e2er-run`, a data download). `proc.kill()` alone leaves those
+    running after a timeout; the subprocess is started in its own session so
+    its process group can be killed whole.
+    """
+    from ...core.child_env import kill_tree
+
+    kill_tree(proc)  # POSIX: the process group; Windows: taskkill /T (os.killpg does not exist there)
+
+
+async def stop_on_cancel(proc: Any) -> None:
+    """The run was cancelled while the CLI ran: kill it and everything it started, then let it go.
+
+    Called from an ``except asyncio.CancelledError`` block, which re-raises. A
+    cancelled run must not leave the CLI (or a script it started) working on in
+    the background.
+    """
+    kill_process_group(proc)
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=5)
+    except BaseException:  # noqa: BLE001,S110 — a second cancel or a slow exit: the kill was sent
+        pass
+
+
+@lru_cache(maxsize=8)
+def cli_version(cli_path: str) -> str | None:
+    """`<cli> --version`, first line; None when it cannot be read."""
+    try:
+        out = subprocess.run(
+            [cli_path, "--version"], capture_output=True, encoding="utf-8", errors="replace", timeout=20, check=False
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    line = (out.stdout or out.stderr or "").strip().splitlines()
+    return line[0].strip() if line and out.returncode == 0 else None
+
+
+def cli_name(cli_path: str) -> str:
+    """The CLI's program name (``claude``), never where it is installed: the run
+    record goes into the dossier, and an install path names this machine."""
+    return re.split(r"[\\/]", cli_path.rstrip("/\\"))[-1] or cli_path
+
+
+def workspace_cwd(settings: Any, paper_id: str | None, fallback: str) -> tuple[str, Path | None]:
+    """(cwd, absolute workspace root) for a call.
+
+    The workspace root must be absolute before it reaches the subprocess: the
+    default `workspaces` is relative, and the subprocess's cwd is already the
+    paper's workspace, so a relative root nests `workspaces/<id>` inside itself
+    (live test eea5379b, v0.4.4).
+    """
+    if not paper_id:
+        return fallback, None
+    from ...home import find_workspace
+
+    root = Path(settings.workspace_root).expanduser().resolve()
+    return str(find_workspace(paper_id, root).resolve()), root
+
+
+def run_env(
+    settings: Any,
+    *,
+    paper_id: str | None,
+    specialist: str | None,
+    workspace_root_abs: Path | None,
+    cli_keys: tuple[str, ...] = (),
+    cli_prefixes: tuple[str, ...] = (),
+) -> dict[str, str]:
+    """Environment for the CLI subprocess and the e2er-* wrappers it runs.
+
+    The model's shell commands run in it, so it is an allowlist (src/core/child_env.py):
+    the system's basics, the user's home (the CLI signs in from it), e2er's run
+    variables and non-secret setting names, the credentials the wrappers need (the
+    data and literature keys in ``WRAPPER_KEYS``) and the CLI's own sign-in
+    (``cli_keys``), and its own configuration (``cli_prefixes``). No other provider's
+    API key, no GitHub, Zenodo or e2er.org token, no ssh agent, no database password:
+    the run database is passed only as a SQLite path (a server URL can carry its password).
+
+    The wrappers are separate Python processes. They read their settings from
+    the environment and from a `.env` in *their* working directory, which is
+    the paper's workspace (or the e2er checkout), never the study folder whose
+    `.env` this run was started with. So a FRED key or a study-local database
+    named only in the study's `.env` never reached them. Everything in that
+    `.env` that the environment does not already set is passed on here, and
+    the database is passed as an absolute path.
+    """
+    import sys
+
+    from ...core.child_env import agent_env
+
+    source = os.environ.copy()
+    try:
+        from dotenv import dotenv_values
+
+        from ...home import env_file
+
+        for key, value in dotenv_values(env_file()).items():
+            if value is not None and key not in source:
+                source[key] = value
+    except Exception:  # noqa: BLE001 — a missing or unreadable .env is normal
+        pass
+    # What controls e2er itself (the dashboard's session, the API token, the
+    # e2er.org sign-in) is not the specialists' business: no wrapper reads it,
+    # and under Codex or Gemini a model's shell command could use it (child_env.CONTROL_VARS).
+    env = agent_env(
+        source=source,
+        keys=WRAPPER_KEYS | set(cli_keys),
+        settings_names=_setting_names(),
+        cli_prefixes=cli_prefixes,
+    )
+    db = db_path(settings)
+    if db is not None:
+        env["DATABASE_URL"] = f"sqlite:///{db}"
+    env["PATH"] = subprocess_path(env.get("PATH"))
+    # The wrappers run under the same interpreter as the runner (right venv,
+    # Python >= 3.11). Without it they fell back to a bare `python` (run #10).
+    env["E2ER_PYTHON"] = sys.executable
+    if paper_id:
+        env["E2ER_PAPER_ID"] = paper_id
+    if specialist:
+        env["E2ER_SPECIALIST"] = specialist
+    journal = _journal.get()
+    if journal is not None:
+        # The wrappers' audit rows go to this call's journal in the workspace, not the run database
+        # (audit_journal above). The model can write that file, as it could write the database's folder
+        # up to 0.20; e2er checks every line before it writes a row (modules/data/audit_journal.py).
+        env["E2ER_AUDIT_JOURNAL"] = str(journal)
+    # Marks every AI CLI call, tool-less strategist calls included: `e2er`
+    # itself refuses to run under it (src/__main__.py).
+    env["E2ER_AI_STEP"] = specialist or "strategist"
+    if workspace_root_abs is not None:
+        env["E2ER_WORKSPACE_ROOT"] = str(workspace_root_abs)
+        if paper_id:
+            # The run's own folder: since 0.14.0 it is named after the date and
+            # title, so the wrappers no longer derive it from the id.
+            from ...home import find_workspace
+
+            env["E2ER_WORKSPACE"] = str(find_workspace(paper_id, workspace_root_abs).resolve())
+    return env
+
+
+def _setting_names() -> set[str]:
+    """e2er's setting names (LOCAL_DATA_DIR, WORKSPACE_ROOT, …): the wrappers read their settings from them."""
+    try:
+        from ...config import Settings
+
+        return {name.upper() for name in Settings.model_fields}
+    except Exception:  # noqa: BLE001
+        return set()
+
+
+#: Variables that control e2er (its API, the dashboard session, the e2er.org
+#: sign-in), kept from the CLI subprocess.
+
+#: Credentials the e2er-* wrappers read from the environment (data and literature sources).
+WRAPPER_KEYS = frozenset(
+    {
+        "FRED_API_KEY",
+        "ALLIUM_API_KEY",
+        "SEMANTIC_SCHOLAR_API_KEY",
+        "ZOTERO_API_KEY",
+        "OPENALEX_API_KEY",  # e2er-fieldmap
+        # Not DB_PASSWORD (since 0.19.0): with it a model's shell command could rewrite the approvals
+        # and the audit rows of a Postgres run database. The wrappers read it from the settings file.
+    }
+)
+#: A variable that holds a credential, by its name (API keys, tokens, secrets, passwords).
+_CREDENTIAL_NAME = re.compile(r"(^|_)(TOKEN|KEY|API_KEY|SECRET|PASSWORD|PASSWD|CREDENTIALS?|PAT)(_|$)", re.I)
+
+
+def db_path(settings: Any) -> Path | None:
+    """Absolute path of the run database when it is SQLite, else None."""
+    try:
+        url = settings.resolved_database_url
+    except Exception:  # noqa: BLE001
+        return None
+    if url and not url.startswith("sqlite"):
+        return None
+    from ...db.client import _sqlite_path
+
+    try:
+        return Path(_sqlite_path(url)).expanduser().resolve()
+    except ValueError:
+        return None
