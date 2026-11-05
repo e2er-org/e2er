@@ -1,6 +1,6 @@
 """Read the RISE catalogue of skill packs, and install one.
 
-RISE (github.com/e2er-org/RISE) indexes skill packs published by other research
+RISE (github.com/bhanneke/RISE) indexes skill packs published by other research
 projects — each with its own source repository, licence and maintainers. It is a
 catalogue, not a library, and that distinction decides the design here: E2ER
 *installs* packs from their source, it does not vendor them.
@@ -110,8 +110,8 @@ class SkillPack:
 
 
 #: The public RISE catalogue, read when no local checkout is configured.
-RISE_REPO = "https://github.com/e2er-org/RISE"
-_RISE_TARBALL = "https://codeload.github.com/e2er-org/RISE/tar.gz/refs/heads/main"
+RISE_REPO = "https://github.com/bhanneke/RISE"
+_RISE_TARBALL = "https://codeload.github.com/bhanneke/RISE/tar.gz/refs/heads/main"
 #: A downloaded copy older than this is fetched again.
 _REFRESH_SECONDS = 24 * 3600
 _MAX_TARBALL_BYTES = 200 * 1024 * 1024

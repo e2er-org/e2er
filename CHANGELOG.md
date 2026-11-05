@@ -1452,7 +1452,7 @@ The local dashboard works end to end on 127.0.0.1, and every page reads plainly.
 
 - **`e2er skills list` and `e2er skills install` work without a local RISE checkout.** The
   default catalogue was a folder on the maintainer's computer (`~/Documents/Projects/RISE`). e2er
-  now downloads the pack list from the public catalogue at github.com/e2er-org/RISE into
+  now downloads the pack list from the public catalogue at github.com/bhanneke/RISE into
   `~/.e2er/cache/rise` (refreshed once a day; an older copy is used when GitHub cannot be
   reached). `RISE_PATH` and `--catalogue` still point to a local clone, and when neither works
   the error says how to set one.

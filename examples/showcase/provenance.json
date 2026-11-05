@@ -127,7 +127,7 @@
       "bytes": 1370
     },
     "paper/paper.pdf": {
-      "sha256": "db1e1a9aa7115d2f13f6d811438807936c1eeb984ec34a40dd089909984c12e2",
+      "sha256": "eca01fe17d484ff80d448d5b9a8b06f9653bf0a4a5070a51d9958479f192f2b0",
       "bytes": 460142
     },
     "paper/paper.tex": {
@@ -3579,7 +3579,7 @@
     {
       "path": "paper/paper.pdf",
       "sha256_before": "ebdee5cb0adbd279fa64a00f5d6de66bbddf84103b595e5d6448ce25d45d8d60",
-      "sha256_after": "db1e1a9aa7115d2f13f6d811438807936c1eeb984ec34a40dd089909984c12e2",
+      "sha256_after": "eca01fe17d484ff80d448d5b9a8b06f9653bf0a4a5070a51d9958479f192f2b0",
       "reason": "compiled again from the anonymised paper.tex",
       "at": "2026-11-05T00:00:00Z"
     }

@@ -455,7 +455,7 @@ def test_skills_without_the_internet_says_so_plainly(client, monkeypatch):
 
     def offline():
         raise sc.CatalogueError(
-            "could not download the RISE catalogue from https://github.com/e2er-org/RISE ([Errno 61] Connection "
+            "could not download the RISE catalogue from https://github.com/bhanneke/RISE ([Errno 61] Connection "
             "refused). Check the internet connection, or clone the repository."
         )
 

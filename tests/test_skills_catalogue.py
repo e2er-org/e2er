@@ -284,7 +284,7 @@ def test_without_a_checkout_the_catalogue_comes_from_github(tmp_path, monkeypatc
 
     monkeypatch.setattr(sc, "_fetch_tarball", fake_fetch)
     assert [p.slug for p in read_catalogue()] == ["demo"]
-    assert calls and "e2er-org/RISE" in calls[0]
+    assert calls and "bhanneke/RISE" in calls[0]
     read_catalogue()  # a fresh copy is reused
     assert len(calls) == 1
 

@@ -143,7 +143,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--catalogue",
         default=None,
-        help="Path to a RISE checkout (default: RISE_PATH, else a copy downloaded from github.com/e2er-org/RISE)",
+        help="Path to a RISE checkout (default: RISE_PATH, else a copy downloaded from github.com/bhanneke/RISE)",
     )
     p.add_argument("--json", action="store_true")
     sub = p.add_subparsers(dest="action", required=True)
