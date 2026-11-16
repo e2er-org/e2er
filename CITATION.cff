@@ -12,8 +12,8 @@ abstract: >
   steps the process pauses for their review. A study produced with e2er comes
   with a dossier that helps others verify and reproduce the work and attributes
   everyone whose templates, specialists, and skills it used.
-version: "0.20.1"
-date-released: "2026-11-04"
+version: "0.21.0"
+date-released: "2026-11-15"
 license: MIT
 repository-code: "https://github.com/e2er-org/e2er"
 url: "https://github.com/e2er-org/e2er"
@@ -33,5 +33,5 @@ preferred-citation:
   authors:
     - name: "The e2er authors"
   year: 2026
-  version: "0.20.1"
+  version: "0.21.0"
   url: "https://github.com/e2er-org/e2er"
