@@ -353,14 +353,14 @@ def test_the_rise_download_is_capped_while_it_streams(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Private packs (tester report, 2026-11-02: "100xOS" did not install, with no reason given)
+# Private packs (tester report, 2026-11-02: "privatelab" did not install, with no reason given)
 # ---------------------------------------------------------------------------
 
 PRIVATE_YML = """
 pack:
   slug: hundredx-os
-  name: '100xOS shared skills'
-  source_url: 'private (the e2er authors, 100xOS ecosystem)'
+  name: 'privatelab shared skills'
+  source_url: 'private (the e2er authors, privatelab ecosystem)'
   maintainers:
     - 'the e2er authors'
   license: 'private (curator-owned)'

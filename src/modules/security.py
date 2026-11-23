@@ -6,7 +6,7 @@ in XML boundary tags makes prompt injection meaningfully harder: the LLM
 sees a clear delimiter between trusted instructions and untrusted data,
 and a reminder note telling it to treat the bounded content as data only.
 
-This is the v3 standalone equivalent of the 100xOS `shared.security`
+This is the v3 standalone equivalent of the privatelab `shared.security`
 sanitizer pattern. Keep it small and obvious.
 """
 

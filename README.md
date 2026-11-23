@@ -370,7 +370,7 @@ make smoke-paid   # one real study on Claude Haiku 4.5 (needs ANTHROPIC_API_KEY,
   title        = {{e2er (End-to-End Research): The Open Infrastructure for
                    Publishing, Verifying, Reproducing and Reusing AI-Enabled Research}},
   year         = {2026},
-  version      = {0.21.0},
+  version      = {0.22.0},
   url          = {https://github.com/e2er-org/e2er},
   license      = {MIT},
 }

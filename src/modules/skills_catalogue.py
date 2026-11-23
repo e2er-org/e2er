@@ -82,7 +82,7 @@ class SkillPack:
     @property
     def private(self) -> bool:
         """The pack lives in a repository e2er cannot download from: the catalogue says it is private,
-        or names no file to fetch (the 100xOS pack: ``source_url: 'private (…)'``, every ``details_url`` empty).
+        or names no file to fetch (the privatelab pack: ``source_url: 'private (…)'``, every ``details_url`` empty).
         """
         src = (self.source_url or "").strip().lower()
         if src.startswith("private") or (self.license or "").strip().lower().startswith("private"):

@@ -225,8 +225,8 @@ def test_the_message_survives_a_url_round_trip(client, catalogue, monkeypatch):
 PRIVATE_PACK = """
 pack:
   slug: hundredx-os
-  name: '100xOS shared skills'
-  source_url: 'private (the e2er authors, 100xOS ecosystem)'
+  name: 'privatelab shared skills'
+  source_url: 'private (the e2er authors, privatelab ecosystem)'
   maintainers: ['the e2er authors']
   license: 'private (curator-owned)'
 skills:
@@ -238,7 +238,7 @@ skills:
 def test_a_private_pack_is_listed_as_private_and_says_why_it_cannot_be_installed(client, catalogue):
     (catalogue / "skills" / "hundredx-os.yml").write_text(PRIVATE_PACK, encoding="utf-8", newline="\n")
     page = client.get("/skills").text
-    assert "100xOS shared skills" in page, "listed, not removed"
+    assert "privatelab shared skills" in page, "listed, not removed"
     assert "Private: ask" in page
     r = client.post("/skills/install", data={"pack": "hundredx-os"}, follow_redirects=True)
     assert r.status_code == 200

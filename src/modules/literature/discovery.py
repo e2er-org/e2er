@@ -418,7 +418,7 @@ async def acquire_literature(
     WHY THIS IS A STAGE AND NOT A TOOL
 
     E2ER v1 ran a literature agent as a mandatory pipeline step: it wrote
-    ``bibliography.bib`` from the 100xOS pgvector knowledge base before the
+    ``bibliography.bib`` from the privatelab pgvector knowledge base before the
     drafter started, and its papers still pass v3's own citation gate today
     (31/33 and 37/38 cites verified, zero missing_in_bib, measured 2026-09-04).
 

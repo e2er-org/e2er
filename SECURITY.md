@@ -19,7 +19,6 @@ Use one of these private channels:
 1. **GitHub Security Advisories (preferred):** open a draft advisory at
    <https://github.com/e2er-org/e2er/security/advisories/new>.
    This keeps the report private until a fix is published.
-2. **Email:** `100xos.lab@gmail.com` with subject `E2ER security:`.
 
 Please include:
 
